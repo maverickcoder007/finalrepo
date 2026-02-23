@@ -1,0 +1,148 @@
+Build a production-grade algorithmic trading agent in Python that integrates completely with Zerodha Kite Connect API v3.
+
+Official API documentation:
+https://kite.trade/docs/connect/v3/
+
+The system must:
+
+1. ARCHITECTURE
+- Modular architecture:
+    /auth
+    /api
+    /strategy
+    /execution
+    /risk
+    /data
+    /utils
+    main.py
+- Fully async (asyncio + aiohttp)
+- Typed models using Pydantic
+- Environment-based configuration (.env)
+
+2. AUTHENTICATION FLOW
+Implement full OAuth login flow:
+- Generate login URL
+- Accept request_token
+- Generate access_token using api_key + api_secret
+- Store access_token securely
+- Auto refresh logic
+- Handle token expiry
+
+3. COMPLETE SCHEMA AWARENESS
+From the documentation, implement typed models for:
+
+- Orders (regular, CO, BO, AMO)
+- Trades
+- Positions
+- Holdings
+- Margins
+- Instruments
+- Historical Data
+- GTT
+- Portfolio
+- User profile
+
+Use Pydantic models mirroring exact API schema fields:
+- order_id
+- exchange
+- tradingsymbol
+- transaction_type
+- quantity
+- price
+- product
+- order_type
+- variety
+- status
+- trigger_price
+- etc.
+
+4. REST API CLIENT
+Create a KiteClient class that wraps all endpoints:
+
+- get_profile()
+- get_margins()
+- get_orders()
+- get_positions()
+- get_holdings()
+- place_order()
+- modify_order()
+- cancel_order()
+- get_instruments()
+- get_ltp()
+- get_historical_data()
+- place_gtt()
+- delete_gtt()
+
+All methods:
+- Typed request models
+- Typed response models
+- Automatic error handling
+- Rate limiting
+- Retry logic
+
+5. WEBSOCKET STREAMING
+Implement KiteTicker equivalent:
+- Connect to live market data
+- Subscribe to tokens
+- Parse tick structure
+- Maintain in-memory orderbook cache
+- Async event-driven architecture
+
+6. STRATEGY ENGINE
+Create pluggable strategy framework:
+
+BaseStrategy:
+- on_tick()
+- on_bar()
+- generate_signal()
+
+Example strategies:
+- EMA crossover
+- VWAP breakout
+- Mean reversion
+- RSI strategy
+
+7. RISK MANAGEMENT
+- Max daily loss
+- Position sizing
+- Exposure control
+- Stop loss auto placement
+- Kill switch
+
+8. EXECUTION ENGINE
+- Smart order routing
+- Slippage protection
+- Partial fill handling
+- Reconciliation loop
+
+9. BACKTEST MODE
+- Historical data backtesting module
+- Metrics:
+    Sharpe ratio
+    Drawdown
+    CAGR
+    Win rate
+- Vectorized backtesting with pandas
+
+10. LOGGING & MONITORING
+- Structured logging
+- Error classification
+- Trade journal
+- PnL tracking
+
+11. DEPLOYMENT READY
+- Dockerfile
+- requirements.txt
+- .env template
+- README.md
+
+12. SECURITY
+- API secret never logged
+- Environment variable only
+- Input validation
+- Exception sanitization
+
+Write clean production-level code.
+Use typing everywhere.
+No pseudo code.
+Make it ready for live trading.

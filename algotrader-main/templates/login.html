@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Kite Trading Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0a1628;
+            color: #e0e6ed;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-container {
+            background: #1a2332;
+            border: 1px solid #2a3a4a;
+            border-radius: 16px;
+            padding: 40px;
+            width: 400px;
+            max-width: 90vw;
+        }
+        .logo {
+            font-size: 24px;
+            font-weight: 700;
+            color: #00d4aa;
+            text-align: center;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #8899aa;
+            font-size: 14px;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            color: #8899aa;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px 16px;
+            background: #0d1821;
+            border: 1px solid #2a3a4a;
+            border-radius: 8px;
+            color: #e0e6ed;
+            font-size: 15px;
+            font-family: 'Inter', sans-serif;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus {
+            border-color: #00d4aa;
+        }
+        .form-group input.otp-input {
+            text-align: center;
+            font-size: 28px;
+            letter-spacing: 12px;
+            font-weight: 600;
+        }
+        .btn {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary {
+            background: #00d4aa;
+            color: #0a1628;
+        }
+        .message {
+            text-align: center;
+            font-size: 13px;
+            margin-top: 16px;
+            min-height: 20px;
+        }
+        .message.error { color: #ff5252; }
+        .message.success { color: #00d4aa; }
+        .message.info { color: #ff9100; }
+        .step { display: none; }
+        .step.active { display: block; }
+        .back-link {
+            text-align: center;
+            margin-top: 16px;
+        }
+        .back-link a {
+            color: #8899aa;
+            font-size: 13px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .back-link a:hover { color: #00d4aa; }
+        .timer {
+            text-align: center;
+            color: #8899aa;
+            font-size: 13px;
+            margin-top: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">Kite Trading Agent</div>
+        <div class="subtitle">Secure OTP Login</div>
+
+        <div id="step-email" class="step active">
+            <div class="form-group">
+                <label>Zerodha ID</label>
+                <input type="text" id="zerodha-id-input" placeholder="e.g. AC3735" autocomplete="username" style="text-transform:uppercase;">
+            </div>
+            <div class="form-group">
+                <label>Email Address</label>
+                <input type="email" id="email-input" placeholder="Enter your email" autocomplete="email">
+            </div>
+            <button class="btn btn-primary" id="btn-send-otp" onclick="sendOTP()">Send OTP</button>
+            <div id="msg-email" class="message"></div>
+        </div>
+
+        <div id="step-otp" class="step">
+            <p style="text-align:center;color:#8899aa;font-size:13px;margin-bottom:20px;">
+                A 6-digit code has been sent to the admin email.
+            </p>
+            <div class="form-group">
+                <label>Enter OTP</label>
+                <input type="text" id="otp-input" class="otp-input" maxlength="6" placeholder="------" autocomplete="one-time-code">
+            </div>
+            <button class="btn btn-primary" id="btn-verify" onclick="verifyOTP()">Verify & Login</button>
+            <div id="msg-otp" class="message"></div>
+            <div id="otp-timer" class="timer"></div>
+            <div class="back-link">
+                <a onclick="showStep('email')">Resend OTP</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showStep(step) {
+            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+            document.getElementById('step-' + step).classList.add('active');
+        }
+
+        let currentZerodhaId = '';
+
+        async function sendOTP() {
+            const zerodhaId = document.getElementById('zerodha-id-input').value.trim().toUpperCase();
+            const email = document.getElementById('email-input').value.trim();
+            const msg = document.getElementById('msg-email');
+            const btn = document.getElementById('btn-send-otp');
+
+            if (!zerodhaId) {
+                msg.className = 'message error';
+                msg.textContent = 'Please enter your Zerodha ID';
+                return;
+            }
+            if (!email) {
+                msg.className = 'message error';
+                msg.textContent = 'Please enter your email address';
+                return;
+            }
+
+            currentZerodhaId = zerodhaId;
+            btn.disabled = true;
+            btn.textContent = 'Sending...';
+            msg.className = 'message info';
+            msg.textContent = 'Sending OTP...';
+
+            try {
+                const res = await fetch('/auth/send-otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, zerodha_id: zerodhaId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    if (data.mode === 'direct' && data.otp) {
+                        document.getElementById('otp-input').value = data.otp;
+                        msg.className = 'message success';
+                        msg.textContent = 'OTP auto-filled. Click Verify to login.';
+                    } else {
+                        msg.className = 'message success';
+                        msg.textContent = 'OTP sent to admin email!';
+                    }
+                    setTimeout(() => showStep('otp'), 500);
+                    startTimer();
+                } else {
+                    msg.className = 'message error';
+                    msg.textContent = data.message || 'Failed to send OTP';
+                }
+            } catch (e) {
+                msg.className = 'message error';
+                msg.textContent = 'Connection error. Please try again.';
+            }
+            btn.disabled = false;
+            btn.textContent = 'Send OTP';
+        }
+
+        async function verifyOTP() {
+            const otp = document.getElementById('otp-input').value.trim();
+            const msg = document.getElementById('msg-otp');
+            const btn = document.getElementById('btn-verify');
+
+            if (!otp || otp.length !== 6) {
+                msg.className = 'message error';
+                msg.textContent = 'Please enter the 6-digit code';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Verifying...';
+
+            try {
+                const res = await fetch('/auth/verify-otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ otp, zerodha_id: currentZerodhaId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    msg.className = 'message success';
+                    msg.textContent = 'Login successful! Redirecting...';
+                    setTimeout(() => window.location.href = '/', 500);
+                } else {
+                    msg.className = 'message error';
+                    msg.textContent = data.message || 'Invalid OTP';
+                }
+            } catch (e) {
+                msg.className = 'message error';
+                msg.textContent = 'Connection error. Please try again.';
+            }
+            btn.disabled = false;
+            btn.textContent = 'Verify & Login';
+        }
+
+        let timerInterval;
+        function startTimer() {
+            let seconds = 300;
+            const el = document.getElementById('otp-timer');
+            clearInterval(timerInterval);
+            timerInterval = setInterval(() => {
+                seconds--;
+                const m = Math.floor(seconds / 60);
+                const s = seconds % 60;
+                el.textContent = `Code expires in ${m}:${s.toString().padStart(2, '0')}`;
+                if (seconds <= 0) {
+                    clearInterval(timerInterval);
+                    el.textContent = 'Code expired. Please resend.';
+                }
+            }, 1000);
+        }
+
+        document.getElementById('otp-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') verifyOTP();
+        });
+        document.getElementById('email-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') sendOTP();
+        });
+        document.getElementById('zerodha-id-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') document.getElementById('email-input').focus();
+        });
+    </script>
+</body>
+</html>

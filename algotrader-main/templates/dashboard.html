@@ -1,0 +1,2348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kite Trading Agent</title>
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <span class="logo">Kite Trading Agent</span>
+            <span id="status-badge" class="status-badge status-offline">OFFLINE</span>
+            {% if zerodha_id %}<span style="margin-left:12px;padding:4px 10px;background:#1a2332;border:1px solid #2a3a4a;border-radius:6px;font-size:12px;color:#00d4aa;font-weight:600;">{{ zerodha_id }}</span>{% endif %}
+        </div>
+        <div class="header-right">
+            <button class="btn btn-outline btn-sm" onclick="toggleKillSwitch()">Kill Switch</button>
+            <button id="btn-login" class="btn btn-primary btn-sm" onclick="loginKite()">Login to Zerodha</button>
+            <button id="btn-start" class="btn btn-success btn-sm" style="display:none" onclick="showModal('modal-start-live')">Start Live</button>
+            <button id="btn-stop" class="btn btn-danger btn-sm" style="display:none" onclick="stopLive()">Stop Live</button>
+            <button class="btn btn-primary btn-sm" onclick="showModal('modal-add-strategy')">+ Strategy</button>
+            <button class="btn btn-outline btn-sm" onclick="logoutUser()" style="margin-left:8px;border-color:#ff5252;color:#ff5252">Logout</button>
+        </div>
+    </header>
+
+    <div id="login-url-display" style="display:none;background:#1a2332;border:1px solid #00d4aa;padding:12px 20px;text-align:center;margin:0">
+        <a id="login-url-link" href="#" target="_blank" rel="noopener" style="color:#00d4aa;font-weight:600;font-size:15px;text-decoration:underline">Click here to open Zerodha login</a>
+        <span style="color:#8899aa;margin-left:12px;font-size:13px">(Opens in new tab. After login, copy the request_token from the URL and paste below)</span>
+        <div style="margin-top:10px;display:flex;gap:8px;justify-content:center;align-items:center;flex-wrap:wrap">
+            <input id="manual-request-token" type="text" placeholder="Paste request_token from redirect URL here" style="padding:8px 12px;border:1px solid #2a3a4a;background:#0d1821;color:#e0e6ed;border-radius:6px;width:400px;font-size:13px">
+            <button class="btn btn-success btn-sm" onclick="manualAuthenticate()">Connect</button>
+        </div>
+        <p style="color:#667788;font-size:11px;margin-top:6px">After Zerodha login, the URL will look like: ...?request_token=<b>XXXXXX</b>&status=success. Copy the token value.</p>
+    </div>
+
+    <main class="main">
+        <div class="tabs">
+            <button class="tab active" data-tab="overview" onclick="switchTab('overview')">Overview</button>
+            <button class="tab" data-tab="positions" onclick="switchTab('positions');loadPositions()">Positions</button>
+            <button class="tab" data-tab="orders" onclick="switchTab('orders');loadOrders()">Orders</button>
+            <button class="tab" data-tab="signals" onclick="switchTab('signals');loadSignals()">Signals</button>
+            <button class="tab" data-tab="strategies" onclick="switchTab('strategies')">Strategies</button>
+            <button class="tab" data-tab="risk" onclick="switchTab('risk')">Risk</button>
+            <button class="tab" data-tab="oi-tracker" onclick="switchTab('oi-tracker');initOITracker()">OI Tracker</button>
+            <button class="tab" data-tab="analysis" onclick="switchTab('analysis');loadAnalysis()">Analysis</button>
+            <button class="tab" data-tab="charts" onclick="switchTab('charts')">Charts</button>
+            <button class="tab" data-tab="backtest" onclick="switchTab('backtest')">Backtest</button>
+            <button class="tab" data-tab="reports" onclick="switchTab('reports');loadReports()">Reports</button>
+            <button class="tab" data-tab="paper-trading" onclick="switchTab('paper-trading')">Paper Trading</button>
+            <button class="tab" data-tab="strategy-builder" onclick="switchTab('strategy-builder');loadBuilderIndicators()">Strategy Builder</button>
+            <button class="tab" data-tab="journal" onclick="switchTab('journal');loadJournal()">Journal</button>
+        </div>
+
+        <!-- Overview Tab -->
+        <div id="tab-overview" class="tab-content active">
+            <div id="portfolio-section" style="display:none;margin-bottom:20px">
+                <div class="grid grid-4" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Account</div>
+                        <div id="account-name" class="metric-value" style="font-size:16px;color:var(--accent-green)">--</div>
+                        <div id="account-id" class="metric-label">--</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Available Margin</div>
+                        <div id="available-margin" class="metric-value">0.00</div>
+                        <div id="used-margin" class="metric-label">Used: 0.00</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Holdings Value</div>
+                        <div id="holdings-value" class="metric-value">0.00</div>
+                        <div id="holdings-count" class="metric-label">0 stocks</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Open Positions P&L</div>
+                        <div id="positions-pnl" class="metric-value neutral">0.00</div>
+                        <div id="positions-count" class="metric-label">0 positions</div>
+                    </div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title">Positions</div>
+                        <div class="table-wrap" style="max-height:280px;overflow-y:auto">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&L</th></tr></thead>
+                                <tbody id="overview-positions-body">
+                                    <tr><td colspan="5" style="color:var(--text-muted);text-align:center">No positions</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Holdings</div>
+                        <div class="table-wrap" style="max-height:280px;overflow-y:auto">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&L</th><th></th></tr></thead>
+                                <tbody id="overview-holdings-body">
+                                    <tr><td colspan="6" style="color:var(--text-muted);text-align:center">No holdings</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="grid grid-4" style="margin-bottom:20px">
+                <div class="card">
+                    <div class="card-title">Daily P&L</div>
+                    <div id="daily-pnl" class="metric-value neutral">0.00</div>
+                    <div class="metric-label">Realized + Unrealized</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Total P&L</div>
+                    <div id="total-pnl" class="metric-value neutral">0.00</div>
+                    <div class="metric-label">Since session start</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Total Trades</div>
+                    <div id="total-trades" class="metric-value">0</div>
+                    <div class="metric-label">Orders executed</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Exposure</div>
+                    <div id="exposure" class="metric-value">0</div>
+                    <div class="progress-bar"><div id="exposure-bar" class="progress-fill" style="width:0%"></div></div>
+                    <div class="metric-label">Capital utilization</div>
+                </div>
+            </div>
+
+            <div class="grid grid-2">
+                <div class="card">
+                    <div class="card-title">Live Market Data</div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Instrument</th>
+                                    <th>LTP</th>
+                                    <th>Change</th>
+                                    <th>High / Low</th>
+                                    <th>Volume</th>
+                                    <th>Buy / Sell Qty</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ticks-body">
+                                <tr><td colspan="6" style="color:var(--text-muted);text-align:center">No live data - click "Start Live" to stream</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Recent Signals</div>
+                    <div id="signals-log" class="table-wrap" style="max-height:340px;overflow-y:auto">
+                        <div class="empty-state"><p>No signals yet</p></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Positions Tab -->
+        <div id="tab-positions" class="tab-content">
+            <div class="card">
+                <div class="card-title">Net Positions</div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Exchange</th>
+                                <th>Qty</th>
+                                <th>Avg Price</th>
+                                <th>LTP</th>
+                                <th>P&L</th>
+                                <th>Product</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-body">
+                            <tr><td colspan="7" style="color:var(--text-muted);text-align:center">No positions</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Orders Tab -->
+        <div id="tab-orders" class="tab-content">
+            <div class="card">
+                <div class="card-title">Orders</div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Order ID</th>
+                                <th>Symbol</th>
+                                <th>Type</th>
+                                <th>Qty</th>
+                                <th>Price</th>
+                                <th>Order Type</th>
+                                <th>Product</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="orders-body">
+                            <tr><td colspan="8" style="color:var(--text-muted);text-align:center">No orders</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Signals Tab -->
+        <div id="tab-signals" class="tab-content">
+            <div class="card">
+                <div class="card-title">Signal History</div>
+                <div id="signals-log-full" class="table-wrap" style="max-height:600px;overflow-y:auto">
+                    <div class="empty-state"><p>No signals generated yet</p></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Strategies Tab -->
+        <div id="tab-strategies" class="tab-content">
+            <div class="grid grid-2">
+                <div class="card">
+                    <div class="card-title">Active Strategies</div>
+                    <div id="strategies-list">
+                        <div class="empty-state"><p>No strategies added</p></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Execution Summary</div>
+                    <table>
+                        <tr><td>Pending Orders</td><td id="exec-pending">0</td></tr>
+                        <tr><td>Filled Orders</td><td id="exec-filled">0</td></tr>
+                    </table>
+                    <div style="margin-top:16px">
+                        <div class="card-title">P&L by Strategy</div>
+                        <table>
+                            <thead><tr><th>Strategy</th><th>P&L</th></tr></thead>
+                            <tbody id="journal-by-strategy">
+                                <tr><td colspan="2" style="color:var(--text-muted)">No data</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Risk Tab -->
+        <div id="tab-risk" class="tab-content">
+            <div class="grid grid-3">
+                <div class="card">
+                    <div class="card-title">Kill Switch</div>
+                    <div class="metric-value" id="kill-switch-status" style="margin-bottom:12px">OFF</div>
+                    <button class="btn btn-danger" onclick="toggleKillSwitch()">Toggle Kill Switch</button>
+                </div>
+                <div class="card">
+                    <div class="card-title">Risk Metrics</div>
+                    <table>
+                        <tr><td>Daily P&L</td><td id="risk-daily-pnl">0.00</td></tr>
+                        <tr><td>Max Daily Loss</td><td id="risk-max-loss">0</td></tr>
+                        <tr><td>Total Exposure</td><td id="risk-exposure">0</td></tr>
+                        <tr><td>Max Exposure</td><td id="risk-max-exposure">0</td></tr>
+                        <tr><td>Position Count</td><td id="risk-positions">0</td></tr>
+                    </table>
+                </div>
+                <div class="card">
+                    <div class="card-title">Risk Controls</div>
+                    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">
+                        Risk parameters are configured via environment variables.
+                        The kill switch immediately halts all trading when daily losses
+                        exceed the threshold.
+                    </p>
+                    <ul style="font-size:12px;color:var(--text-muted);list-style:none">
+                        <li>Max Daily Loss: Configurable</li>
+                        <li>Max Position Size: Configurable</li>
+                        <li>Max Exposure: Configurable</li>
+                        <li>Stop Loss: Auto-placed</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <!-- OI Tracker Tab -->
+        <div id="tab-oi-tracker" class="tab-content">
+            <!-- OI Sub-nav -->
+            <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap">
+                <button class="btn btn-sm oi-tab-btn active" data-oi-tab="options" onclick="switchOITab('options')">Options OI (Near ATM)</button>
+                <button class="btn btn-sm oi-tab-btn" data-oi-tab="futures" onclick="switchOITab('futures')">Futures OI</button>
+                <button class="btn btn-sm oi-tab-btn" data-oi-tab="strategy" onclick="switchOITab('strategy')">OI Strategy</button>
+                <button class="btn btn-sm oi-tab-btn" data-oi-tab="live" onclick="switchOITab('live')">Live Stream</button>
+                <span style="margin-left:auto;display:flex;gap:8px;align-items:center">
+                    <select id="oi-underlying-select" class="btn btn-outline btn-sm" style="padding:6px 12px">
+                        <option value="NIFTY" selected>NIFTY</option>
+                        <option value="SENSEX">SENSEX</option>
+                    </select>
+                    <span id="oi-stream-status" class="status-badge status-offline" style="font-size:10px">IDLE</span>
+                    <span id="oi-last-update" style="font-size:11px;color:var(--text-muted)">--</span>
+                </span>
+            </div>
+
+            <!-- ═══ OPTIONS OI VIEW ═══ -->
+            <div id="oi-view-options" class="oi-view active">
+                <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+                    <button class="btn btn-primary btn-sm" onclick="runOptionsOIScan()">Scan Options OI</button>
+                    <span id="opt-oi-status" style="font-size:12px;color:var(--text-muted)">No data yet</span>
+                </div>
+                <!-- Summary Cards -->
+                <div class="grid grid-4" style="margin-bottom:16px" id="opt-oi-summary">
+                    <div class="card">
+                        <div class="card-title">Spot / ATM</div>
+                        <div id="opt-spot" class="metric-value">--</div>
+                        <div class="metric-label">ATM: <span id="opt-atm">--</span> | Expiry: <span id="opt-expiry">--</span></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">PCR (OI / Vol)</div>
+                        <div id="opt-pcr" class="metric-value">--</div>
+                        <div class="metric-label">Vol PCR: <span id="opt-pcr-vol">--</span></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Max Pain / Straddle</div>
+                        <div id="opt-maxpain" class="metric-value">--</div>
+                        <div class="metric-label">ATM Straddle: ₹<span id="opt-straddle">--</span></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">OI Bias</div>
+                        <div id="opt-bias" class="metric-value">--</div>
+                        <div id="opt-bias-reasons" class="metric-label" style="font-size:10px;max-height:40px;overflow-y:auto">--</div>
+                    </div>
+                </div>
+                <!-- OI Walls -->
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">OI Walls (Support / Resistance)</div>
+                        <div id="opt-oi-walls" style="display:flex;gap:16px;padding:8px 0;flex-wrap:wrap">
+                            <div style="flex:1;min-width:120px">
+                                <div style="font-size:11px;color:var(--text-muted)">PE Wall (Support)</div>
+                                <div id="opt-pe-wall" style="font-size:20px;font-weight:700;color:#00d4aa">--</div>
+                                <div id="opt-pe-wall-oi" style="font-size:11px;color:var(--text-muted)">OI: --</div>
+                            </div>
+                            <div style="flex:1;min-width:120px">
+                                <div style="font-size:11px;color:var(--text-muted)">CE Wall (Resistance)</div>
+                                <div id="opt-ce-wall" style="font-size:20px;font-weight:700;color:#ff5252">--</div>
+                                <div id="opt-ce-wall-oi" style="font-size:11px;color:var(--text-muted)">OI: --</div>
+                            </div>
+                            <div style="flex:1;min-width:120px">
+                                <div style="font-size:11px;color:var(--text-muted)">IV Skew (PE-CE)</div>
+                                <div id="opt-iv-skew" style="font-size:20px;font-weight:700">--</div>
+                                <div style="font-size:11px;color:var(--text-muted)">Avg CE: <span id="opt-ce-iv">--</span> | PE: <span id="opt-pe-iv">--</span></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">CE + PE Total OI</div>
+                        <div style="display:flex;gap:16px;padding:8px 0">
+                            <div style="flex:1">
+                                <div style="font-size:11px;color:#ff5252">Total CE OI</div>
+                                <div id="opt-ce-total" style="font-size:18px;font-weight:600">--</div>
+                                <div style="font-size:11px;color:var(--text-muted)">Vol: <span id="opt-ce-vol">--</span></div>
+                            </div>
+                            <div style="flex:1">
+                                <div style="font-size:11px;color:#00d4aa">Total PE OI</div>
+                                <div id="opt-pe-total" style="font-size:18px;font-weight:600">--</div>
+                                <div style="font-size:11px;color:var(--text-muted)">Vol: <span id="opt-pe-vol">--</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Strike-by-strike OI Chain -->
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-title">Near-ATM OI Chain (CE ← Strike → PE)</div>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th style="text-align:right">CE OI Chg</th>
+                                    <th style="text-align:right">CE Vol</th>
+                                    <th style="text-align:right">CE OI</th>
+                                    <th style="text-align:right">CE LTP</th>
+                                    <th style="text-align:right">CE IV</th>
+                                    <th style="text-align:center;font-weight:700">Strike</th>
+                                    <th>PE IV</th>
+                                    <th>PE LTP</th>
+                                    <th>PE OI</th>
+                                    <th>PE Vol</th>
+                                    <th>PE OI Chg</th>
+                                    <th>Net OI Chg</th>
+                                </tr>
+                            </thead>
+                            <tbody id="opt-chain-body">
+                                <tr><td colspan="12" style="color:var(--text-muted);text-align:center">Run scan to load data</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <!-- Top OI Additions + Buildup Signals -->
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Top OI Additions</div>
+                        <div class="grid grid-2" style="gap:8px">
+                            <div>
+                                <div style="font-size:11px;color:#ff5252;margin-bottom:4px;font-weight:600">CE OI Additions</div>
+                                <div id="opt-top-ce-adds" class="table-wrap" style="max-height:180px;font-size:12px">--</div>
+                            </div>
+                            <div>
+                                <div style="font-size:11px;color:#00d4aa;margin-bottom:4px;font-weight:600">PE OI Additions</div>
+                                <div id="opt-top-pe-adds" class="table-wrap" style="max-height:180px;font-size:12px">--</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">OI Buildup Signals</div>
+                        <div id="opt-buildup-signals" class="table-wrap" style="max-height:250px">
+                            <div class="empty-state"><p>No signals yet</p></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ FUTURES OI VIEW ═══ -->
+            <div id="oi-view-futures" class="oi-view">
+                <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+                    <button class="btn btn-primary btn-sm" onclick="runFuturesOIScan()">Scan Futures OI</button>
+                    <span id="fut-oi-status" style="font-size:12px;color:var(--text-muted)">No data yet</span>
+                </div>
+                <!-- Market Sentiment -->
+                <div class="card" style="margin-bottom:16px" id="fut-sentiment-card">
+                    <div class="card-title">Market Futures Sentiment</div>
+                    <div id="fut-sentiment" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:8px 0">
+                        <div>
+                            <div style="font-size:11px;color:var(--text-muted)">Bias</div>
+                            <div id="fut-bias" style="font-size:22px;font-weight:700">--</div>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;color:var(--text-muted)">Confidence</div>
+                            <div id="fut-confidence" style="font-size:18px;font-weight:600">--%</div>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;color:#00d4aa">Long Build + Short Cover</div>
+                            <div id="fut-bullish-count" style="font-size:18px;font-weight:600;color:#00d4aa">--</div>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;color:#ff5252">Short Build + Long Unwind</div>
+                            <div id="fut-bearish-count" style="font-size:18px;font-weight:600;color:#ff5252">--</div>
+                        </div>
+                        <div id="fut-reasons" style="flex:1;min-width:200px;font-size:11px;color:var(--text-muted);max-height:60px;overflow-y:auto">--</div>
+                    </div>
+                </div>
+                <!-- Index Futures -->
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-title">Index Futures</div>
+                    <div class="table-wrap" style="max-height:200px">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Index</th><th>Expiry</th><th>LTP</th><th>Chg %</th>
+                                    <th>OI</th><th>OI Chg</th><th>OI Chg %</th><th>Volume</th><th>Buildup</th>
+                                </tr>
+                            </thead>
+                            <tbody id="fut-index-body"><tr><td colspan="9" style="color:var(--text-muted);text-align:center">Run scan</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+                <!-- Futures OI Sub-views -->
+                <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
+                    <button class="btn btn-outline btn-sm fut-view-btn active" onclick="switchFutView('buildup')">Buildup View</button>
+                    <button class="btn btn-outline btn-sm fut-view-btn" onclick="switchFutView('all')">All Stocks</button>
+                    <button class="btn btn-outline btn-sm fut-view-btn" onclick="switchFutView('rollover')">Rollover</button>
+                    <button class="btn btn-outline btn-sm fut-view-btn" onclick="switchFutView('sector')">Sector Heat</button>
+                </div>
+                <!-- Buildup View -->
+                <div id="fut-view-buildup" class="fut-view active">
+                    <div class="grid grid-2" style="margin-bottom:16px">
+                        <div class="card">
+                            <div class="card-title" style="color:#00d4aa">Long Buildup (Price ↑ OI ↑)</div>
+                            <div class="table-wrap" style="max-height:300px">
+                                <table><thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>Chg%</th><th>OI Chg%</th><th>Volume</th></tr></thead>
+                                    <tbody id="fut-long-buildup-body"><tr><td colspan="6" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title" style="color:#ff5252">Short Buildup (Price ↓ OI ↑)</div>
+                            <div class="table-wrap" style="max-height:300px">
+                                <table><thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>Chg%</th><th>OI Chg%</th><th>Volume</th></tr></thead>
+                                    <tbody id="fut-short-buildup-body"><tr><td colspan="6" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="grid grid-2">
+                        <div class="card">
+                            <div class="card-title" style="color:#ff9100">Long Unwinding (Price ↓ OI ↓)</div>
+                            <div class="table-wrap" style="max-height:300px">
+                                <table><thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>Chg%</th><th>OI Chg%</th><th>Volume</th></tr></thead>
+                                    <tbody id="fut-long-unwind-body"><tr><td colspan="6" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title" style="color:#64b5f6">Short Covering (Price ↑ OI ↓)</div>
+                            <div class="table-wrap" style="max-height:300px">
+                                <table><thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>Chg%</th><th>OI Chg%</th><th>Volume</th></tr></thead>
+                                    <tbody id="fut-short-cover-body"><tr><td colspan="6" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- All Stocks View -->
+                <div id="fut-view-all" class="fut-view">
+                    <div class="card">
+                        <div class="card-title">All Stock Futures</div>
+                        <div class="table-wrap" style="max-height:500px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>Sector</th><th>Expiry</th><th>LTP</th><th>Chg%</th><th>OI</th><th>OI Chg</th><th>OI Chg%</th><th>Volume</th><th>Val (L)</th><th>Buildup</th></tr></thead>
+                                <tbody id="fut-all-body"><tr><td colspan="11" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <!-- Rollover View -->
+                <div id="fut-view-rollover" class="fut-view">
+                    <div class="card">
+                        <div class="card-title">Rollover Analysis (Current → Next Expiry)</div>
+                        <div class="table-wrap" style="max-height:500px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>Current Exp</th><th>Next Exp</th><th>Current OI</th><th>Next OI</th><th>Rollover %</th><th>Basis %</th><th>Signal</th></tr></thead>
+                                <tbody id="fut-rollover-body"><tr><td colspan="8" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <!-- Sector View -->
+                <div id="fut-view-sector" class="fut-view">
+                    <div class="card">
+                        <div class="card-title">Sector Futures Heatmap</div>
+                        <div id="fut-sector-heatmap" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px"></div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Sector</th><th>Avg Chg%</th><th>Long BU</th><th>Short BU</th><th>Long UW</th><th>Short CV</th><th>Bias</th><th>Stocks</th></tr></thead>
+                                <tbody id="fut-sector-body"><tr><td colspan="8" style="color:var(--text-muted);text-align:center">--</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ OI STRATEGY VIEW ═══ -->
+            <div id="oi-view-strategy" class="oi-view">
+                <!-- Scan Controls -->
+                <div style="display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+                    <button class="btn btn-primary btn-sm" onclick="runOIStrategyScan('NIFTY')">Scan NIFTY</button>
+                    <button class="btn btn-primary btn-sm" onclick="runOIStrategyScan('SENSEX')">Scan SENSEX</button>
+                    <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="runOIStrategyScanBoth()">Scan Both</button>
+                    <button class="btn btn-sm" onclick="loadOIStrategyPositions()">Refresh Positions</button>
+                    <button class="btn btn-sm" onclick="loadOIStrategySummary()">Summary</button>
+                    <button class="btn btn-sm" onclick="toggleOIStrategyConfig()">⚙ Config</button>
+                    <span id="oi-strat-scan-status" style="color:var(--text-muted);font-size:12px"></span>
+                </div>
+
+                <!-- Summary Cards -->
+                <div class="grid grid-4" id="oi-strat-summary-cards" style="margin-bottom:16px">
+                    <div class="card"><div class="card-title">Direction</div><div id="oi-strat-direction" class="metric-value">--</div><div class="metric-label">Combined Bias</div></div>
+                    <div class="card"><div class="card-title">Confidence</div><div id="oi-strat-confidence" class="metric-value">--</div><div class="metric-label">Signal Strength</div></div>
+                    <div class="card"><div class="card-title">Signals Found</div><div id="oi-strat-signal-count" class="metric-value">--</div><div class="metric-label">Active Signals</div></div>
+                    <div class="card"><div class="card-title">P&L</div><div id="oi-strat-pnl" class="metric-value">--</div><div class="metric-label">Open Positions</div></div>
+                </div>
+
+                <!-- Last Scan Details -->
+                <div class="card" id="oi-strat-scan-detail" style="margin-bottom:16px;display:none">
+                    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+                        <span>Last Scan: <span id="oi-strat-scan-index">--</span></span>
+                        <span id="oi-strat-scan-time" style="font-size:11px;color:var(--text-muted)"></span>
+                    </div>
+                    <div class="grid grid-4" style="margin-top:8px">
+                        <div><span style="color:var(--text-muted);font-size:11px">PCR</span><br><strong id="oi-strat-pcr">--</strong></div>
+                        <div><span style="color:var(--text-muted);font-size:11px">Max Pain</span><br><strong id="oi-strat-maxpain">--</strong></div>
+                        <div><span style="color:var(--text-muted);font-size:11px">IV Skew</span><br><strong id="oi-strat-ivskew">--</strong></div>
+                        <div><span style="color:var(--text-muted);font-size:11px">Straddle Prem</span><br><strong id="oi-strat-straddle">--</strong></div>
+                    </div>
+                </div>
+
+                <!-- Signals Table -->
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-title">Active Signals</div>
+                    <div class="table-wrap">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>Index</th><th>Type</th><th>Direction</th><th>Strike</th><th>Option</th>
+                                <th>Confidence</th><th>Action</th><th>Price</th><th>SL</th><th>Target</th><th>Execute</th>
+                            </tr></thead>
+                            <tbody id="oi-strat-signals-body">
+                                <tr><td colspan="11" style="color:var(--text-muted);text-align:center">Run a scan to detect signals</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Open Positions -->
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-title">Open Positions</div>
+                    <div class="table-wrap">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>Index</th><th>Signal</th><th>Action</th><th>Strike</th><th>Entry</th>
+                                <th>Current</th><th>P&L</th><th>SL</th><th>Target</th><th>Close</th>
+                            </tr></thead>
+                            <tbody id="oi-strat-open-body">
+                                <tr><td colspan="10" style="color:var(--text-muted);text-align:center">No open positions</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Closed Positions -->
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+                        <span>Closed Positions</span>
+                        <button class="btn btn-sm" onclick="document.getElementById('oi-strat-closed-wrap').style.display=document.getElementById('oi-strat-closed-wrap').style.display==='none'?'block':'none'">Toggle</button>
+                    </div>
+                    <div id="oi-strat-closed-wrap" style="display:none">
+                        <div class="table-wrap">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>Index</th><th>Signal</th><th>Action</th><th>Strike</th><th>Entry</th>
+                                    <th>Exit</th><th>P&L</th><th>Reason</th><th>Duration</th>
+                                </tr></thead>
+                                <tbody id="oi-strat-closed-body">
+                                    <tr><td colspan="9" style="color:var(--text-muted);text-align:center">No closed positions</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Performance Summary -->
+                <div class="card" id="oi-strat-perf-card" style="margin-bottom:16px;display:none">
+                    <div class="card-title">Performance Summary</div>
+                    <div class="grid grid-4" style="margin-bottom:12px">
+                        <div><span style="color:var(--text-muted);font-size:11px">Total Trades</span><br><strong id="oi-strat-perf-total">0</strong></div>
+                        <div><span style="color:var(--text-muted);font-size:11px">Win Rate</span><br><strong id="oi-strat-perf-winrate">--</strong></div>
+                        <div><span style="color:var(--text-muted);font-size:11px">Total P&L</span><br><strong id="oi-strat-perf-pnl">--</strong></div>
+                        <div><span style="color:var(--text-muted);font-size:11px">Avg P&L/Trade</span><br><strong id="oi-strat-perf-avg">--</strong></div>
+                    </div>
+                    <div id="oi-strat-perf-by-type"></div>
+                </div>
+
+                <!-- Config Panel (hidden by default) -->
+                <div class="card" id="oi-strat-config-panel" style="display:none;margin-bottom:16px">
+                    <div class="card-title">OI Strategy Configuration</div>
+                    <div class="grid grid-3" style="gap:12px">
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">PCR Bullish Threshold</label>
+                            <input type="number" id="oi-cfg-pcr-bull" step="0.1" value="0.5" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">PCR Bearish Threshold</label>
+                            <input type="number" id="oi-cfg-pcr-bear" step="0.1" value="1.5" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">Wall Proximity %</label>
+                            <input type="number" id="oi-cfg-wall-prox" step="0.1" value="1.5" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">Straddle Collapse %</label>
+                            <input type="number" id="oi-cfg-straddle-col" step="1" value="20" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">IV Skew Threshold</label>
+                            <input type="number" id="oi-cfg-iv-skew" step="0.5" value="5.0" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">Min Confidence</label>
+                            <input type="number" id="oi-cfg-min-conf" step="0.05" value="0.6" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">Max Positions</label>
+                            <input type="number" id="oi-cfg-max-pos" step="1" value="5" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">Default SL %</label>
+                            <input type="number" id="oi-cfg-sl" step="1" value="30" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:var(--text-muted)">Default Target %</label>
+                            <input type="number" id="oi-cfg-target" step="1" value="60" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                        </div>
+                    </div>
+                    <div style="margin-top:12px;display:flex;gap:8px">
+                        <button class="btn btn-primary btn-sm" onclick="saveOIStrategyConfig()">Save Config</button>
+                        <button class="btn btn-sm" onclick="loadOIStrategyConfig()">Reset</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ LIVE STREAM VIEW (legacy) ═══ -->
+            <div id="oi-view-live" class="oi-view">
+                <div class="grid grid-4" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Spot</div>
+                        <div id="oi-nifty-spot" class="metric-value">--</div>
+                        <div class="metric-label">ATM: <span id="oi-nifty-atm">--</span></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">PCR (OI)</div>
+                        <div id="oi-nifty-pcr" class="metric-value">--</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Total CE OI</div>
+                        <div id="oi-nifty-ce-total" class="metric-value" style="font-size:22px">--</div>
+                        <div class="metric-label">Vol: <span id="oi-nifty-ce-vol">--</span></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Total PE OI</div>
+                        <div id="oi-nifty-pe-total" class="metric-value" style="font-size:22px">--</div>
+                        <div class="metric-label">Vol: <span id="oi-nifty-pe-vol">--</span></div>
+                    </div>
+                </div>
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Near ATM - Calls (CE)</div>
+                        <div class="table-wrap" style="max-height:350px">
+                            <table>
+                                <thead><tr><th>Strike</th><th>OI</th><th>OI Chg</th><th>OI Chg %</th><th>Volume</th><th>LTP</th><th>LTP Chg</th></tr></thead>
+                                <tbody id="oi-atm-ce-body"><tr><td colspan="7" style="color:var(--text-muted);text-align:center">No data</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Near ATM - Puts (PE)</div>
+                        <div class="table-wrap" style="max-height:350px">
+                            <table>
+                                <thead><tr><th>Strike</th><th>OI</th><th>OI Chg</th><th>OI Chg %</th><th>Volume</th><th>LTP</th><th>LTP Chg</th></tr></thead>
+                                <tbody id="oi-atm-pe-body"><tr><td colspan="7" style="color:var(--text-muted);text-align:center">No data</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Most Active Options</div>
+                        <div class="table-wrap" style="max-height:300px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>Type</th><th>Strike</th><th>OI</th><th>Volume</th><th>Activity</th></tr></thead>
+                                <tbody id="oi-most-active-body"><tr><td colspan="6" style="color:var(--text-muted);text-align:center">No data</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">OI Losers</div>
+                        <div class="table-wrap" style="max-height:300px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>Type</th><th>Strike</th><th>OI</th><th>OI Lost</th><th>OI Lost %</th></tr></thead>
+                                <tbody id="oi-losers-body"><tr><td colspan="6" style="color:var(--text-muted);text-align:center">No data</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">OI Buildup Signals (Live)</div>
+                    <div id="oi-buildup-signals" class="table-wrap" style="max-height:300px">
+                        <div class="empty-state"><p>No buildup signals detected yet</p></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Analysis Tab -->
+        <div id="tab-analysis" class="tab-content">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+                <select id="scan-universe" style="padding:4px 8px;border-radius:4px;background:var(--card-bg);color:var(--text);border:1px solid var(--border);font-size:12px">
+                    <option value="nifty50">NIFTY 50</option>
+                    <option value="nifty500">NIFTY 500</option>
+                </select>
+                <button id="btn-run-scan" class="btn btn-primary btn-sm" onclick="runAnalysisScan()">Run Full Scan</button>
+                <span id="scan-status" style="font-size:12px;color:var(--text-muted)">No scan data yet</span>
+                <span id="scan-time" style="font-size:11px;color:var(--text-muted);margin-left:auto"></span>
+            </div>
+
+            <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+                <button class="btn btn-outline btn-sm analysis-view-btn active" data-view="super" onclick="switchAnalysisView('super')">Super Performers</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="stage2" onclick="switchAnalysisView('stage2')">Stage 2</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="rs" onclick="switchAnalysisView('rs')">RS Leaders</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="vcp" onclick="switchAnalysisView('vcp')">VCP Setups</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="accumulation" onclick="switchAnalysisView('accumulation')">Accumulation</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="sectors" onclick="switchAnalysisView('sectors')">Sectors</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="daily" onclick="switchAnalysisView('daily')">Daily</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="weekly" onclick="switchAnalysisView('weekly')">Weekly</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="monthly" onclick="switchAnalysisView('monthly')">Monthly</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="triggers" onclick="switchAnalysisView('triggers')">Triggers</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="volume" onclick="switchAnalysisView('volume')">Volume Surges</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="52w" onclick="switchAnalysisView('52w')">52W High/Low</button>
+                <button class="btn btn-outline btn-sm analysis-view-btn" data-view="all" onclick="switchAnalysisView('all')">All Stocks</button>
+            </div>
+
+            <!-- Super Performers View -->
+            <div id="analysis-view-super" class="analysis-view active">
+                <div class="card">
+                    <div class="card-title" style="color:#00d4aa">Super Performance Stocks (Minervini Trend Template)</div>
+                    <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Stocks meeting 9+ of 13 criteria: Price above major SMAs, rising 200 SMA, 25%+ from 52W low, within 25% of high, RSI > 50, strong ADX, above-avg volume, Stage 2 advancing, positive slope, high RS rating</p>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th>
+                                    <th>Sector</th>
+                                    <th>LTP</th>
+                                    <th>Grade</th>
+                                    <th>Score</th>
+                                    <th>Stage</th>
+                                    <th>RS</th>
+                                    <th>Trend</th>
+                                    <th>RSI</th>
+                                    <th>ADX</th>
+                                    <th>1D %</th>
+                                    <th>Accum</th>
+                                    <th>Triggers</th>
+                                    <th>Detail</th>
+                                </tr>
+                            </thead>
+                            <tbody id="analysis-super-body">
+                                <tr><td colspan="14" style="color:var(--text-muted);text-align:center">Run scan to see results</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 2 Advancing View -->
+            <div id="analysis-view-stage2" class="analysis-view">
+                <div class="card">
+                    <div class="card-title" style="color:#ffe066">Stage 2 Advancing (Weinstein)</div>
+                    <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Stocks in Stage 2 uptrend — price above rising 200 SMA, ideal for momentum buying</p>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>RS</th><th>Trend</th><th>ADX</th><th>Vol</th><th>1D %</th><th>20D %</th><th>60D %</th><th>VCP</th><th>Accum</th><th>Detail</th></tr></thead>
+                            <tbody id="analysis-stage2-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- RS Leaders View -->
+            <div id="analysis-view-rs" class="analysis-view">
+                <div class="card">
+                    <div class="card-title" style="color:#00bcd4">Relative Strength Leaders (vs NIFTY 50)</div>
+                    <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">IBD-style RS Rating (1-99). Stocks outperforming the benchmark across multiple timeframes</p>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>RS Rating</th><th>Stage</th><th>Trend</th><th>1D %</th><th>20D %</th><th>60D %</th><th>250D %</th><th>Detail</th></tr></thead>
+                            <tbody id="analysis-rs-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- VCP Setups View -->
+            <div id="analysis-view-vcp" class="analysis-view">
+                <div class="card">
+                    <div class="card-title" style="color:#e040fb">VCP Setups (Volatility Contraction Pattern)</div>
+                    <p style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Mark Minervini's VCP — successive tighter price contractions indicating institutional accumulation before breakout</p>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead><tr><th>Symbol</th><th>Sector</th><th>LTP</th><th>Pivot</th><th>Tightness</th><th>RS</th><th>Stage</th><th>Vol</th><th>Pocket Pivot</th><th>Accum</th><th>Detail</th></tr></thead>
+                            <tbody id="analysis-vcp-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Accumulation View -->
+            <div id="analysis-view-accumulation" class="analysis-view">
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title" style="color:#00d4aa">Institutional Accumulation</div>
+                        <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px">OBV rising + MFI strong + pocket pivots — institutions building positions</p>
+                        <div class="table-wrap" style="max-height:450px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>Score</th><th>OBV</th><th>MFI</th><th>Signals</th><th>Detail</th></tr></thead>
+                                <tbody id="analysis-accumulating-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title" style="color:#ff5252">Institutional Distribution</div>
+                        <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px">OBV falling + MFI weak — institutions selling / reducing positions</p>
+                        <div class="table-wrap" style="max-height:450px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>Score</th><th>OBV</th><th>MFI</th><th>Signals</th><th>Detail</th></tr></thead>
+                                <tbody id="analysis-distributing-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sectors View -->
+            <div id="analysis-view-sectors" class="analysis-view">
+                <div class="card">
+                    <div class="card-title">Sector Analysis — Relative Performance Heatmap</div>
+                    <div id="sector-heatmap" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Sector Details</div>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead><tr><th>Sector</th><th>Stocks</th><th>1D %</th><th>5D %</th><th>20D %</th><th>60D %</th><th>Avg RS</th><th>Avg Trend</th><th>Super Perf</th><th>Best Stock</th></tr></thead>
+                            <tbody id="analysis-sectors-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Daily View -->
+            <div id="analysis-view-daily" class="analysis-view">
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title" style="color:#00d4aa">Top Daily Gainers</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>1D %</th><th>RSI</th><th>Vol</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-daily-gainers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title" style="color:#ff5252">Top Daily Losers</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>1D %</th><th>RSI</th><th>Vol</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-daily-losers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Weekly View -->
+            <div id="analysis-view-weekly" class="analysis-view">
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title" style="color:#00d4aa">Top Weekly Gainers (5-Day)</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>5D %</th><th>RSI</th><th>MACD</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-weekly-gainers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title" style="color:#ff5252">Top Weekly Losers (5-Day)</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>5D %</th><th>RSI</th><th>MACD</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-weekly-losers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Monthly View -->
+            <div id="analysis-view-monthly" class="analysis-view">
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title" style="color:#00d4aa">Top Monthly Gainers (20-Day)</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>20D %</th><th>SMA 50</th><th>SMA 200</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-monthly-gainers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title" style="color:#ff5252">Top Monthly Losers (20-Day)</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>20D %</th><th>SMA 50</th><th>SMA 200</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-monthly-losers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Triggers View -->
+            <div id="analysis-view-triggers" class="analysis-view">
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title" style="color:#00d4aa">Bullish Triggers</div>
+                        <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px">Stocks with MACD crossover, RSI oversold, Golden Cross, volume breakout, near 52W high, Bollinger bounce</p>
+                        <div class="table-wrap" style="max-height:450px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>1D %</th><th>Signal</th><th>Strength</th></tr></thead>
+                                <tbody id="analysis-bullish-triggers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title" style="color:#ff5252">Bearish Triggers</div>
+                        <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px">Stocks with MACD death cross, RSI overbought, Death Cross, volume breakdown, near 52W low</p>
+                        <div class="table-wrap" style="max-height:450px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>1D %</th><th>Signal</th><th>Strength</th></tr></thead>
+                                <tbody id="analysis-bearish-triggers"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Volume Surges View -->
+            <div id="analysis-view-volume" class="analysis-view">
+                <div class="card">
+                    <div class="card-title">Volume Surges (1.5x+ Average)</div>
+                    <div class="table-wrap" style="max-height:500px">
+                        <table>
+                            <thead><tr><th>Symbol</th><th>LTP</th><th>1D %</th><th>Vol Ratio</th><th>RSI</th><th>MACD</th><th>Trend</th></tr></thead>
+                            <tbody id="analysis-volume-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 52 Week High/Low View -->
+            <div id="analysis-view-52w" class="analysis-view">
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title" style="color:#00d4aa">Near 52-Week High</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>52W High</th><th>Dist %</th><th>RSI</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-52w-high-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title" style="color:#ff5252">Near 52-Week Low</div>
+                        <div class="table-wrap" style="max-height:400px">
+                            <table>
+                                <thead><tr><th>Symbol</th><th>LTP</th><th>52W Low</th><th>Dist %</th><th>RSI</th><th>Trend</th></tr></thead>
+                                <tbody id="analysis-52w-low-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- All Stocks View -->
+            <div id="analysis-view-all" class="analysis-view">
+                <div class="card">
+                    <div class="card-title">All Scanned Stocks — Full Deep Analysis Snapshot</div>
+                    <div class="table-wrap" style="max-height:600px;overflow:auto">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th>
+                                    <th>Sector</th>
+                                    <th>LTP</th>
+                                    <th>1D %</th>
+                                    <th>5D %</th>
+                                    <th>20D %</th>
+                                    <th>Stage</th>
+                                    <th>RS</th>
+                                    <th>RSI</th>
+                                    <th>ADX</th>
+                                    <th>Vol</th>
+                                    <th>Grade</th>
+                                    <th>Trend</th>
+                                    <th>Accum</th>
+                                    <th>Detail</th>
+                                </tr>
+                            </thead>
+                            <tbody id="analysis-all-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Deep Profile Modal -->
+            <div id="deep-profile-modal" class="modal-overlay" style="display:none">
+                <div class="modal-content" style="max-width:800px;max-height:90vh;overflow-y:auto">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+                        <h3 id="deep-profile-title" style="margin:0;color:var(--primary)">Stock Profile</h3>
+                        <button class="btn btn-outline btn-sm" onclick="closeDeepProfile()">&times; Close</button>
+                    </div>
+                    <div id="deep-profile-body"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Tab -->
+        <div id="tab-charts" class="tab-content">
+            <div class="card" style="margin-bottom:16px">
+                <div class="card-title">Historical Chart</div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:16px">
+                    <div class="form-group" style="margin:0;flex:1;min-width:180px">
+                        <label>Symbol</label>
+                        <div style="display:flex;gap:6px">
+                            <input id="chart-symbol" type="text" placeholder="e.g. RELIANCE" value="RELIANCE" style="flex:1">
+                            <select id="chart-exchange" style="width:80px"><option value="NSE" selected>NSE</option><option value="BSE">BSE</option><option value="NFO">NFO</option></select>
+                        </div>
+                    </div>
+                    <div class="form-group" style="margin:0;min-width:120px">
+                        <label>Interval</label>
+                        <select id="chart-interval">
+                            <option value="minute">1 Min</option>
+                            <option value="5minute">5 Min</option>
+                            <option value="15minute">15 Min</option>
+                            <option value="30minute">30 Min</option>
+                            <option value="60minute">1 Hour</option>
+                            <option value="day" selected>Daily</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin:0;min-width:80px">
+                        <label>Days</label>
+                        <input id="chart-days" type="number" value="365" min="1" max="2000">
+                    </div>
+                    <div class="form-group" style="margin:0;min-width:130px">
+                        <label>Timezone</label>
+                        <select id="chart-timezone" onchange="if(window._chartData) renderPriceChart(window._chartData)">
+                            <option value="Asia/Kolkata" selected>IST (India)</option>
+                            <option value="America/New_York">EST (New York)</option>
+                            <option value="America/Chicago">CST (Chicago)</option>
+                            <option value="Europe/London">GMT (London)</option>
+                            <option value="Asia/Tokyo">JST (Tokyo)</option>
+                            <option value="Asia/Hong_Kong">HKT (Hong Kong)</option>
+                            <option value="Asia/Singapore">SGT (Singapore)</option>
+                            <option value="UTC">UTC</option>
+                        </select>
+                    </div>
+                    <button class="btn btn-primary btn-sm" onclick="loadChart()" style="height:36px">Load Chart</button>
+                </div>
+                <!-- Indicator Toggles -->
+                <div id="chart-indicator-toggles" style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:10px;align-items:center">
+                    <span style="color:var(--text-secondary);font-size:11px;font-weight:600;margin-right:4px">Overlays:</span>
+                    <label class="ind-toggle" style="--ind-color:#ffb74d"><input type="checkbox" class="chart-ind-cb" data-ind="sma_20" checked><span class="ind-swatch"></span>SMA 20</label>
+                    <label class="ind-toggle" style="--ind-color:#42a5f5"><input type="checkbox" class="chart-ind-cb" data-ind="sma_50" checked><span class="ind-swatch"></span>SMA 50</label>
+                    <label class="ind-toggle" style="--ind-color:#ce93d8"><input type="checkbox" class="chart-ind-cb" data-ind="sma_200" checked><span class="ind-swatch"></span>SMA 200</label>
+                    <label class="ind-toggle" style="--ind-color:#ffd54f"><input type="checkbox" class="chart-ind-cb" data-ind="ema_9" checked><span class="ind-swatch"></span>EMA 9</label>
+                    <label class="ind-toggle" style="--ind-color:#4dd0e1"><input type="checkbox" class="chart-ind-cb" data-ind="ema_21"><span class="ind-swatch"></span>EMA 21</label>
+                    <label class="ind-toggle" style="--ind-color:#607d8b"><input type="checkbox" class="chart-ind-cb" data-ind="bb" checked><span class="ind-swatch"></span>Bollinger</label>
+                    <label class="ind-toggle" style="--ind-color:#ff7043"><input type="checkbox" class="chart-ind-cb" data-ind="vwap"><span class="ind-swatch"></span>VWAP</label>
+                    <span style="color:var(--text-secondary);font-size:11px;font-weight:600;margin-left:10px;margin-right:4px">Panels:</span>
+                    <label class="ind-toggle" style="--ind-color:#ab47bc"><input type="checkbox" class="chart-ind-cb" data-ind="rsi_14" checked><span class="ind-swatch"></span>RSI 14</label>
+                    <label class="ind-toggle" style="--ind-color:#66bb6a"><input type="checkbox" class="chart-ind-cb" data-ind="vol_sma"><span class="ind-swatch"></span>Vol SMA</label>
+                </div>
+                <div id="chart-status" style="color:var(--text-muted);font-size:12px;margin-bottom:8px"></div>
+                <div id="chart-container" style="min-height:480px;background:#0d1821;border:1px solid #1a2332;border-radius:8px;position:relative">
+                    <canvas id="price-chart" style="width:100%;height:400px"></canvas>
+                    <canvas id="rsi-chart" style="width:100%;height:0px;display:none"></canvas>
+                    <canvas id="volume-chart" style="width:100%;height:80px"></canvas>
+                </div>
+                <div id="chart-indicators-panel" style="margin-top:12px;display:none">
+                    <div class="grid grid-4" id="chart-indicator-cards"></div>
+                </div>
+            </div>
+
+            <!-- Market Overview -->
+            <div class="card">
+                <div class="card-title">Market Overview
+                    <button class="btn btn-outline btn-sm" onclick="loadMarketOverview()" style="float:right;font-size:11px">Refresh</button>
+                </div>
+                <div class="table-wrap" style="max-height:400px;overflow-y:auto">
+                    <table>
+                        <thead><tr><th>Symbol</th><th>LTP</th><th>Change</th><th>%</th><th>Open</th><th>High</th><th>Low</th><th>Volume</th></tr></thead>
+                        <tbody id="market-overview-body">
+                            <tr><td colspan="8" style="color:var(--text-muted);text-align:center">Click Refresh to load market data</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Backtest Tab -->
+        <div id="tab-backtest" class="tab-content">
+            <div class="grid grid-2" style="margin-bottom:16px">
+                <div class="card">
+                    <div class="card-title">Run Backtest</div>
+                    <div class="form-group">
+                        <label>Strategy</label>
+                        <select id="bt-strategy" onchange="toggleBTMode()">
+                            <optgroup label="Equity Strategies">
+                                <option value="ema_crossover">EMA Crossover</option>
+                                <option value="rsi">RSI Strategy</option>
+                                <option value="vwap_breakout">VWAP Breakout</option>
+                                <option value="mean_reversion">Mean Reversion</option>
+                                <option value="scanner_strategy">Scanner Strategy (All-in-One)</option>
+                            </optgroup>
+                            <optgroup label="Analysis Strategies">
+                                <option value="macd_crossover">MACD Crossover</option>
+                                <option value="golden_death_cross">Golden / Death Cross</option>
+                                <option value="volume_breakout_analysis">Volume Breakout</option>
+                                <option value="bollinger_bands">Bollinger Bands</option>
+                                <option value="stochastic">Stochastic Oscillator</option>
+                                <option value="ichimoku_cloud">Ichimoku Cloud</option>
+                                <option value="vcp_pattern">VCP Pattern</option>
+                                <option value="pocket_pivot">Pocket Pivot</option>
+                                <option value="stage_analysis">Stage Analysis (Weinstein)</option>
+                                <option value="cci_extreme">CCI Extreme</option>
+                                <option value="mfi_strategy">MFI (Money Flow Index)</option>
+                                <option value="52_week_hl">52-Week High / Low</option>
+                            </optgroup>
+                            <optgroup label="F&O Option Strategies">
+                                <option value="fno_iron_condor">Iron Condor</option>
+                                <option value="fno_bull_call_spread">Bull Call Spread</option>
+                                <option value="fno_bear_put_spread">Bear Put Spread</option>
+                                <option value="fno_bull_put_spread">Bull Put Spread</option>
+                                <option value="fno_bear_call_spread">Bear Call Spread</option>
+                                <option value="fno_straddle">Long Straddle</option>
+                                <option value="fno_short_straddle">Short Straddle</option>
+                                <option value="fno_strangle">Long Strangle</option>
+                                <option value="fno_short_strangle">Short Strangle</option>
+                                <option value="fno_iron_butterfly">Iron Butterfly</option>
+                            </optgroup>
+                            <optgroup id="bt-custom-strategies" label="Custom Strategies"></optgroup>
+                            <optgroup id="bt-fno-custom-strategies" label="Custom F&O Strategies"></optgroup>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Data Source</label>
+                        <select id="bt-source" onchange="toggleBTSource()">
+                            <option value="live">Live Zerodha Data</option>
+                            <option value="sample">Sample Data</option>
+                        </select>
+                    </div>
+                    <div id="bt-live-fields">
+                        <div class="form-group">
+                            <label>Symbol</label>
+                            <div style="display:flex;gap:6px">
+                                <input id="bt-symbol" type="text" placeholder="e.g. RELIANCE" value="RELIANCE" style="flex:1">
+                                <select id="bt-exchange" style="width:80px"><option value="NSE">NSE</option></select>
+                            </div>
+                        </div>
+                        <div class="grid grid-2" style="margin-bottom:0">
+                            <div class="form-group"><label>Interval</label>
+                                <select id="bt-interval"><option value="day" selected>Daily</option><option value="60minute">Hourly</option><option value="15minute">15 Min</option><option value="5minute">5 Min</option></select>
+                            </div>
+                            <div class="form-group"><label>Days</label><input id="bt-days" type="number" value="365" min="30"></div>
+                        </div>
+                    </div>
+                    <div id="bt-sample-fields" style="display:none">
+                        <div class="form-group"><label>Bars</label><input id="bt-bars" type="number" value="500" min="100"></div>
+                    </div>
+                    <div class="grid grid-2" style="margin-bottom:0">
+                        <div class="form-group"><label>Capital (₹)</label><input id="bt-capital" type="number" value="100000"></div>
+                        <div class="form-group"><label>Position Sizing</label>
+                            <select id="bt-sizing"><option value="fixed">Fixed Qty</option><option value="capital_fraction">Capital Fraction</option><option value="risk_based">Risk-Based</option></select>
+                        </div>
+                    </div>
+                    <!-- F&O-specific fields (shown when F&O strategy selected) -->
+                    <div id="bt-fno-fields" style="display:none">
+                        <div class="form-group">
+                            <label>Underlying</label>
+                            <select id="bt-underlying">
+                                <option value="NIFTY">NIFTY 50</option>
+                                <option value="BANKNIFTY">BANK NIFTY</option>
+                                <option value="FINNIFTY">FIN NIFTY</option>
+                                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
+                                <option value="SENSEX">SENSEX</option>
+                            </select>
+                        </div>
+                        <div class="grid grid-2" style="margin-bottom:0">
+                            <div class="form-group"><label>Delta Target</label><input id="bt-delta" type="number" value="0.16" step="0.01" min="0.05" max="0.50"></div>
+                            <div class="form-group"><label>Max Positions</label><input id="bt-max-pos" type="number" value="3" min="1" max="10"></div>
+                        </div>
+                        <div class="grid grid-2" style="margin-bottom:0">
+                            <div class="form-group"><label>Profit Target %</label><input id="bt-profit-target" type="number" value="50" min="10" max="100"></div>
+                            <div class="form-group"><label>Stop Loss %</label><input id="bt-stop-loss" type="number" value="100" min="25" max="300"></div>
+                        </div>
+                        <div class="grid grid-2" style="margin-bottom:0">
+                            <div class="form-group"><label>Min DTE (entry)</label><input id="bt-dte-min" type="number" value="15" min="1" max="90"></div>
+                            <div class="form-group"><label>Max DTE (entry)</label><input id="bt-dte-max" type="number" value="45" min="7" max="120"></div>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex;align-items:center;gap:6px"><input id="bt-regime-filter" type="checkbox" checked> Use Regime Filter</label>
+                        </div>
+                    </div>
+                    <div class="grid grid-2" style="margin-bottom:0">
+                        <div class="form-group"><label>Slippage %</label><input id="bt-slippage" type="number" value="0.05" step="0.01"></div>
+                        <div class="form-group">
+                            <label style="display:flex;align-items:center;gap:6px;margin-top:20px"><input id="bt-indian-costs" type="checkbox" checked> Indian Cost Model</label>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;margin-top:12px">
+                        <button class="btn btn-primary" onclick="runBacktest()" id="btn-run-bt">Run Backtest</button>
+                        <button class="btn btn-outline" onclick="runBacktestSample()">Quick Sample Test</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Backtest Summary</div>
+                    <div id="bt-summary" style="color:var(--text-muted);font-size:13px">Run a backtest to see results</div>
+                </div>
+            </div>
+            <!-- Strategy Health Report Card -->
+            <div id="bt-health-report" class="card" style="margin-bottom:16px;display:none">
+                <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+                    <span>Strategy Health Report</span>
+                    <span id="health-badge" style="font-size:13px;padding:3px 10px;border-radius:12px;font-weight:700"></span>
+                </div>
+                <div id="health-overall" style="margin-bottom:12px"></div>
+                <div id="health-pillars" style="margin-bottom:12px"></div>
+                <div id="health-blockers" style="margin-bottom:8px"></div>
+                <div id="health-warnings" style="margin-bottom:8px"></div>
+                <div id="health-summary"></div>
+            </div>
+            <div class="card" style="margin-bottom:16px">
+                <div class="card-title">Equity Curve & Drawdown</div>
+                <canvas id="bt-equity-chart" style="width:100%;height:300px"></canvas>
+                <canvas id="bt-underwater-chart" style="width:100%;height:120px;margin-top:8px"></canvas>
+            </div>
+            <div class="grid grid-2" style="margin-bottom:16px">
+                <div class="card">
+                    <div class="card-title">Monte Carlo Simulation</div>
+                    <div id="bt-monte-carlo" style="color:var(--text-muted);font-size:13px">--</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Trade Analytics</div>
+                    <div id="bt-trade-analytics" style="color:var(--text-muted);font-size:13px">--</div>
+                </div>
+            </div>
+            <div class="card" style="margin-bottom:16px">
+                <div class="card-title">Cost Breakdown</div>
+                <div id="bt-cost-breakdown" style="color:var(--text-muted);font-size:13px">--</div>
+            </div>
+            <!-- F&O Greeks & Margin (hidden until F&O backtest run) -->
+            <div id="bt-fno-results" style="display:none">
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Portfolio Greeks History</div>
+                        <canvas id="bt-greeks-chart" style="width:100%;height:200px"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Margin Usage</div>
+                        <canvas id="bt-margin-chart" style="width:100%;height:200px"></canvas>
+                    </div>
+                </div>
+                <div class="grid grid-3" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">Regime Classification</div>
+                        <div id="bt-regime-info" style="color:var(--text-muted);font-size:13px">--</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">FnO Settings</div>
+                        <div id="bt-fno-settings" style="color:var(--text-muted);font-size:13px">--</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Positions Summary</div>
+                        <div id="bt-fno-positions" style="color:var(--text-muted);font-size:13px">--</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-title">Trade Log</div>
+                <div class="table-wrap" style="max-height:400px;overflow-y:auto">
+                    <table>
+                        <thead><tr><th>#</th><th>Type</th><th>Price</th><th>Qty</th><th>P&L</th><th>Costs</th><th>Hold</th><th>MAE%</th><th>MFE%</th></tr></thead>
+                        <tbody id="bt-trades-body">
+                            <tr><td colspan="9" style="color:var(--text-muted);text-align:center">No trades yet</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reports Tab -->
+        <div id="tab-reports" class="tab-content">
+            <div class="sub-tabs" style="margin-bottom:16px;display:flex;gap:6px;flex-wrap:wrap">
+                <button class="btn btn-sm btn-outline report-tab active" onclick="switchReportTab('pnl')">P&L Summary</button>
+                <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('holdings')">Holdings</button>
+                <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('positions')">Positions</button>
+                <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('trades')">Trades</button>
+                <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('orders')">Orders</button>
+                <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('margins')">Margins</button>
+            </div>
+            <div id="report-view-pnl" class="report-view">
+                <div class="grid grid-3" id="pnl-summary-cards" style="margin-bottom:16px"></div>
+                <div class="card" id="pnl-details"></div>
+            </div>
+            <div id="report-view-holdings" class="report-view" style="display:none">
+                <div class="grid grid-4" id="holdings-summary-cards" style="margin-bottom:16px"></div>
+                <div class="card">
+                    <div class="card-title">Holdings</div>
+                    <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+                        <table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg</th><th>LTP</th><th>Value</th><th>P&L</th><th>%</th><th>Weight</th><th>Action</th></tr></thead>
+                            <tbody id="report-holdings-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div id="report-view-positions" class="report-view" style="display:none">
+                <div class="grid grid-4" id="positions-summary-cards" style="margin-bottom:16px"></div>
+                <div class="card">
+                    <div class="card-title">Positions</div>
+                    <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+                        <table><thead><tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&L</th><th>Product</th></tr></thead>
+                            <tbody id="report-positions-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div id="report-view-trades" class="report-view" style="display:none">
+                <div class="grid grid-3" id="trades-summary-cards" style="margin-bottom:16px"></div>
+                <div class="card">
+                    <div class="card-title">Executed Trades</div>
+                    <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+                        <table><thead><tr><th>Trade ID</th><th>Symbol</th><th>Type</th><th>Qty</th><th>Price</th><th>Value</th><th>Product</th></tr></thead>
+                            <tbody id="report-trades-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div id="report-view-orders" class="report-view" style="display:none">
+                <div class="grid grid-4" id="orders-summary-cards" style="margin-bottom:16px"></div>
+                <div class="card">
+                    <div class="card-title">Orders</div>
+                    <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+                        <table><thead><tr><th>Order ID</th><th>Symbol</th><th>Type</th><th>Qty</th><th>Price</th><th>Status</th><th>Time</th></tr></thead>
+                            <tbody id="report-orders-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div id="report-view-margins" class="report-view" style="display:none">
+                <div class="grid grid-3" id="margins-cards"></div>
+            </div>
+        </div>
+
+        <!-- Paper Trading Tab -->
+        <div id="tab-paper-trading" class="tab-content">
+            <div class="grid grid-2" style="margin-bottom:16px">
+                <div class="card">
+                    <div class="card-title">Run Paper Trade</div>
+                    <div class="form-group">
+                        <label>Strategy</label>
+                        <select id="paper-strategy" onchange="togglePaperMode()">
+                            <optgroup label="Built-in Strategies">
+                                <option value="ema_crossover">EMA Crossover</option>
+                                <option value="vwap_breakout">VWAP Breakout</option>
+                                <option value="mean_reversion">Mean Reversion</option>
+                                <option value="rsi">RSI Strategy</option>
+                                <option value="scanner_strategy">Scanner Strategy (All-in-One)</option>
+                            </optgroup>
+                            <optgroup label="Analysis Strategies">
+                                <option value="macd_crossover">MACD Crossover</option>
+                                <option value="golden_death_cross">Golden / Death Cross</option>
+                                <option value="volume_breakout_analysis">Volume Breakout</option>
+                                <option value="bollinger_bands">Bollinger Bands</option>
+                                <option value="stochastic">Stochastic Oscillator</option>
+                                <option value="ichimoku_cloud">Ichimoku Cloud</option>
+                                <option value="vcp_pattern">VCP Pattern</option>
+                                <option value="pocket_pivot">Pocket Pivot</option>
+                                <option value="stage_analysis">Stage Analysis (Weinstein)</option>
+                                <option value="cci_extreme">CCI Extreme</option>
+                                <option value="mfi_strategy">MFI (Money Flow Index)</option>
+                                <option value="52_week_hl">52-Week High / Low</option>
+                            </optgroup>
+                            <optgroup label="F&O Option Strategies">
+                                <option value="fno_iron_condor">Iron Condor</option>
+                                <option value="fno_bull_call_spread">Bull Call Spread</option>
+                                <option value="fno_bear_put_spread">Bear Put Spread</option>
+                                <option value="fno_bull_put_spread">Bull Put Spread</option>
+                                <option value="fno_bear_call_spread">Bear Call Spread</option>
+                                <option value="fno_straddle">Long Straddle</option>
+                                <option value="fno_short_straddle">Short Straddle</option>
+                                <option value="fno_strangle">Long Strangle</option>
+                                <option value="fno_short_strangle">Short Strangle</option>
+                                <option value="fno_iron_butterfly">Iron Butterfly</option>
+                            </optgroup>
+                            <optgroup id="paper-custom-strategies" label="Custom Strategies"></optgroup>
+                            <optgroup id="paper-fno-custom-strategies" label="Custom F&O Strategies"></optgroup>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Symbol</label>
+                        <div style="display:flex;gap:6px;align-items:center">
+                            <input id="paper-symbol" type="text" placeholder="e.g. RELIANCE" value="RELIANCE" style="flex:1"
+                                   onchange="resolveToken('paper')">
+                            <button class="btn btn-outline btn-sm" onclick="resolveToken('paper')" title="Resolve token from symbol" style="padding:4px 10px;font-size:11px">🔗</button>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Instrument Token <span id="paper-token-status" style="font-size:10px;color:#00d4aa"></span></label>
+                        <input id="paper-token" type="number" placeholder="Auto-resolved from symbol" value="" readonly
+                               style="background:#0d1821;cursor:not-allowed;opacity:0.8" title="Auto-resolved from symbol — cannot be edited manually">
+                    </div>
+                    <div class="grid grid-2">
+                        <div class="form-group">
+                            <label>Exchange</label>
+                            <select id="paper-exchange" onchange="resolveToken('paper')">
+                                <option value="NSE" selected>NSE</option>
+                                <option value="BSE">BSE</option>
+                                <option value="NFO">NFO</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Interval</label>
+                            <select id="paper-interval">
+                                <option value="5minute" selected>5 min</option>
+                                <option value="15minute">15 min</option>
+                                <option value="30minute">30 min</option>
+                                <option value="60minute">1 hour</option>
+                                <option value="day">Daily</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="grid grid-2">
+                        <div class="form-group">
+                            <label>Days of Data</label>
+                            <input id="paper-days" type="number" value="60" min="5" max="365">
+                        </div>
+                        <div class="form-group">
+                            <label>Initial Capital</label>
+                            <input id="paper-capital" type="number" value="100000" min="1000">
+                        </div>
+                    </div>
+                    <!-- F&O-specific paper trade fields -->
+                    <div id="paper-fno-fields" style="display:none">
+                        <div class="form-group">
+                            <label>Underlying</label>
+                            <select id="paper-underlying">
+                                <option value="NIFTY">NIFTY 50</option>
+                                <option value="BANKNIFTY">BANK NIFTY</option>
+                                <option value="FINNIFTY">FIN NIFTY</option>
+                                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
+                                <option value="SENSEX">SENSEX</option>
+                            </select>
+                        </div>
+                        <div class="grid grid-2" style="margin-bottom:0">
+                            <div class="form-group"><label>Delta Target</label><input id="paper-delta" type="number" value="0.16" step="0.01" min="0.05" max="0.50"></div>
+                            <div class="form-group"><label>Max Positions</label><input id="paper-max-pos" type="number" value="3" min="1" max="10"></div>
+                        </div>
+                        <div class="grid grid-2" style="margin-bottom:0">
+                            <div class="form-group"><label>Profit Target %</label><input id="paper-profit-target" type="number" value="50" min="10" max="100"></div>
+                            <div class="form-group"><label>Stop Loss %</label><input id="paper-stop-loss" type="number" value="100" min="25" max="300"></div>
+                        </div>
+                    </div>
+                    <div class="grid grid-2">
+                        <div class="form-group">
+                            <label>Commission %</label>
+                            <input id="paper-commission" type="number" value="0.03" step="0.01" min="0">
+                        </div>
+                        <div class="form-group">
+                            <label>Slippage %</label>
+                            <input id="paper-slippage" type="number" value="0.05" step="0.01" min="0">
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;margin-top:8px">
+                        <button id="btn-run-paper" class="btn btn-primary" onclick="runPaperTrade()">Run Paper Trade</button>
+                        <button class="btn btn-outline" onclick="runPaperTradeSample()">Quick Test (Sample Data)</button>
+                    </div>
+                    <div id="paper-loading" style="display:none;margin-top:12px;color:var(--accent-green);font-size:13px">Running simulation...</div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Performance Summary</div>
+                    <div id="paper-summary">
+                        <div class="empty-state"><p>Run a paper trade to see results</p></div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="paper-results-section" style="display:none">
+                <div class="card" style="margin-bottom:16px">
+                    <div class="card-title">Equity Curve</div>
+                    <canvas id="paper-equity-chart" height="200"></canvas>
+                </div>
+
+                <!-- Strategy Health Report Card (Paper Trading) -->
+                <div id="paper-health-report" class="card" style="margin-bottom:16px;display:none">
+                    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+                        <span>Strategy Health Report</span>
+                        <span id="paper-health-badge" style="font-size:13px;padding:3px 10px;border-radius:12px;font-weight:700"></span>
+                    </div>
+                    <div id="paper-health-overall" style="margin-bottom:12px"></div>
+                    <div id="paper-health-pillars" style="margin-bottom:12px"></div>
+                    <div id="paper-health-blockers" style="margin-bottom:8px"></div>
+                    <div id="paper-health-warnings" style="margin-bottom:8px"></div>
+                    <div id="paper-health-summary"></div>
+                </div>
+
+                <!-- F&O Greeks & Margin (hidden until F&O paper-trade run) -->
+                <div id="paper-fno-results" style="display:none">
+                    <div class="grid grid-2" style="margin-bottom:16px">
+                        <div class="card">
+                            <div class="card-title">Portfolio Greeks</div>
+                            <div id="paper-greeks-info" style="color:var(--text-muted);font-size:13px">--</div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title">Margin Snapshots</div>
+                            <div id="paper-margin-info" style="color:var(--text-muted);font-size:13px">--</div>
+                        </div>
+                    </div>
+                    <div class="card" style="margin-bottom:16px">
+                        <div class="card-title">F&O Positions</div>
+                        <div class="table-wrap" style="max-height:300px;overflow-y:auto">
+                            <table>
+                                <thead><tr><th>ID</th><th>Structure</th><th>Legs</th><th>Premium</th><th>P&L</th><th>Regime</th><th>Entry</th></tr></thead>
+                                <tbody id="paper-fno-positions-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Trade Log</div>
+                    <div class="table-wrap" style="max-height:400px;overflow-y:auto">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Type</th>
+                                    <th>Entry</th>
+                                    <th>Exit</th>
+                                    <th>Qty</th>
+                                    <th>P&L</th>
+                                    <th>Entry Time</th>
+                                    <th>Exit Time</th>
+                                    <th>Reason</th>
+                                </tr>
+                            </thead>
+                            <tbody id="paper-trades-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Strategy Builder Tab -->
+        <div id="tab-strategy-builder" class="tab-content">
+            <div class="grid grid-2" style="margin-bottom:16px">
+                <div class="card">
+                    <div class="card-title">Build Custom Strategy</div>
+                    <div class="form-group">
+                        <label>Strategy Name</label>
+                        <input id="builder-name" type="text" placeholder="my_strategy">
+                    </div>
+                    <div class="form-group">
+                        <label>Description</label>
+                        <input id="builder-desc" type="text" placeholder="Brief description of the strategy">
+                    </div>
+
+                    <div style="margin-bottom:12px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                            <label style="font-weight:600;color:var(--accent-green)">Entry Rules</label>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <label style="font-size:12px;color:var(--text-muted)">Logic:</label>
+                                <select id="builder-entry-logic" style="padding:2px 6px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:4px;font-size:12px">
+                                    <option value="all">ALL (AND)</option>
+                                    <option value="any">ANY (OR)</option>
+                                </select>
+                                <button class="btn btn-outline btn-sm" onclick="addBuilderRule('entry')">+ Add Rule</button>
+                            </div>
+                        </div>
+                        <div id="builder-entry-rules" class="builder-rules-container"></div>
+                    </div>
+
+                    <div style="margin-bottom:12px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                            <label style="font-weight:600;color:#ff5252">Exit Rules</label>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <label style="font-size:12px;color:var(--text-muted)">Logic:</label>
+                                <select id="builder-exit-logic" style="padding:2px 6px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:4px;font-size:12px">
+                                    <option value="any">ANY (OR)</option>
+                                    <option value="all">ALL (AND)</option>
+                                </select>
+                                <button class="btn btn-outline btn-sm" onclick="addBuilderRule('exit')">+ Add Rule</button>
+                            </div>
+                        </div>
+                        <div id="builder-exit-rules" class="builder-rules-container"></div>
+                    </div>
+
+                    <div class="grid grid-2">
+                        <div class="form-group">
+                            <label>Quantity</label>
+                            <input id="builder-qty" type="number" value="10" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>Exchange</label>
+                            <select id="builder-exchange">
+                                <option value="NSE" selected>NSE</option>
+                                <option value="BSE">BSE</option>
+                                <option value="NFO">NFO</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="grid grid-2">
+                        <div class="form-group">
+                            <label>Stop Loss %</label>
+                            <input id="builder-sl" type="number" value="2" step="0.5" min="0">
+                        </div>
+                        <div class="form-group">
+                            <label>Target %</label>
+                            <input id="builder-target" type="number" value="4" step="0.5" min="0">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label><input id="builder-atr-sl" type="checkbox"> Use ATR-based Stop Loss</label>
+                    </div>
+
+                    <div style="display:flex;gap:8px;margin-top:8px">
+                        <button class="btn btn-primary" onclick="saveCustomStrategy()">Save Strategy</button>
+                        <button class="btn btn-success" onclick="testCustomStrategy()">Save & Test</button>
+                    </div>
+                    <div id="builder-status" style="margin-top:8px;font-size:13px;display:none"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Saved Custom Strategies</div>
+                    <div id="custom-strategies-list">
+                        <div class="empty-state"><p>No custom strategies saved</p></div>
+                    </div>
+                    <div id="builder-test-result" style="display:none;margin-top:16px;border-top:1px solid #2a3a4a;padding-top:12px">
+                        <div class="card-title">Quick Test Result</div>
+                        <div id="builder-test-metrics"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- F&O Strategy Builder Section -->
+            <div style="margin-top:24px;padding-top:20px;border-top:2px solid #2a3a4a">
+                <h3 style="color:#ff9100;margin-bottom:16px;font-size:16px">F&O Options Strategy Builder</h3>
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title" style="color:#ff9100">Build Custom F&O Strategy</div>
+                        <div class="form-group">
+                            <label>Strategy Name</label>
+                            <input id="fno-builder-name" type="text" placeholder="my_credit_spread">
+                        </div>
+                        <div class="form-group">
+                            <label>Description</label>
+                            <input id="fno-builder-desc" type="text" placeholder="Short description">
+                        </div>
+                        <div class="grid grid-2">
+                            <div class="form-group">
+                                <label>Underlying</label>
+                                <select id="fno-builder-underlying" onchange="updateFnOBuilderLotSize()">
+                                    <option value="NIFTY">NIFTY 50</option>
+                                    <option value="BANKNIFTY">BANK NIFTY</option>
+                                    <option value="FINNIFTY">FIN NIFTY</option>
+                                    <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
+                                    <option value="SENSEX">SENSEX</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Strategy Type</label>
+                                <select id="fno-builder-type">
+                                    <option value="custom">Custom</option>
+                                    <option value="credit_spread">Credit Spread</option>
+                                    <option value="debit_spread">Debit Spread</option>
+                                    <option value="iron_condor">Iron Condor</option>
+                                    <option value="straddle">Straddle</option>
+                                    <option value="strangle">Strangle</option>
+                                    <option value="ratio_spread">Ratio Spread</option>
+                                    <option value="butterfly">Butterfly</option>
+                                    <option value="jade_lizard">Jade Lizard</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Load Template</label>
+                            <select id="fno-builder-template" onchange="loadFnOTemplate()">
+                                <option value="">— Select a template —</option>
+                            </select>
+                        </div>
+
+                        <div style="margin-bottom:12px">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                                <label style="font-weight:600;color:#ff9100">Strategy Legs</label>
+                                <div style="display:flex;gap:8px;align-items:center">
+                                    <span id="fno-builder-lot-info" style="font-size:11px;color:#667788">Lot: 50</span>
+                                    <button class="btn btn-outline btn-sm" onclick="addFnOBuilderLeg()">+ Add Leg</button>
+                                </div>
+                            </div>
+                            <div id="fno-builder-legs" style="display:flex;flex-direction:column;gap:8px"></div>
+                        </div>
+
+                        <div class="grid grid-2">
+                            <div class="form-group">
+                                <label>Spot Price (for payoff)</label>
+                                <input id="fno-builder-spot" type="number" value="25000" step="50">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Positions</label>
+                                <input id="fno-builder-max-pos" type="number" value="1" min="1" max="10">
+                            </div>
+                        </div>
+                        <div class="grid grid-2">
+                            <div class="form-group">
+                                <label>Profit Target %</label>
+                                <input id="fno-builder-profit" type="number" value="50" min="10" max="100">
+                            </div>
+                            <div class="form-group">
+                                <label>Stop Loss %</label>
+                                <input id="fno-builder-sl" type="number" value="100" min="25" max="300">
+                            </div>
+                        </div>
+                        <div class="grid grid-2">
+                            <div class="form-group">
+                                <label>Min DTE</label>
+                                <input id="fno-builder-dte-min" type="number" value="15" min="1" max="90">
+                            </div>
+                            <div class="form-group">
+                                <label>Max DTE</label>
+                                <input id="fno-builder-dte-max" type="number" value="45" min="7" max="120">
+                            </div>
+                        </div>
+
+                        <div style="display:flex;gap:8px;margin-top:8px">
+                            <button class="btn btn-primary" onclick="saveFnOStrategy()">Save Strategy</button>
+                            <button class="btn btn-success" onclick="testFnOStrategy()">Save & Test</button>
+                            <button class="btn btn-outline" onclick="computePayoff()">Payoff Chart</button>
+                        </div>
+                        <div id="fno-builder-status" style="margin-top:8px;font-size:13px;display:none"></div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title" style="color:#ff9100">Payoff Diagram</div>
+                        <canvas id="fno-payoff-chart" style="width:100%;height:220px"></canvas>
+                        <div id="fno-payoff-stats" style="margin-top:8px;font-size:13px;color:#c0c8d0;line-height:1.8"></div>
+
+                        <div style="margin-top:16px;border-top:1px solid #2a3a4a;padding-top:12px">
+                            <div class="card-title">Saved F&O Strategies</div>
+                            <div id="fno-custom-strategies-list">
+                                <div class="empty-state"><p>No custom F&O strategies saved</p></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Journal Tab -->
+        <div id="tab-journal" class="tab-content">
+            <!-- Filters Bar -->
+            <div class="card" style="margin-bottom:12px;padding:12px 16px">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+                    <select id="j-filter-strategy" style="padding:6px 10px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:6px;font-size:12px;min-width:130px">
+                        <option value="">All Strategies</option>
+                    </select>
+                    <select id="j-filter-instrument" style="padding:6px 10px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:6px;font-size:12px;min-width:130px">
+                        <option value="">All Instruments</option>
+                    </select>
+                    <select id="j-filter-source" style="padding:6px 10px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:6px;font-size:12px">
+                        <option value="">All Sources</option>
+                        <option value="live">Live</option>
+                        <option value="paper_trade">Paper</option>
+                        <option value="backtest">Backtest</option>
+                    </select>
+                    <select id="j-filter-direction" style="padding:6px 10px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:6px;font-size:12px">
+                        <option value="">All Directions</option>
+                        <option value="LONG">Long</option>
+                        <option value="SHORT">Short</option>
+                    </select>
+                    <select id="j-filter-type" style="padding:6px 10px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:6px;font-size:12px">
+                        <option value="">All Types</option>
+                        <option value="equity">Equity</option>
+                        <option value="futures">Futures</option>
+                        <option value="options">Options</option>
+                        <option value="spread">Spread</option>
+                    </select>
+                    <select id="j-filter-days" style="padding:6px 10px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:6px;font-size:12px">
+                        <option value="">All Time</option>
+                        <option value="7">Last 7 Days</option>
+                        <option value="30">Last 30 Days</option>
+                        <option value="90">Last 90 Days</option>
+                        <option value="180">Last 180 Days</option>
+                        <option value="365">Last Year</option>
+                    </select>
+                    <button class="btn btn-primary btn-sm" onclick="loadJournal()">Apply</button>
+                    <button class="btn btn-outline btn-sm" onclick="exportJournal()">Export</button>
+                </div>
+            </div>
+
+            <!-- Summary Cards -->
+            <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:12px" id="j-summary-cards">
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Total Trades</div>
+                    <div id="j-stat-total" style="font-size:22px;font-weight:700;color:#e0e6ed">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Win Rate</div>
+                    <div id="j-stat-winrate" style="font-size:22px;font-weight:700;color:#00d4aa">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Expectancy</div>
+                    <div id="j-stat-expectancy" style="font-size:22px;font-weight:700;color:#00d4aa">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Profit Factor</div>
+                    <div id="j-stat-pf" style="font-size:22px;font-weight:700;color:#e0e6ed">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Sharpe</div>
+                    <div id="j-stat-sharpe" style="font-size:22px;font-weight:700;color:#e0e6ed">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Sortino</div>
+                    <div id="j-stat-sortino" style="font-size:22px;font-weight:700;color:#e0e6ed">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Max DD</div>
+                    <div id="j-stat-dd" style="font-size:22px;font-weight:700;color:#ff5252">—</div>
+                </div>
+                <div class="card" style="padding:12px;text-align:center">
+                    <div style="font-size:11px;color:#667788;margin-bottom:4px">Consistency</div>
+                    <div id="j-stat-consistency" style="font-size:22px;font-weight:700;color:#e0e6ed">—</div>
+                </div>
+            </div>
+
+            <!-- Sub-tabs -->
+            <div style="display:flex;gap:4px;margin-bottom:12px;border-bottom:1px solid #2a3a4a;padding-bottom:8px" id="j-subtabs">
+                <button class="btn btn-sm btn-primary" data-jtab="j-overview" onclick="switchJournalTab('j-overview',this)">Overview</button>
+                <button class="btn btn-sm btn-outline" data-jtab="j-trades" onclick="switchJournalTab('j-trades',this)">Trades</button>
+                <button class="btn btn-sm btn-outline" data-jtab="j-execution" onclick="switchJournalTab('j-execution',this)">Execution</button>
+                <button class="btn btn-sm btn-outline" data-jtab="j-edge" onclick="switchJournalTab('j-edge',this)">Edge</button>
+                <button class="btn btn-sm btn-outline" data-jtab="j-portfolio" onclick="switchJournalTab('j-portfolio',this);loadPortfolioHealth()">Portfolio</button>
+                <button class="btn btn-sm btn-outline" data-jtab="j-fno" onclick="switchJournalTab('j-fno',this);loadFnOAnalytics()">F&O</button>
+                <button class="btn btn-sm btn-outline" data-jtab="j-system" onclick="switchJournalTab('j-system',this);loadSystemEvents()">System</button>
+            </div>
+
+            <!-- Overview Sub-tab -->
+            <div id="j-overview" class="j-subtab">
+                <div class="grid grid-2" style="margin-bottom:12px">
+                    <div class="card">
+                        <div class="card-title">Daily P&L</div>
+                        <canvas id="j-daily-pnl-chart" height="220"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Equity Curve</div>
+                        <canvas id="j-equity-chart" height="220"></canvas>
+                    </div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title">Strategy Breakdown</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>Strategy</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Avg PnL</th><th>PF</th>
+                                </tr></thead>
+                                <tbody id="j-strategy-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Regime Performance Matrix</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>Regime</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Avg PnL</th>
+                                </tr></thead>
+                                <tbody id="j-regime-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Trades Sub-tab -->
+            <div id="j-trades" class="j-subtab" style="display:none">
+                <div class="card">
+                    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+                        Trade Log
+                        <div style="display:flex;gap:6px;align-items:center">
+                            <select id="j-trades-review" style="padding:4px 8px;background:#0d1821;border:1px solid #2a3a4a;color:#e0e6ed;border-radius:4px;font-size:11px">
+                                <option value="">All Reviews</option>
+                                <option value="pending">Pending</option>
+                                <option value="reviewed">Reviewed</option>
+                                <option value="flagged">Flagged</option>
+                            </select>
+                            <button class="btn btn-outline btn-sm" onclick="loadJournalEntries()">Refresh</button>
+                        </div>
+                    </div>
+                    <div style="overflow-x:auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>Time</th><th>Strategy</th><th>Instrument</th><th>Dir</th><th>Type</th>
+                                <th>Entry</th><th>Exit</th><th>P&L</th><th>Slip</th>
+                                <th>MAE</th><th>MFE</th><th>Edge</th><th>Review</th><th></th>
+                            </tr></thead>
+                            <tbody id="j-trades-body"></tbody>
+                        </table>
+                    </div>
+                    <div style="display:flex;justify-content:center;gap:8px;margin-top:12px" id="j-trades-pagination"></div>
+                </div>
+            </div>
+
+            <!-- Execution Sub-tab -->
+            <div id="j-execution" class="j-subtab" style="display:none">
+                <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:12px" id="j-exec-cards">
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Avg Slippage</div>
+                        <div id="j-exec-avg-slip" style="font-size:18px;font-weight:700;color:#ffaa00">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Max Slippage</div>
+                        <div id="j-exec-max-slip" style="font-size:18px;font-weight:700;color:#ff5252">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Exec Alpha</div>
+                        <div id="j-exec-alpha" style="font-size:18px;font-weight:700;color:#00d4aa">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Fill Latency</div>
+                        <div id="j-exec-latency" style="font-size:18px;font-weight:700;color:#e0e6ed">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Partial Fills</div>
+                        <div id="j-exec-partial" style="font-size:18px;font-weight:700;color:#e0e6ed">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Cost/PnL %</div>
+                        <div id="j-exec-cost-pnl" style="font-size:18px;font-weight:700;color:#ffaa00">—</div>
+                    </div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title">Slippage Drift</div>
+                        <canvas id="j-slippage-chart" height="220"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Cost Breakdown</div>
+                        <canvas id="j-cost-chart" height="220"></canvas>
+                        <div id="j-cost-table" style="margin-top:8px"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Edge Sub-tab -->
+            <div id="j-edge" class="j-subtab" style="display:none">
+                <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Expectancy Stability</div>
+                        <div id="j-edge-stability" style="font-size:18px;font-weight:700;color:#00d4aa">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Edge Decay</div>
+                        <div id="j-edge-decay" style="font-size:18px;font-weight:700;color:#ffaa00">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Best Month</div>
+                        <div id="j-edge-best-month" style="font-size:18px;font-weight:700;color:#00d4aa">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Worst Month</div>
+                        <div id="j-edge-worst-month" style="font-size:18px;font-weight:700;color:#ff5252">—</div>
+                    </div>
+                </div>
+                <div class="grid grid-2" style="margin-bottom:12px">
+                    <div class="card">
+                        <div class="card-title">Rolling Sharpe (20-trade)</div>
+                        <canvas id="j-rolling-sharpe-chart" height="220"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Monthly Performance</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>Month</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Expectancy</th><th>PF</th>
+                                </tr></thead>
+                                <tbody id="j-monthly-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title">Performance by Day of Week</div>
+                        <canvas id="j-dow-chart" height="200"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Performance by Session</div>
+                        <canvas id="j-session-chart" height="200"></canvas>
+                    </div>
+                </div>
+                <div class="grid grid-2" style="margin-top:12px">
+                    <div class="card">
+                        <div class="card-title">MAE / MFE Analysis</div>
+                        <div id="j-mae-mfe-stats" style="font-size:13px;color:#c0c8d0;line-height:1.8"></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Confidence Bucket Analysis</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>Bucket</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Avg</th>
+                                </tr></thead>
+                                <tbody id="j-confidence-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Portfolio Sub-tab -->
+            <div id="j-portfolio" class="j-subtab" style="display:none">
+                <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:12px" id="j-port-cards">
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Equity</div>
+                        <div id="j-port-equity" style="font-size:18px;font-weight:700;color:#00d4aa">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Day P&L</div>
+                        <div id="j-port-day-pnl" style="font-size:18px;font-weight:700;color:#e0e6ed">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Rolling DD</div>
+                        <div id="j-port-dd" style="font-size:18px;font-weight:700;color:#ff5252">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Open Positions</div>
+                        <div id="j-port-open" style="font-size:18px;font-weight:700;color:#e0e6ed">—</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Margin Used</div>
+                        <div id="j-port-margin" style="font-size:18px;font-weight:700;color:#ffaa00">—</div>
+                    </div>
+                </div>
+                <div class="grid grid-2" style="margin-bottom:12px">
+                    <div class="card">
+                        <div class="card-title">Drawdown History</div>
+                        <canvas id="j-dd-chart" height="220"></canvas>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Exposure Breakdown</div>
+                        <div id="j-exposure-content" style="font-size:13px;color:#c0c8d0;line-height:1.8"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Capital Metrics History</div>
+                    <div style="overflow-x:auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>Time</th><th>Equity</th><th>Risk %</th><th>Margin %</th><th>Drawdown</th><th>Open Pos</th>
+                            </tr></thead>
+                            <tbody id="j-capital-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- F&O Sub-tab -->
+            <div id="j-fno" class="j-subtab" style="display:none">
+                <div class="grid grid-2" style="margin-bottom:12px">
+                    <div class="card">
+                        <div class="card-title">IV Percentile Bucket Analysis</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>IV Bucket</th><th>Trades</th><th>Win%</th><th>Avg PnL</th><th>Total PnL</th>
+                                </tr></thead>
+                                <tbody id="j-fno-iv-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">DTE Bucket Analysis</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>DTE Bucket</th><th>Trades</th><th>Win%</th><th>Avg PnL</th><th>Total PnL</th>
+                                </tr></thead>
+                                <tbody id="j-fno-dte-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid grid-2">
+                    <div class="card">
+                        <div class="card-title">Greeks P&L Attribution</div>
+                        <canvas id="j-greeks-pnl-chart" height="220"></canvas>
+                        <div id="j-greeks-stats" style="margin-top:8px;font-size:13px;color:#c0c8d0;line-height:1.8"></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Options Structure Performance</div>
+                        <div style="overflow-x:auto">
+                            <table class="data-table">
+                                <thead><tr>
+                                    <th>Structure</th><th>Trades</th><th>Win%</th><th>Avg PnL</th><th>PF</th>
+                                </tr></thead>
+                                <tbody id="j-fno-structure-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- System Sub-tab -->
+            <div id="j-system" class="j-subtab" style="display:none">
+                <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Disconnects</div>
+                        <div id="j-sys-disconnects" style="font-size:18px;font-weight:700;color:#ffaa00">0</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Rejections</div>
+                        <div id="j-sys-rejections" style="font-size:18px;font-weight:700;color:#ff5252">0</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">Recoveries</div>
+                        <div id="j-sys-recoveries" style="font-size:18px;font-weight:700;color:#00d4aa">0</div>
+                    </div>
+                    <div class="card" style="padding:12px;text-align:center">
+                        <div style="font-size:11px;color:#667788;margin-bottom:4px">DB Size</div>
+                        <div id="j-sys-dbsize" style="font-size:18px;font-weight:700;color:#e0e6ed">—</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+                        System Events
+                        <button class="btn btn-outline btn-sm" onclick="loadSystemEvents()">Refresh</button>
+                    </div>
+                    <div style="overflow-x:auto">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th>Time</th><th>Type</th><th>Severity</th><th>Details</th>
+                            </tr></thead>
+                            <tbody id="j-events-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- Add Strategy Modal -->
+    <div id="modal-add-strategy" class="modal-overlay" onclick="if(event.target===this)hideModal('modal-add-strategy')">
+        <div class="modal">
+            <div class="modal-title">Add Strategy</div>
+            <div class="form-group">
+                <label>Strategy Type</label>
+                <select id="strat-select">
+                    <optgroup label="Equity Strategies">
+                        <option value="ema_crossover">EMA Crossover</option>
+                        <option value="vwap_breakout">VWAP Breakout</option>
+                        <option value="mean_reversion">Mean Reversion</option>
+                        <option value="rsi">RSI Strategy</option>
+                        <option value="scanner_strategy">Scanner Strategy (All-in-One)</option>
+                    </optgroup>
+                    <optgroup label="Analysis Strategies">
+                        <option value="macd_crossover">MACD Crossover</option>
+                        <option value="golden_death_cross">Golden / Death Cross</option>
+                        <option value="volume_breakout_analysis">Volume Breakout</option>
+                        <option value="bollinger_bands">Bollinger Bands</option>
+                        <option value="stochastic">Stochastic Oscillator</option>
+                        <option value="ichimoku_cloud">Ichimoku Cloud</option>
+                        <option value="vcp_pattern">VCP Pattern</option>
+                        <option value="pocket_pivot">Pocket Pivot</option>
+                        <option value="stage_analysis">Stage Analysis (Weinstein)</option>
+                        <option value="cci_extreme">CCI Extreme</option>
+                        <option value="mfi_strategy">MFI (Money Flow Index)</option>
+                        <option value="52_week_hl">52-Week High / Low</option>
+                    </optgroup>
+                    <optgroup label="Options Strategies">
+                        <option value="iron_condor">Iron Condor</option>
+                        <option value="straddle_strangle">Straddle / Strangle</option>
+                        <option value="bull_call_spread">Bull Call Spread</option>
+                        <option value="bear_put_spread">Bear Put Spread</option>
+                    </optgroup>
+                    <optgroup id="modal-custom-strategies" label="Custom Strategies"></optgroup>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Parameters (JSON, optional)</label>
+                <input id="strat-params" type="text" placeholder='{"quantity": 50, "exchange": "NFO"}'>
+            </div>
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn btn-outline" onclick="hideModal('modal-add-strategy')">Cancel</button>
+                <button class="btn btn-primary" onclick="addStrategy()">Add Strategy</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Start Live Modal -->
+    <div id="modal-start-live" class="modal-overlay" onclick="if(event.target===this)hideModal('modal-start-live')">
+        <div class="modal" style="max-width:650px;max-height:85vh;overflow-y:auto">
+            <div class="modal-title">Start Live Trading</div>
+
+            <div class="form-group">
+                <label style="font-weight:600;color:#00d4aa;margin-bottom:8px;display:block">Popular Instruments</label>
+                <div id="preset-instruments" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:200px;overflow-y:auto;padding:4px">
+                    <label class="inst-check"><input type="checkbox" value="256265" data-name="NIFTY 50"> <span class="inst-token">256265</span> NIFTY 50</label>
+                    <label class="inst-check"><input type="checkbox" value="260105" data-name="SENSEX"> <span class="inst-token">260105</span> SENSEX</label>
+                    <label class="inst-check"><input type="checkbox" value="257801" data-name="NIFTY BANK"> <span class="inst-token">257801</span> NIFTY BANK</label>
+                    <label class="inst-check"><input type="checkbox" value="261889" data-name="NIFTY FIN SERVICE"> <span class="inst-token">261889</span> NIFTY FIN SVC</label>
+                    <label class="inst-check"><input type="checkbox" value="738561" data-name="RELIANCE"> <span class="inst-token">738561</span> RELIANCE</label>
+                    <label class="inst-check"><input type="checkbox" value="341249" data-name="HDFCBANK"> <span class="inst-token">341249</span> HDFC BANK</label>
+                    <label class="inst-check"><input type="checkbox" value="2953217" data-name="TCS"> <span class="inst-token">2953217</span> TCS</label>
+                    <label class="inst-check"><input type="checkbox" value="408065" data-name="INFY"> <span class="inst-token">408065</span> INFOSYS</label>
+                    <label class="inst-check"><input type="checkbox" value="2885377" data-name="SBIN"> <span class="inst-token">2885377</span> SBI</label>
+                    <label class="inst-check"><input type="checkbox" value="424961" data-name="ICICIBANK"> <span class="inst-token">424961</span> ICICI BANK</label>
+                    <label class="inst-check"><input type="checkbox" value="1270529" data-name="KOTAKBANK"> <span class="inst-token">1270529</span> KOTAK BANK</label>
+                    <label class="inst-check"><input type="checkbox" value="3861249" data-name="AXISBANK"> <span class="inst-token">3861249</span> AXIS BANK</label>
+                    <label class="inst-check"><input type="checkbox" value="2714625" data-name="LT"> <span class="inst-token">2714625</span> L&T</label>
+                    <label class="inst-check"><input type="checkbox" value="3465729" data-name="TATAMOTORS"> <span class="inst-token">3465729</span> TATA MOTORS</label>
+                    <label class="inst-check"><input type="checkbox" value="3456769" data-name="TATASTEEL"> <span class="inst-token">3456769</span> TATA STEEL</label>
+                    <label class="inst-check"><input type="checkbox" value="969473" data-name="MARUTI"> <span class="inst-token">969473</span> MARUTI</label>
+                    <label class="inst-check"><input type="checkbox" value="2760193" data-name="BAJFINANCE"> <span class="inst-token">2760193</span> BAJAJ FINANCE</label>
+                    <label class="inst-check"><input type="checkbox" value="895745" data-name="HINDUNILVR"> <span class="inst-token">895745</span> HUL</label>
+                    <label class="inst-check"><input type="checkbox" value="81153" data-name="ADANIENT"> <span class="inst-token">81153</span> ADANI ENT</label>
+                    <label class="inst-check"><input type="checkbox" value="3001089" data-name="SUNPHARMA"> <span class="inst-token">3001089</span> SUN PHARMA</label>
+                    <label class="inst-check"><input type="checkbox" value="2815745" data-name="WIPRO"> <span class="inst-token">2815745</span> WIPRO</label>
+                    <label class="inst-check"><input type="checkbox" value="779521" data-name="POWERGRID"> <span class="inst-token">779521</span> POWER GRID</label>
+                    <label class="inst-check"><input type="checkbox" value="2929921" data-name="TECHM"> <span class="inst-token">2929921</span> TECH MAHINDRA</label>
+                    <label class="inst-check"><input type="checkbox" value="5215745" data-name="ASIANPAINT"> <span class="inst-token">5215745</span> ASIAN PAINTS</label>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label style="font-weight:600;color:#00d4aa;margin-bottom:8px;display:block">Search Instruments</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <select id="search-exchange" style="width:100px;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px">
+                        <option value="NSE" selected>NSE</option>
+                        <option value="BSE">BSE</option>
+                        <option value="NFO">NFO</option>
+                        <option value="BFO">BFO</option>
+                        <option value="MCX">MCX</option>
+                    </select>
+                    <input id="search-inst-query" type="text" placeholder="Search by name or symbol..." style="flex:1;padding:6px 10px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px">
+                    <button class="btn btn-outline btn-sm" onclick="searchInstruments()">Search</button>
+                </div>
+                <div id="search-results" style="max-height:150px;overflow-y:auto;margin-top:8px;display:none"></div>
+            </div>
+
+            <div class="form-group">
+                <label style="font-weight:600;color:#8899aa;margin-bottom:4px;display:block">Selected (<span id="selected-count">0</span>)</label>
+                <div id="selected-instruments" style="min-height:32px;padding:6px;background:#0d1821;border:1px solid #2a3a4a;border-radius:6px;display:flex;flex-wrap:wrap;gap:6px">
+                    <span style="color:#667788;font-size:12px">Select instruments above</span>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Tick Mode</label>
+                <select id="live-mode">
+                    <option value="ltp">LTP Only</option>
+                    <option value="quote" selected>Quote (LTP + OHLC)</option>
+                    <option value="full">Full (with Depth + OI)</option>
+                </select>
+            </div>
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn btn-outline" onclick="hideModal('modal-start-live')">Cancel</button>
+                <button class="btn btn-success" onclick="startLive()">Start Trading</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
