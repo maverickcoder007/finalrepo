@@ -163,7 +163,8 @@ class OptionLeg:
 
     @property
     def lots(self) -> int:
-        return abs(self.quantity) // max(self.contract.lot_size, 1)
+        # quantity = ±filled_lots (lot count), NOT total shares
+        return abs(self.quantity)
 
     @property
     def net_quantity(self) -> int:
@@ -294,9 +295,22 @@ class MultiLegPosition:
 
     @property
     def max_loss(self) -> float:
-        """Estimated max loss for defined-risk structures."""
+        """Estimated max loss for defined-risk structures.
+
+        Returns float('inf') for undefined-risk structures (all-short
+        or all-long without hedges, e.g. short strangle/straddle).
+        """
         if len(self.legs) < 2:
             return float("inf")
+
+        has_long = any(l.quantity > 0 for l in self.legs)
+        has_short = any(l.quantity < 0 for l in self.legs)
+
+        # Undefined risk: all legs same direction (no hedge)
+        if not has_long or not has_short:
+            return float("inf")
+
+        # Defined risk: has both long and short legs
         # For vertical spreads: width of strikes − net premium
         strikes = sorted(set(
             leg.contract.strike for leg in self.legs

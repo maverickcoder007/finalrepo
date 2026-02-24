@@ -228,7 +228,7 @@ class FnOBacktestEngine:
                         "entry_time": str(pos.entry_time) if pos.entry_time else str(bar_date),
                         "exit_time": str(bar_date),
                         "legs": len(pos.legs),
-                        "net_premium": round(pos.net_premium, 2),
+                        "net_premium": round(pos.net_premium * max((l.contract.lot_size for l in pos.legs), default=1), 2),
                         "qty": sum(abs(l.quantity) for l in pos.legs),
                         "spot": round(spot, 2),
                         "settlement_price": round(evt.settlement_price, 2),
@@ -237,6 +237,10 @@ class FnOBacktestEngine:
                         "position_id": pos.position_id,
                     })
                     capital += evt.pnl
+                # If expiry closed all legs, set position-level exit metadata
+                if pos.is_closed and pos.exit_time is None:
+                    pos.exit_time = datetime.combine(bar_date, datetime.min.time())
+                    pos.exit_reason = "expiry"
 
             # ── 4. Update Greeks for open positions ───
             open_positions = [p for p in positions if not p.is_closed]
@@ -262,7 +266,8 @@ class FnOBacktestEngine:
                 _lot_size = pos.legs[0].contract.lot_size if pos.legs else 50
                 _premium_based = abs(pos.net_premium) * _lot_size
                 max_profit = pos.max_profit if (pos.max_profit and pos.max_profit > 0) else max(_premium_based, 500.0)
-                max_loss = pos.max_loss if (pos.max_loss and pos.max_loss > 0) else max(max_profit * 2, 1000.0)
+                import math
+                max_loss = pos.max_loss if (pos.max_loss and math.isfinite(pos.max_loss) and pos.max_loss > 0) else max(max_profit * 2, 1000.0)
 
                 # Profit target
                 if max_profit > 0 and current_pnl >= max_profit * (self.profit_target_pct / 100):
@@ -278,7 +283,7 @@ class FnOBacktestEngine:
                         "entry_time": str(pos.entry_time) if pos.entry_time else str(bar_date),
                         "exit_time": str(pos.exit_time) if pos.exit_time else str(bar_date),
                         "legs": len(pos.legs),
-                        "net_premium": round(pos.net_premium, 2),
+                        "net_premium": round(pos.net_premium * max((l.contract.lot_size for l in pos.legs), default=1), 2),
                         "qty": sum(abs(l.quantity) for l in pos.legs),
                         "pnl": round(exit_pnl, 2),
                         "costs": round(exit_costs, 2),
@@ -299,7 +304,7 @@ class FnOBacktestEngine:
                         "entry_time": str(pos.entry_time) if pos.entry_time else str(bar_date),
                         "exit_time": str(pos.exit_time) if pos.exit_time else str(bar_date),
                         "legs": len(pos.legs),
-                        "net_premium": round(pos.net_premium, 2),
+                        "net_premium": round(pos.net_premium * max((l.contract.lot_size for l in pos.legs), default=1), 2),
                         "qty": sum(abs(l.quantity) for l in pos.legs),
                         "pnl": round(exit_pnl, 2),
                         "costs": round(exit_costs, 2),
@@ -347,7 +352,7 @@ class FnOBacktestEngine:
                             "bar": i, "date": str(bar_date),
                             "spot": round(spot, 2),
                             "legs": len(new_pos.legs),
-                            "net_premium": round(new_pos.net_premium, 2),
+                            "net_premium": round(new_pos.net_premium * max((l.contract.lot_size for l in new_pos.legs), default=1), 2),
                             "margin": round(margin_result.total_margin, 2),
                             "costs": round(entry_costs, 2),
                             "position_id": new_pos.position_id,
@@ -389,12 +394,15 @@ class FnOBacktestEngine:
                 "entry_time": str(pos.entry_time) if pos.entry_time else str(final_date),
                 "exit_time": str(final_date),
                 "legs": len(pos.legs),
-                "net_premium": round(pos.net_premium, 2),
+                "net_premium": round(pos.net_premium * max((l.contract.lot_size for l in pos.legs), default=1), 2),
                 "qty": sum(abs(l.quantity) for l in pos.legs),
                 "pnl": round(exit_pnl, 2),
                 "costs": round(exit_costs, 2),
                 "position_id": pos.position_id,
             })
+
+        # Append final capital so equity curve matches final_capital exactly
+        equity_curve.append(capital)
 
         # ── Build results ───
         equity = np.array(equity_curve)

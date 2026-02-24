@@ -2625,11 +2625,13 @@ function displayFnOPaperResult(r) {
             <div class="summary-item"><span class="summary-label">Initial Capital</span><span class="summary-value">₹${fmtNum(r.initial_capital||0)}</span></div>
             <div class="summary-item"><span class="summary-label">Final Capital</span><span class="summary-value ${pnlClass}">₹${fmtNum(r.final_capital||0)}</span></div>
             <div class="summary-item"><span class="summary-label">Total P&L</span><span class="summary-value ${pnlClass}">₹${fmtNum(r.total_pnl||0)}</span></div>
+            <div class="summary-item"><span class="summary-label">Total Costs</span><span class="summary-value negative">₹${fmtNum(r.total_costs||0)}</span></div>
             <div class="summary-item"><span class="summary-label">Return</span><span class="summary-value ${pnlClass}">${fmtPct(r.total_return_pct||0)}</span></div>
             <div class="summary-item"><span class="summary-label">Total Trades</span><span class="summary-value">${r.total_trades||0}</span></div>
             <div class="summary-item"><span class="summary-label">Win Rate</span><span class="summary-value">${fmtPct(r.win_rate||0)}</span></div>
             <div class="summary-item"><span class="summary-label">Max Drawdown</span><span class="summary-value negative">${fmtPct(r.max_drawdown_pct||0)}</span></div>
             <div class="summary-item"><span class="summary-label">Sharpe Ratio</span><span class="summary-value">${(r.sharpe_ratio||0).toFixed(4)}</span></div>
+            <div class="summary-item"><span class="summary-label">Profit Factor</span><span class="summary-value">${(r.profit_factor||0).toFixed(2)}</span></div>
         </div>`;
 
     // Show results section
@@ -2674,6 +2676,7 @@ function displayFnOPaperResult(r) {
     if (positions.length > 0) {
         tbody.innerHTML = positions.map((p, i) => {
             const pnlColor = (p.pnl||0) >= 0 ? '#00d4aa' : '#ff5252';
+            const entryDate = (p.entry_time||p.entry||'--').toString().slice(0, 10);
             return '<tr>' +
                 '<td>' + (i+1) + '</td>' +
                 '<td>' + (p.structure||p.type||'--') + '</td>' +
@@ -2681,7 +2684,7 @@ function displayFnOPaperResult(r) {
                 '<td>₹' + formatNum(p.net_premium||0) + '</td>' +
                 '<td style="color:' + pnlColor + '">₹' + formatNum(p.pnl||0) + '</td>' +
                 '<td>' + (p.regime||'--') + '</td>' +
-                '<td>' + (p.entry_time||p.entry||'--') + '</td>' +
+                '<td>' + entryDate + '</td>' +
                 '</tr>';
         }).join('');
     } else {
@@ -2693,15 +2696,18 @@ function displayFnOPaperResult(r) {
     if (positions.length > 0) {
         tradeBody.innerHTML = positions.map(p => {
             const pnlCl = (p.pnl||0) >= 0 ? 'text-green' : 'text-red';
+            const entryT = (p.entry_time||p.entry||'--').toString().slice(0, 10);
+            const exitT = (p.exit_time||p.exit||'--').toString().slice(0, 10);
+            const exitR = p.exit_reason||p.reason||'--';
             return `<tr>
                 <td>${p.structure||p.type||'--'}</td>
                 <td>₹${fmtNum(p.net_premium||0)}</td>
-                <td>--</td>
-                <td>${p.qty||p.quantity||p.legs||'--'}</td>
+                <td>${(p.pnl||0) >= 0 ? 'Profit' : 'Loss'}</td>
+                <td>${p.qty||p.quantity||'--'}</td>
                 <td class="${pnlCl}">₹${fmtNum(p.pnl||0)}</td>
-                <td>${p.entry_time||p.entry||'--'}</td>
-                <td>${p.exit_time||p.exit||'--'}</td>
-                <td>${p.exit_reason||p.reason||'--'}</td>
+                <td>${entryT}</td>
+                <td>${exitT}</td>
+                <td>${exitR}</td>
             </tr>`;
         }).join('');
     }
@@ -4145,7 +4151,7 @@ function displayFnOBacktestResult(data) {
         metricCard('Total Trades', m.total_trades||0) +
         metricCard('Max Drawdown', (m.max_drawdown_pct||0).toFixed(2) + '%', '#ff5252') +
         metricCard('Profit Factor', (m.profit_factor||0).toFixed(2)) +
-        metricCard('Capital', '₹' + formatNum(m.initial_capital||0)) +
+        metricCard('Total Costs', '₹' + formatNum(m.total_costs||0), '#ffb74d') +
         metricCard('Final Capital', '₹' + formatNum(m.final_capital||0), profitColor) +
         '</div>';
 

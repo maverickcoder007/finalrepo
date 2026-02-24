@@ -330,6 +330,10 @@ class FnOPaperTradingEngine:
                         timestamp=bar_time,
                         position_id=pos.position_id,
                     ))
+                # If expiry closed all legs, set position-level exit metadata
+                if pos.is_closed and pos.exit_time is None:
+                    pos.exit_time = datetime.combine(bar_date, datetime.min.time())
+                    pos.exit_reason = "expiry"
 
             # 4. Update Greeks
             if self.open_positions:
@@ -358,7 +362,8 @@ class FnOPaperTradingEngine:
                 _lot_size = pos.legs[0].contract.lot_size if pos.legs else 50
                 _premium_based = abs(pos.net_premium) * _lot_size
                 max_profit = pos.max_profit if (pos.max_profit and pos.max_profit > 0) else max(_premium_based, 500.0)
-                max_loss = pos.max_loss if (pos.max_loss and pos.max_loss > 0) else max(max_profit * 2, 1000.0)
+                import math
+                max_loss = pos.max_loss if (pos.max_loss and math.isfinite(pos.max_loss) and pos.max_loss > 0) else max(max_profit * 2, 1000.0)
 
                 should_close = False
                 reason = ""
@@ -408,6 +413,9 @@ class FnOPaperTradingEngine:
             pnl, costs = self._close_position(pos, final_time, "session_end")
             self._capital += pnl - costs
             total_costs += costs
+
+        # Append final capital so equity curve matches final_capital exactly
+        self._equity_curve.append(self._capital)
 
         return self._build_result(df, timeframe, total_costs)
 
@@ -579,19 +587,28 @@ class FnOPaperTradingEngine:
         position_pnls = []
         position_dicts = []
         for pos in closed:
+            # Safety net: ensure all closed positions have exit metadata
+            if pos.exit_time is None:
+                pos.exit_time = datetime.combine(
+                    self._parse_date(df, len(df) - 1), datetime.min.time()
+                )
+            if not pos.exit_reason:
+                pos.exit_reason = "session_end"
+
             pos_pnl = sum(
                 (l.exit_price - l.entry_price) * l.quantity * l.contract.lot_size
-                if l.exit_price else 0
+                if l.is_closed else 0
                 for l in pos.legs
             )
             position_pnls.append(pos_pnl)
             total_lots = sum(abs(l.quantity) for l in pos.legs)
+            _lot_size = max((l.contract.lot_size for l in pos.legs), default=1)
             position_dicts.append({
                 "id": pos.position_id,
                 "structure": pos.structure.value,
                 "type": pos.structure.value,
                 "legs": len(pos.legs),
-                "net_premium": round(pos.net_premium, 2),
+                "net_premium": round(pos.net_premium * _lot_size, 2),
                 "pnl": round(pos_pnl, 2),
                 "entry": str(pos.entry_time),
                 "exit": str(pos.exit_time),
