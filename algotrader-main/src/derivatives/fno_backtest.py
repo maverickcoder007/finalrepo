@@ -220,9 +220,16 @@ class FnOBacktestEngine:
                 for evt in events:
                     trades.append({
                         "type": "EXPIRY",
+                        "structure": pos.structure.value,
+                        "exit_reason": "expiry",
                         "event": evt.event_type.value,
                         "bar": i,
                         "date": str(bar_date),
+                        "entry_time": str(pos.entry_time) if pos.entry_time else str(bar_date),
+                        "exit_time": str(bar_date),
+                        "legs": len(pos.legs),
+                        "net_premium": round(pos.net_premium, 2),
+                        "qty": sum(abs(l.quantity) for l in pos.legs),
                         "spot": round(spot, 2),
                         "settlement_price": round(evt.settlement_price, 2),
                         "intrinsic": round(evt.intrinsic_value, 2),
@@ -262,9 +269,17 @@ class FnOBacktestEngine:
                     exit_pnl, exit_costs = self._close_position(pos, chain, spot, i, bar_date)
                     capital += exit_pnl - exit_costs
                     total_costs += exit_costs
+                    pos.exit_reason = "profit_target"
                     trades.append({
                         "type": "PROFIT_TARGET",
+                        "structure": pos.structure.value,
+                        "exit_reason": "profit_target",
                         "bar": i, "date": str(bar_date),
+                        "entry_time": str(pos.entry_time) if pos.entry_time else str(bar_date),
+                        "exit_time": str(pos.exit_time) if pos.exit_time else str(bar_date),
+                        "legs": len(pos.legs),
+                        "net_premium": round(pos.net_premium, 2),
+                        "qty": sum(abs(l.quantity) for l in pos.legs),
                         "pnl": round(exit_pnl, 2),
                         "costs": round(exit_costs, 2),
                         "position_id": pos.position_id,
@@ -275,9 +290,17 @@ class FnOBacktestEngine:
                     exit_pnl, exit_costs = self._close_position(pos, chain, spot, i, bar_date)
                     capital += exit_pnl - exit_costs
                     total_costs += exit_costs
+                    pos.exit_reason = "stop_loss"
                     trades.append({
                         "type": "STOP_LOSS",
+                        "structure": pos.structure.value,
+                        "exit_reason": "stop_loss",
                         "bar": i, "date": str(bar_date),
+                        "entry_time": str(pos.entry_time) if pos.entry_time else str(bar_date),
+                        "exit_time": str(pos.exit_time) if pos.exit_time else str(bar_date),
+                        "legs": len(pos.legs),
+                        "net_premium": round(pos.net_premium, 2),
+                        "qty": sum(abs(l.quantity) for l in pos.legs),
                         "pnl": round(exit_pnl, 2),
                         "costs": round(exit_costs, 2),
                         "position_id": pos.position_id,
@@ -313,6 +336,8 @@ class FnOBacktestEngine:
                         margin_history.append({
                             "bar": i, "date": str(bar_date),
                             "margin": round(margin_result.total_margin, 2),
+                            "margin_used": round(margin_result.total_margin, 2),
+                            "total_margin": round(margin_result.total_margin, 2),
                             "span": round(margin_result.span_margin, 2),
                         })
 
@@ -354,10 +379,18 @@ class FnOBacktestEngine:
             capital += exit_pnl - exit_costs
             total_costs += exit_costs
             closed_positions.append(pos)
+            pos.exit_reason = "final_exit"
             trades.append({
                 "type": "FINAL_EXIT",
+                "structure": pos.structure.value,
+                "exit_reason": "final_exit",
                 "bar": len(df) - 1,
                 "date": str(final_date),
+                "entry_time": str(pos.entry_time) if pos.entry_time else str(final_date),
+                "exit_time": str(final_date),
+                "legs": len(pos.legs),
+                "net_premium": round(pos.net_premium, 2),
+                "qty": sum(abs(l.quantity) for l in pos.legs),
                 "pnl": round(exit_pnl, 2),
                 "costs": round(exit_costs, 2),
                 "position_id": pos.position_id,
@@ -374,8 +407,8 @@ class FnOBacktestEngine:
             "underlying": self.underlying,
             "tradingsymbol": tradingsymbol,
             "total_bars": len(df),
-            "start_date": str(df.index[0]),
-            "end_date": str(df.index[-1]),
+            "start_date": str(self._parse_bar_date(df, 0)),
+            "end_date": str(self._parse_bar_date(df, len(df) - 1)),
             "initial_capital": self.initial_capital,
             "final_capital": round(capital, 2),
             "total_return_pct": round(
@@ -727,10 +760,10 @@ class FnOBacktestEngine:
             return
 
         opt_type = "CE" if contract.is_call else "PE"
-        key = f"{contract.strike}_{opt_type}"
+        strike_data = chain.strikes.get(contract.strike)
 
-        if key in chain.strikes:
-            quote = chain.strikes[key]
+        if strike_data is not None and opt_type in strike_data:
+            quote = strike_data[opt_type]
             leg.current_price = quote.price
             leg.iv_current = quote.iv
         else:

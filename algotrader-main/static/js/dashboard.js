@@ -2681,7 +2681,7 @@ function displayFnOPaperResult(r) {
                 '<td>₹' + formatNum(p.net_premium||0) + '</td>' +
                 '<td style="color:' + pnlColor + '">₹' + formatNum(p.pnl||0) + '</td>' +
                 '<td>' + (p.regime||'--') + '</td>' +
-                '<td>' + (p.entry_time||'--') + '</td>' +
+                '<td>' + (p.entry_time||p.entry||'--') + '</td>' +
                 '</tr>';
         }).join('');
     } else {
@@ -2696,12 +2696,12 @@ function displayFnOPaperResult(r) {
             return `<tr>
                 <td>${p.structure||p.type||'--'}</td>
                 <td>₹${fmtNum(p.net_premium||0)}</td>
-                <td>${p.exit_reason||'--'}</td>
-                <td>${p.legs||'--'}</td>
+                <td>--</td>
+                <td>${p.qty||p.quantity||p.legs||'--'}</td>
                 <td class="${pnlCl}">₹${fmtNum(p.pnl||0)}</td>
-                <td>${p.entry_time||'--'}</td>
-                <td>${p.exit_time||'--'}</td>
-                <td>${p.regime||'--'}</td>
+                <td>${p.entry_time||p.entry||'--'}</td>
+                <td>${p.exit_time||p.exit||'--'}</td>
+                <td>${p.exit_reason||p.reason||'--'}</td>
             </tr>`;
         }).join('');
     }
@@ -2752,18 +2752,25 @@ function displayPaperResult(r) {
 
     // Trade log
     const tbody = document.getElementById('paper-trades-body');
-    if (r.positions && r.positions.length > 0) {
-        tbody.innerHTML = r.positions.map(p => {
+    const tradeData = r.positions || r.trades || [];
+    // For equity backtests, filter to exit trades only (skip entries)
+    const exitData = tradeData.filter(p => p.pnl !== undefined && (!p.type || !p.type.includes('ENTRY')));
+    if (exitData.length > 0) {
+        tbody.innerHTML = exitData.map(p => {
             const pnlCl = p.pnl >= 0 ? 'text-green' : 'text-red';
+            const entryVal = p.entry_price || p.net_premium || p.entry;
+            const exitVal = p.exit_price || p.exit;
+            const entryDisp = (typeof entryVal === 'number' || (typeof entryVal === 'string' && !isNaN(entryVal))) ? '₹' + fmtNum(entryVal) : (entryVal || '--');
+            const exitDisp = (typeof exitVal === 'number' || (typeof exitVal === 'string' && !isNaN(exitVal))) ? '₹' + fmtNum(exitVal) : (exitVal || '--');
             return `<tr>
-                <td>${p.type}</td>
-                <td>₹${fmtNum(p.entry)}</td>
-                <td>₹${fmtNum(p.exit)}</td>
-                <td>${p.qty}</td>
+                <td>${p.type||p.structure||'--'}</td>
+                <td>${entryDisp}</td>
+                <td>${exitDisp}</td>
+                <td>${p.qty||p.quantity||'--'}</td>
                 <td class="${pnlCl}">₹${fmtNum(p.pnl)}</td>
-                <td>${p.entry_time || '--'}</td>
-                <td>${p.exit_time || '--'}</td>
-                <td>${p.reason || '--'}</td>
+                <td>${p.entry_time||p.entry||'--'}</td>
+                <td>${p.exit_time||p.exit||'--'}</td>
+                <td>${p.reason||p.exit_reason||'--'}</td>
             </tr>`;
         }).join('');
     } else {
@@ -4201,17 +4208,19 @@ function displayFnOBacktestResult(data) {
 
     // Reuse trade log for F&O
     const tbody = document.getElementById('bt-trades-body');
-    if (trades.length > 0) {
-        tbody.innerHTML = trades.map((t, i) => {
+    // Filter to exit trades only (skip ENTRY) and render with enriched fields
+    const exitTrades = trades.filter(t => t.type !== 'ENTRY' && t.pnl !== undefined);
+    if (exitTrades.length > 0) {
+        tbody.innerHTML = exitTrades.map((t, i) => {
             const color = (t.pnl||0) >= 0 ? '#00d4aa' : '#ff5252';
-            return '<tr><td>' + (i+1) + '</td><td>' + (t.structure||'--') + '</td>' +
-                '<td>' + (t.entry_time||'--') + ' → ' + (t.exit_time||'--') + '</td>' +
-                '<td>' + (t.legs||'--') + '</td>' +
+            return '<tr><td>' + (i+1) + '</td><td>' + (t.structure||t.type||'--') + '</td>' +
+                '<td>' + (t.entry_time||t.date||'--') + ' → ' + (t.exit_time||t.date||'--') + '</td>' +
+                '<td>' + (t.qty||t.legs||'--') + '</td>' +
                 '<td style="color:' + color + '">₹' + formatNum(t.pnl||0) + '</td>' +
                 '<td>₹' + formatNum(t.costs||0) + '</td>' +
                 '<td>' + (t.hold_bars||'--') + '</td>' +
                 '<td>' + (t.regime||'--') + '</td>' +
-                '<td>' + (t.exit_reason||'--') + '</td></tr>';
+                '<td>' + (t.exit_reason||t.type||'--') + '</td></tr>';
         }).join('');
     } else {
         tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted);text-align:center">No F&O trades</td></tr>';

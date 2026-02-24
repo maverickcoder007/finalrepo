@@ -237,6 +237,9 @@ class MultiLegPosition:
     margin_peak: float = 0.0
     margin_at_entry: float = 0.0
 
+    # Exit reason (profit_target, stop_loss, expiry, session_end, final_exit)
+    exit_reason: str = ""
+
     # Journal metadata
     iv_percentile_at_entry: float = 0.0
     regime_at_entry: str = ""

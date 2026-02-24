@@ -388,6 +388,8 @@ class FnOPaperTradingEngine:
                     self._margin_history.append({
                         "bar": i, "date": str(bar_date),
                         "margin_required": round(margin.total_margin, 2),
+                        "margin_used": round(margin.total_margin, 2),
+                        "total_margin": round(margin.total_margin, 2),
                         "capital": round(self._capital, 2),
                     })
 
@@ -526,7 +528,12 @@ class FnOPaperTradingEngine:
             ))
             leg.close(exit_price)
 
-        pos.exit_time = datetime.now()
+        # Use bar_time (simulated timestamp) instead of wall-clock time
+        try:
+            pos.exit_time = datetime.fromisoformat(str(bar_time))
+        except (ValueError, TypeError):
+            pos.exit_time = datetime.now()
+        pos.exit_reason = reason
         return total_pnl, total_cost
 
     def _update_leg_price(self, leg: OptionLeg, chain: SyntheticChain, spot: float) -> None:
@@ -535,9 +542,9 @@ class FnOPaperTradingEngine:
         if contract.strike is None:
             return
         opt = "CE" if contract.is_call else "PE"
-        key = f"{contract.strike}_{opt}"
-        if key in chain.strikes:
-            q = chain.strikes[key]
+        strike_data = chain.strikes.get(contract.strike)
+        if strike_data is not None and opt in strike_data:
+            q = strike_data[opt]
             leg.current_price = q.price
             leg.iv_current = q.iv
         else:
@@ -578,14 +585,22 @@ class FnOPaperTradingEngine:
                 for l in pos.legs
             )
             position_pnls.append(pos_pnl)
+            total_lots = sum(abs(l.quantity) for l in pos.legs)
             position_dicts.append({
                 "id": pos.position_id,
                 "structure": pos.structure.value,
+                "type": pos.structure.value,
                 "legs": len(pos.legs),
                 "net_premium": round(pos.net_premium, 2),
                 "pnl": round(pos_pnl, 2),
                 "entry": str(pos.entry_time),
                 "exit": str(pos.exit_time),
+                "entry_time": str(pos.entry_time),
+                "exit_time": str(pos.exit_time),
+                "exit_reason": pos.exit_reason or "unknown",
+                "reason": pos.exit_reason or "unknown",
+                "qty": total_lots,
+                "quantity": total_lots,
                 "regime": pos.regime_at_entry,
             })
 

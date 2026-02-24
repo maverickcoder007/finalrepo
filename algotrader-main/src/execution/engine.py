@@ -638,8 +638,11 @@ class ExecutionEngine:
                 broker_order = broker_order_map.get(order_id)
                 if broker_order:
                     if broker_order.status in ("COMPLETE", "CANCELLED", "REJECTED"):
+                        # Use .pop() with default to avoid KeyError if fast loop already removed it
+                        removed = self._pending_orders.pop(order_id, None)
+                        if removed is None:
+                            continue  # Already handled by fast reconciliation loop
                         self._filled_orders[order_id] = broker_order
-                        del self._pending_orders[order_id]
                         result["matched"] += 1
 
                         if broker_order.status == "REJECTED":
@@ -704,7 +707,9 @@ class ExecutionEngine:
                     if broker_order and broker_order.status in (
                         "COMPLETE", "CANCELLED", "REJECTED"
                     ):
-                        order_req = self._pending_orders.pop(order_id)
+                        order_req = self._pending_orders.pop(order_id, None)
+                        if order_req is None:
+                            continue  # Already handled by slow reconciliation loop
                         self._filled_orders[order_id] = broker_order
                         
                         if broker_order.status == "REJECTED":
