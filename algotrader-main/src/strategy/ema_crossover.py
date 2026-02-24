@@ -57,11 +57,13 @@ class EMACrossoverStrategy(BaseStrategy):
         return [signal] if signal else []
 
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
-        if len(data) < self.params["slow_period"]:
+        fast_p = self._scale_period(self.params["fast_period"])
+        slow_p = self._scale_period(self.params["slow_period"])
+        if len(data) < slow_p:
             return None
 
-        fast_ema = data["close"].ewm(span=self.params["fast_period"], adjust=False).mean()
-        slow_ema = data["close"].ewm(span=self.params["slow_period"], adjust=False).mean()
+        fast_ema = data["close"].ewm(span=fast_p, adjust=False).mean()
+        slow_ema = data["close"].ewm(span=slow_p, adjust=False).mean()
 
         current_fast = fast_ema.iloc[-1]
         current_slow = slow_ema.iloc[-1]

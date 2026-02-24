@@ -347,9 +347,16 @@ async def start_live(request: Request) -> dict[str, Any]:
     body = await request.json()
     tokens = body.get("tokens", [])
     mode = body.get("mode", "quote")
+    names = body.get("names", {})  # optional token→name map from frontend
     if not tokens:
         raise HTTPException(400, "tokens list is required")
     svc = get_user_service(request)
+    # Populate token name map from frontend selections
+    for tok_str, name in names.items():
+        try:
+            svc._token_name_map[int(tok_str)] = name
+        except (ValueError, TypeError):
+            pass
     return await svc.start_live(tokens, mode)
 
 
@@ -664,6 +671,7 @@ async def run_paper_trade_sample(request: Request) -> dict[str, Any]:
             tradingsymbol=body.get("tradingsymbol", "SAMPLE"),
             bars=body.get("bars", 500),
             capital=body.get("capital", 100000),
+            interval=body.get("interval", "5minute"),
             strategy_params=body.get("strategy_params"),
         )
     except Exception as e:
@@ -1104,6 +1112,7 @@ async def run_backtest_sample(request: Request) -> dict[str, Any]:
             is_intraday=body.get("is_intraday", False),
             risk_per_trade=body.get("risk_per_trade", 0.02),
             capital_fraction=body.get("capital_fraction", 0.10),
+            interval=body.get("interval", "day"),
             strategy_params=body.get("strategy_params"),
         )
         return result

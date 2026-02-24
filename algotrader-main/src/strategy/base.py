@@ -13,6 +13,33 @@ logger = get_logger(__name__)
 
 
 class BaseStrategy(abc.ABC):
+    """Base class for all trading strategies.
+
+    Supports timeframe-aware parameter scaling: when ``set_timeframe``
+    is called the strategy records the operating interval and computes
+    a *moderate* scaling multiplier so that lookback-period based params
+    (EMA span, RSI period, etc.) are automatically adjusted for
+    intraday vs daily data.
+
+    Multiplier table (Indian markets, 375 min / trading day):
+        day → 1.0, 60min → 1.0, 30min → 1.5, 15min → 2.0,
+        10min → 2.5, 5min → 3.0, 3min → 4.0, minute → 5.0
+    """
+
+    # Moderate scaling factors – NOT linear bar-count ratio.
+    # Designed so that a 9-bar EMA on daily stays 9, while on 5-min
+    # it becomes 27 (≈ ~2.25 hours) which is a sensible intraday window.
+    _TF_MULTIPLIERS: dict[str, float] = {
+        "day": 1.0,
+        "60minute": 1.0,
+        "30minute": 1.5,
+        "15minute": 2.0,
+        "10minute": 2.5,
+        "5minute": 3.0,
+        "3minute": 4.0,
+        "minute": 5.0,
+    }
+
     def __init__(self, name: str, params: Optional[dict[str, Any]] = None) -> None:
         self.name = name
         self.params = params or {}
@@ -21,6 +48,31 @@ class BaseStrategy(abc.ABC):
         self._bar_data: dict[int, pd.DataFrame] = {}
         self._signals: list[Signal] = []
         self._last_signal_time: Optional[datetime] = None
+        self._timeframe: str = "day"
+        self._tf_multiplier: float = 1.0
+
+    # ─── Timeframe scaling ────────────────────────────────────
+
+    def set_timeframe(self, interval: str) -> None:
+        """Set the operating timeframe so period parameters auto-scale."""
+        self._timeframe = interval
+        self._tf_multiplier = self._TF_MULTIPLIERS.get(interval, 1.0)
+        logger.info(
+            "strategy_timeframe_set",
+            strategy=self.name,
+            timeframe=interval,
+            multiplier=self._tf_multiplier,
+        )
+
+    def _scale_period(self, base_period: int) -> int:
+        """Scale a lookback period based on the current timeframe multiplier."""
+        return max(base_period, int(base_period * self._tf_multiplier))
+
+    @property
+    def timeframe(self) -> str:
+        return self._timeframe
+
+    # ─── Abstract interface ───────────────────────────────────
 
     @abc.abstractmethod
     async def on_tick(self, ticks: list[Tick]) -> list[Signal]:
@@ -33,6 +85,8 @@ class BaseStrategy(abc.ABC):
     @abc.abstractmethod
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
         pass
+
+    # ─── Bar / tick helpers ───────────────────────────────────
 
     def update_bar_data(self, instrument_token: int, df: pd.DataFrame) -> None:
         self._bar_data[instrument_token] = df

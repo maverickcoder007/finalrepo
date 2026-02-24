@@ -153,10 +153,59 @@ THRESHOLDS = {
         "rom_good": 30.0,
         "rom_ok": 15.0,
     },
+    # ── Credit / income F&O strategies ──────────────────────
+    # Iron butterfly, iron condor, short straddle, short strangle,
+    # bull put spread, bear call spread: high win-rate, small wins,
+    # occasional large (but capped) losses.  Traditional payoff /
+    # avg-win-ratio thresholds are inappropriate for these.
+    "fno_credit": {
+        "expectancy_good": 0.15,      # smaller edge per R is normal
+        "expectancy_ok": 0.05,
+        "profit_factor_good": 1.3,    # 1.3 PF on credit spreads is solid
+        "profit_factor_ok": 1.05,
+        "sharpe_good": 1.2,
+        "sharpe_ok": 0.7,
+        "sortino_good": 1.5,
+        "sortino_ok": 0.8,
+        "max_dd_good": 20.0,          # credit structures can spike
+        "max_dd_ok": 35.0,
+        "recovery_good": 3.0,
+        "recovery_ok": 1.5,
+        "payoff_good": 0.6,           # avg_win < avg_loss by design
+        "payoff_ok": 0.3,
+        "avg_win_ratio_good": 0.7,    # not expected to exceed 1.0
+        "avg_win_ratio_ok": 0.3,
+        "rom_good": 25.0,
+        "rom_ok": 12.0,
+    },
+}
+
+# Structures that are naturally "credit / income" strategies
+CREDIT_STRUCTURES: set[str] = {
+    "iron_butterfly", "iron_condor", "short_straddle", "short_strangle",
+    "bull_put_spread", "bear_call_spread",
+    # StructureType enum values (lowercase)
+    "IRON_BUTTERFLY", "IRON_CONDOR", "SHORT_STRADDLE", "SHORT_STRANGLE",
+    "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD",
 }
 
 
-def _get_thresholds(strategy_type: str) -> dict[str, float]:
+def _is_credit_strategy(result: dict) -> bool:
+    """Detect whether the result belongs to a credit / income F&O structure."""
+    struct = result.get("structure", result.get("structure_type", ""))
+    sname = result.get("strategy_name", "")
+    return (
+        struct.lower().replace(" ", "_") in {s.lower() for s in CREDIT_STRUCTURES}
+        or sname.lower().replace(" ", "_") in {s.lower() for s in CREDIT_STRUCTURES}
+    )
+
+
+def _get_thresholds(strategy_type: str, result: dict | None = None) -> dict[str, float]:
+    """Return threshold dict appropriate for the strategy type and structure."""
+    # Credit / income F&O strategies get specialised thresholds
+    if result and _is_credit_strategy(result):
+        return THRESHOLDS["fno_credit"]
+
     stype = strategy_type.lower()
     if stype in THRESHOLDS:
         return THRESHOLDS[stype]
@@ -165,6 +214,195 @@ def _get_thresholds(strategy_type: str) -> dict[str, float]:
     if "fno" in stype or "option" in stype or "oi" in stype:
         return THRESHOLDS["fno"]
     return THRESHOLDS["equity"]
+
+
+# ────────────────────────────────────────────────────────────
+# Streak helper  (used by _normalize_result and Pillar 4/8)
+# ────────────────────────────────────────────────────────────
+
+def _compute_streaks(pnls: list[float]) -> tuple[int, int]:
+    """Compute max winning and losing streaks."""
+    max_win = max_lose = cur_win = cur_lose = 0
+    for pnl in pnls:
+        if pnl > 0:
+            cur_win += 1
+            cur_lose = 0
+            max_win = max(max_win, cur_win)
+        else:
+            cur_lose += 1
+            cur_win = 0
+            max_lose = max(max_lose, cur_lose)
+    return max_win, max_lose
+
+
+# ────────────────────────────────────────────────────────────
+# Result-dict normalisation
+# ────────────────────────────────────────────────────────────
+
+# Trade types that represent an actual exit (with PnL)
+_EXIT_TYPES: set[str] = {
+    "PROFIT_TARGET", "STOP_LOSS", "FINAL_EXIT", "EXPIRY",
+    "SL_LONG_EXIT", "SL_SHORT_EXIT", "TP_LONG_EXIT", "TP_SHORT_EXIT",
+    "EXIT", "CLOSE",
+}
+
+
+def _extract_exit_pnls(result: dict) -> list[float]:
+    """Extract PnL values from exit trades only, handling all result shapes.
+
+    Equity BacktestEngine:   trades have "pnl" on every entry.
+    FnO BacktestEngine:      trades have mixed types; only exits have "pnl".
+    FnO PaperTradingEngine:  "orders" list or "positions" list.
+    """
+    pnls: list[float] = []
+
+    # 1. Try trades list (equity + FnO backtest)
+    trades = result.get("trades", [])
+    if trades:
+        for t in trades:
+            ttype = t.get("type", "")
+            pnl = t.get("pnl")
+            if pnl is None:
+                continue
+            # If type is present and it's an ENTRY, skip it
+            if ttype and ttype.upper() == "ENTRY":
+                continue
+            # If type is present and it's a known exit, include
+            if ttype and ttype.upper() in _EXIT_TYPES:
+                pnls.append(float(pnl))
+            # If no type tag (equity backtest) just include all with pnl
+            elif not ttype:
+                pnls.append(float(pnl))
+        if pnls:
+            return pnls
+
+    # 2. Try positions list (FnO paper trade)
+    positions = result.get("positions", [])
+    if positions:
+        for pos in positions:
+            pnl = pos.get("pnl")
+            if pnl is not None:
+                pnls.append(float(pnl))
+        if pnls:
+            return pnls
+
+    # 3. Try orders list (FnO paper trade)
+    orders = result.get("orders", [])
+    if orders:
+        for o in orders:
+            pnl = o.get("pnl")
+            if pnl is not None:
+                pnls.append(float(pnl))
+
+    return pnls
+
+
+def _synthesize_monthly_pnl(result: dict) -> dict[str, float]:
+    """Compute monthly PnL from trades when trade_analytics.monthly_pnl is absent."""
+    monthly: dict[str, float] = {}
+
+    # Collect (date_str, pnl) pairs
+    items: list[tuple[str, float]] = []
+    for t in result.get("trades", []):
+        ttype = t.get("type", "")
+        if ttype and ttype.upper() == "ENTRY":
+            continue
+        pnl = t.get("pnl")
+        dt = t.get("date", t.get("exit_time", t.get("entry_time", "")))
+        if pnl is not None and dt:
+            items.append((str(dt), float(pnl)))
+
+    if not items:
+        for pos in result.get("positions", []):
+            pnl = pos.get("pnl")
+            dt = pos.get("exit", pos.get("date", ""))
+            if pnl is not None and dt:
+                items.append((str(dt), float(pnl)))
+
+    for dt_str, pnl in items:
+        try:
+            month_key = dt_str[:7]  # "YYYY-MM"
+            if len(month_key) == 7 and month_key[4] == "-":
+                monthly[month_key] = monthly.get(month_key, 0) + pnl
+        except (IndexError, ValueError):
+            pass
+
+    return monthly
+
+
+def _normalize_result(result: dict) -> None:
+    """Fill commonly-missing keys so pillar functions see a uniform shape.
+
+    Mutates ``result`` in-place.  Must be called before pillar computation.
+    """
+    engine = result.get("engine", "")
+    is_fno = "fno" in engine.lower()
+
+    # ── total_pnl ──
+    if "total_pnl" not in result:
+        ic = result.get("initial_capital", 0)
+        fc = result.get("final_capital", 0)
+        if ic and fc:
+            result["total_pnl"] = fc - ic
+
+    # ── payoff_ratio ──
+    if "payoff_ratio" not in result:
+        aw = result.get("avg_win", 0)
+        al = abs(result.get("avg_loss", 0))
+        result["payoff_ratio"] = round(aw / al, 4) if al > 0 else 0
+
+    # ── sortino_ratio from equity_curve ──
+    if "sortino_ratio" not in result or result.get("sortino_ratio", 0) == 0:
+        eq = result.get("equity_curve", [])
+        if len(eq) > 2:
+            arr = np.array(eq, dtype=float)
+            rets = np.diff(arr) / np.where(arr[:-1] != 0, arr[:-1], 1)
+            neg = rets[rets < 0]
+            if len(neg) > 0 and np.std(neg) > 0:
+                result["sortino_ratio"] = round(
+                    float(np.mean(rets) / np.std(neg) * np.sqrt(252)), 4
+                )
+
+    # ── trade_analytics (streaks, best/worst) from exit PnLs ──
+    analytics = result.setdefault("trade_analytics", {})
+    exit_pnls = _extract_exit_pnls(result)
+    if exit_pnls:
+        if not analytics.get("max_win_streak") and not analytics.get("max_lose_streak"):
+            ws, ls = _compute_streaks(exit_pnls)
+            analytics.setdefault("max_win_streak", ws)
+            analytics.setdefault("max_lose_streak", ls)
+        analytics.setdefault("best_trade", round(max(exit_pnls), 2))
+        analytics.setdefault("worst_trade", round(min(exit_pnls), 2))
+
+        # monthly_pnl synthesis
+        if not analytics.get("monthly_pnl"):
+            mpnl = _synthesize_monthly_pnl(result)
+            if mpnl:
+                analytics["monthly_pnl"] = mpnl
+
+    # ── Equity settings fallback (from stop_loss_stats + result keys) ──
+    if "settings" not in result:
+        sl_stats = result.get("stop_loss_stats", {})
+        result["settings"] = {
+            "stop_loss_pct": 1 if sl_stats.get("sl_exits", 0) > 0 else 0,
+            "profit_target_pct": 1 if sl_stats.get("tp_exits", 0) > 0 else 0,
+            "max_positions": result.get("max_positions", 0),
+            "position_sizing": result.get("position_sizing", "fixed"),
+        }
+
+    # ── Normalize margin_history keys ──
+    # FnO backtest uses "margin", FnO paper trade uses "margin_required"
+    margin_hist = result.get("margin_history", [])
+    for m in margin_hist:
+        if "margin" not in m and "margin_required" in m:
+            m["margin"] = m["margin_required"]
+
+    # ── expectancy ──
+    if "expectancy" not in result:
+        wr = result.get("win_rate", 0) / 100
+        aw = result.get("avg_win", 0)
+        al = abs(result.get("avg_loss", 0))
+        result["expectancy"] = round(wr * aw - (1 - wr) * al, 2)
 
 
 def _score_metric(value: float, good: float, ok: float, higher_is_better: bool = True) -> tuple[float, str]:
@@ -232,8 +470,24 @@ def _compute_profitability(result: dict, th: dict) -> PillarResult:
     p.metrics["sortino_ratio"] = round(sortino, 4)
     so_score, so_v = _score_metric(sortino, th["sortino_good"], th["sortino_ok"])
 
-    # Weighted pillar score
-    p.score = 0.35 * exp_score + 0.25 * pf_score + 0.20 * sh_score + 0.20 * so_score
+    # ── Credit strategy win-rate bonus ──
+    # Credit / income strategies derive edge from high win-rate × many small wins.
+    # Even with payoff < 1.0, the math works if win_rate is high enough.
+    is_credit = result.get("_is_credit_strategy", False)
+    if is_credit and win_rate >= 0.55:
+        wr_bonus = min(30, (win_rate - 0.55) * 200)  # up to +30 for 70%+ WR
+        p.metrics["credit_win_rate_bonus"] = round(wr_bonus, 1)
+        p.notes.append(f"Credit strategy: win-rate {win_rate:.0%} adds {wr_bonus:.0f} pts")
+    else:
+        wr_bonus = 0
+
+    # Weighted pillar score (credit strategies de-emphasise payoff-dependent metrics)
+    if is_credit:
+        # PF and expectancy matter most; Sharpe less so (short gamma spikes it)
+        p.score = 0.30 * exp_score + 0.35 * pf_score + 0.15 * sh_score + 0.10 * so_score + wr_bonus * 0.10
+    else:
+        p.score = 0.35 * exp_score + 0.25 * pf_score + 0.20 * sh_score + 0.20 * so_score
+    p.score = min(100, p.score)
 
     # Verdict
     if expectancy_r < 0 or pf < 1.0:
@@ -241,6 +495,9 @@ def _compute_profitability(result: dict, th: dict) -> PillarResult:
         p.notes.append("Negative expectancy or profit factor <1 — strategy loses money")
     elif exp_v == "PASS" and pf_v in ("PASS", "WARN"):
         p.verdict = "PASS"
+    elif is_credit and pf >= 1.0 and expectancy_r > 0:
+        # Credit strategies with positive expectancy and PF≥1 should not FAIL
+        p.verdict = "WARN" if exp_v == "FAIL" or pf_v == "FAIL" else "PASS"
     elif any(v == "FAIL" for v in [exp_v, pf_v]):
         p.verdict = "FAIL"
     else:
@@ -338,7 +595,26 @@ def _compute_trade_quality(result: dict, th: dict) -> PillarResult:
     wl_score, wl_v = _score_metric(win_loss_ratio, th["avg_win_ratio_good"], th["avg_win_ratio_ok"])
 
     # Win/Loss structure classification
-    if win_rate >= 60:
+    is_credit = result.get("_is_credit_strategy", False)
+    if is_credit:
+        # ── Credit / income profile ──
+        # High win-rate + low payoff is *by design*.  The real quality metric
+        # is whether (win_rate × avg_win) > ((1-win_rate) × avg_loss).
+        structure = "credit_income"
+        edge = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss)
+        p.metrics["credit_edge_per_trade"] = round(edge, 2)
+        p.notes.append(f"Credit/income profile: {win_rate:.0f}% WR, edge ₹{edge:,.0f}/trade")
+
+        # Re-score payoff: for credit strategies payoff < 1.0 is expected
+        if edge > 0:
+            # Positive edge → payoff score floor based on win-rate strength
+            credit_pay_floor = min(80, 40 + (win_rate - 50) * 1.5) if win_rate > 50 else 30
+            pay_score = max(pay_score, credit_pay_floor)
+            wl_score = max(wl_score, credit_pay_floor)
+        elif payoff >= 0.3:
+            pay_score = max(pay_score, 40)
+            wl_score = max(wl_score, 40)
+    elif win_rate >= 60:
         structure = "mean_reversion"
         p.notes.append(f"Mean reversion profile: {win_rate:.0f}% win rate")
         # For mean reversion, smaller payoff is acceptable
@@ -352,22 +628,20 @@ def _compute_trade_quality(result: dict, th: dict) -> PillarResult:
         p.notes.append(f"Low win rate: {win_rate:.0f}% — needs high payoff ratio")
     p.metrics["structure_type"] = structure
 
-    # Danger zone: 50-55% win rate with bad RR
-    if 50 <= win_rate <= 55 and payoff < 1.0:
+    # Danger zone: 50-55% win rate with bad RR (skip for credit strategies)
+    if not is_credit and 50 <= win_rate <= 55 and payoff < 1.0:
         p.notes.append("Danger zone: 50-55% win rate with payoff <1 — edge is razor thin")
         pay_score = min(pay_score, 30)
 
-    # Streak analysis from trades
-    trades = result.get("trades", [])
+    # Streak analysis from trades (uses normalised exit PnLs)
     analytics = result.get("trade_analytics", {})
     max_win_streak = analytics.get("max_win_streak", 0)
     max_lose_streak = analytics.get("max_lose_streak", 0)
 
-    if max_win_streak == 0 and max_lose_streak == 0 and trades:
-        # Compute from trade list
-        pnls = [t.get("pnl", 0) for t in trades if "pnl" in t]
-        if pnls:
-            max_win_streak, max_lose_streak = _compute_streaks(pnls)
+    if max_win_streak == 0 and max_lose_streak == 0:
+        exit_pnls = _extract_exit_pnls(result)
+        if exit_pnls:
+            max_win_streak, max_lose_streak = _compute_streaks(exit_pnls)
 
     p.metrics["max_win_streak"] = max_win_streak
     p.metrics["max_lose_streak"] = max_lose_streak
@@ -391,21 +665,6 @@ def _compute_trade_quality(result: dict, th: dict) -> PillarResult:
         p.verdict = "WARN"
 
     return p
-
-
-def _compute_streaks(pnls: list[float]) -> tuple[int, int]:
-    """Compute max winning and losing streaks."""
-    max_win = max_lose = cur_win = cur_lose = 0
-    for pnl in pnls:
-        if pnl > 0:
-            cur_win += 1
-            cur_lose = 0
-            max_win = max(max_win, cur_win)
-        else:
-            cur_lose += 1
-            cur_win = 0
-            max_lose = max(max_lose, cur_lose)
-    return max_win, max_lose
 
 
 # ────────────────────────────────────────────────────────────
@@ -472,13 +731,11 @@ def _compute_robustness(result: dict, th: dict) -> PillarResult:
                 p.notes.append(f"Lost money in regimes: {', '.join(negative_regimes)}")
 
     # Trade distribution stability (are trades spread across the period?)
-    trades = result.get("trades", [])
-    if trades and len(trades) > 5:
-        # Check for clustering
-        dates = [t.get("date", t.get("entry_time", "")) for t in trades if "pnl" in t]
-        p.metrics["trade_count_for_robustness"] = len(dates)
+    exit_pnls = _extract_exit_pnls(result)
+    if exit_pnls and len(exit_pnls) > 5:
+        p.metrics["trade_count_for_robustness"] = len(exit_pnls)
         # Simple: enough trades = more robust
-        count_score = min(100, len(dates) * 2)
+        count_score = min(100, len(exit_pnls) * 2)
         monthly_scores.append(count_score)
 
     if monthly_scores:
@@ -524,6 +781,10 @@ def _compute_execution(result: dict, th: dict) -> PillarResult:
     slippage = 0
     if isinstance(total_costs, dict):
         slippage = total_costs.get("slippage", 0)
+    elif total_cost_val > 0:
+        # FnO engines return total_costs as a plain float without slippage breakdown.
+        # Estimate slippage as ~20% of total costs (industry convention for multi-leg fills).
+        slippage = total_cost_val * 0.20
     p.metrics["slippage_cost"] = round(slippage, 2)
     slippage_pct = (slippage / abs(total_pnl)) * 100 if total_pnl != 0 else 0
     p.metrics["slippage_pct"] = round(slippage_pct, 2)
@@ -532,9 +793,16 @@ def _compute_execution(result: dict, th: dict) -> PillarResult:
 
     # Fill quality (for options — orders may not fill at expected price)
     strategy_type = result.get("engine", "")
+    is_credit = result.get("_is_credit_strategy", False)
     if "fno" in strategy_type.lower():
-        p.notes.append("F&O strategies have significantly higher slippage in illiquid strikes")
-        slip_score = min(slip_score, 80)  # inherent penalty
+        if is_credit:
+            # Defined-risk credit structures trade near ATM strikes (more liquid)
+            # and have built-in max-loss.  Smaller penalty.
+            p.notes.append("Credit spread: trades near-ATM strikes with defined risk")
+            slip_score = min(slip_score, 90)
+        else:
+            p.notes.append("F&O strategies have significantly higher slippage in illiquid strikes")
+            slip_score = min(slip_score, 80)  # inherent penalty
 
     p.score = 0.50 * cost_score + 0.50 * slip_score
 
@@ -622,6 +890,8 @@ def _compute_risk_architecture(result: dict, th: dict) -> PillarResult:
     p = PillarResult(name="Risk Architecture")
 
     settings = result.get("settings", {})
+    engine = result.get("engine", "")
+    is_fno = "fno" in engine.lower()
 
     # Position sizing
     position_sizing = result.get("position_sizing", settings.get("position_sizing", "fixed"))
@@ -635,26 +905,47 @@ def _compute_risk_architecture(result: dict, th: dict) -> PillarResult:
 
     # Exposure control (max positions)
     max_positions = settings.get("max_positions", 0)
+    # FnO structures are inherently limited to 1 position at a time
+    if max_positions == 0 and is_fno:
+        max_positions = 1
     p.metrics["max_positions"] = max_positions
     if 1 <= max_positions <= 5:
         exposure_score = 85
     elif max_positions <= 10:
         exposure_score = 65
+    elif max_positions == 0:
+        # No max_positions specified — neutral rather than penalty
+        exposure_score = 55
     else:
         exposure_score = 40
         p.notes.append("High max positions — consider tightening")
 
     # Stop loss presence
     has_sl = settings.get("stop_loss_pct", 0) > 0 or result.get("stop_loss_stats", {}).get("sl_exits", 0) > 0
+    is_credit = result.get("_is_credit_strategy", False)
     p.metrics["has_stop_loss"] = has_sl
-    sl_score = 85 if has_sl else 30
-    if not has_sl:
+    if is_credit:
+        # Credit spreads have built-in defined max loss (spread width)
+        sl_score = 90
+        p.notes.append("Defined-risk structure — max loss capped by spread width")
+        p.metrics["defined_risk"] = True
+    elif has_sl:
+        sl_score = 85
+    else:
+        sl_score = 30
         p.notes.append("No stop loss detected — critical risk gap")
 
     # Profit target
     has_pt = settings.get("profit_target_pct", 0) > 0
     p.metrics["has_profit_target"] = has_pt
-    pt_score = 80 if has_pt else 45
+    if is_credit and has_pt:
+        # Credit strategies with profit target (e.g., 50% of max profit) show discipline
+        pt_score = 90
+        p.notes.append(f"Profit target at {settings.get('profit_target_pct', 0):.0f}% of max profit")
+    elif has_pt:
+        pt_score = 80
+    else:
+        pt_score = 45
 
     p.score = 0.30 * sizing_score + 0.25 * exposure_score + 0.25 * sl_score + 0.20 * pt_score
 
@@ -679,12 +970,11 @@ def _compute_psychological(result: dict, th: dict) -> PillarResult:
     # Longest losing streak
     analytics = result.get("trade_analytics", {})
     max_lose = analytics.get("max_lose_streak", 0)
-    trades = result.get("trades", [])
 
-    if max_lose == 0 and trades:
-        pnls = [t.get("pnl", 0) for t in trades if "pnl" in t]
-        if pnls:
-            _, max_lose = _compute_streaks(pnls)
+    if max_lose == 0:
+        exit_pnls = _extract_exit_pnls(result)
+        if exit_pnls:
+            _, max_lose = _compute_streaks(exit_pnls)
 
     p.metrics["max_losing_streak"] = max_lose
     streak_score = 100 if max_lose <= 3 else (80 if max_lose <= 5 else (50 if max_lose <= 8 else (20 if max_lose <= 12 else 5)))
@@ -719,11 +1009,11 @@ def _compute_psychological(result: dict, th: dict) -> PillarResult:
     # Worst single trade
     worst_trade = analytics.get("worst_trade", 0)
     best_trade = analytics.get("best_trade", 0)
-    if worst_trade == 0 and trades:
-        pnls = [t.get("pnl", 0) for t in trades if "pnl" in t]
-        if pnls:
-            worst_trade = min(pnls)
-            best_trade = max(pnls)
+    if worst_trade == 0:
+        exit_pnls = _extract_exit_pnls(result)
+        if exit_pnls:
+            worst_trade = min(exit_pnls)
+            best_trade = max(exit_pnls)
     p.metrics["worst_trade"] = round(worst_trade, 2)
     p.metrics["best_trade"] = round(best_trade, 2)
 
@@ -779,15 +1069,15 @@ def compute_health_report(
             blockers=["No valid backtest result to evaluate"],
         )
 
-    th = _get_thresholds(strategy_type)
+    th = _get_thresholds(strategy_type, result)
     name = strategy_name or result.get("strategy_name", "unknown")
 
-    # Compute total_pnl if missing
-    if "total_pnl" not in result:
-        ic = result.get("initial_capital", 0)
-        fc = result.get("final_capital", 0)
-        if ic > 0 and fc > 0:
-            result["total_pnl"] = fc - ic
+    # Tag credit strategy flag so pillar functions can use it
+    credit = _is_credit_strategy(result)
+    result["_is_credit_strategy"] = credit
+
+    # ── Normalise result dict (fill missing keys across all engine types) ──
+    _normalize_result(result)
 
     # Compute all 8 pillars
     pillars = {
@@ -801,10 +1091,26 @@ def compute_health_report(
         "psychological": _compute_psychological(result, th),
     }
 
+    # Pillar weights: credit strategies shift weight towards PF and risk arch,
+    # away from trade_quality payoff ratio which penalises them unfairly.
+    if credit:
+        weights = {
+            "profitability": 0.25,
+            "drawdown": 0.18,
+            "trade_quality": 0.10,      # reduced — payoff ratio is misleading
+            "robustness": 0.10,
+            "execution": 0.10,
+            "capital_efficiency": 0.10,  # margin efficiency matters more
+            "risk_architecture": 0.10,  # defined risk is a strength
+            "psychological": 0.07,
+        }
+    else:
+        weights = PILLAR_WEIGHTS
+
     # Overall score = weighted average
     overall = sum(
-        pillars[k].score * PILLAR_WEIGHTS[k]
-        for k in PILLAR_WEIGHTS
+        pillars[k].score * weights[k]
+        for k in weights
     )
 
     # Execution readiness
@@ -838,6 +1144,12 @@ def compute_health_report(
         if critical_fails:
             summary.append(f"Critical failures in: {', '.join(pillars[k].name for k in critical_fails)}")
         summary.append("Resolve blockers before deploying to live trading")
+
+    if credit:
+        summary.insert(0, f"Credit/income strategy detected — using structure-aware scoring")
+
+    # Clean up internal flag from result dict
+    result.pop("_is_credit_strategy", None)
 
     return HealthReport(
         strategy_name=name,

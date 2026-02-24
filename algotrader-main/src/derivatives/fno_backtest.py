@@ -136,15 +136,23 @@ class FnOBacktestEngine:
         if missing:
             return {"error": f"Missing columns: {missing}"}
 
-        df = data.copy().reset_index(drop=True)
+        df = data.copy()
+        # Preserve DatetimeIndex as 'timestamp' column if not already present
+        if "timestamp" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+            df["timestamp"] = df.index
+        df = df.reset_index(drop=True)
         closes = df["close"].values
+
+        _has_ts = "timestamp" in df.columns
+        def _bar_ts(idx: int) -> str:
+            return str(df["timestamp"].iloc[idx]) if _has_ts else str(idx)
 
         # State tracking
         capital = self.initial_capital
         positions: list[MultiLegPosition] = []
         closed_positions: list[MultiLegPosition] = []
         equity_curve: list[float] = [capital]
-        bar_dates: list[str] = [str(df.index[0])]
+        bar_dates: list[str] = [_bar_ts(0)]
         greeks_history: list[dict] = []
         margin_history: list[dict] = []
         regime_history: list[dict] = []
@@ -168,11 +176,11 @@ class FnOBacktestEngine:
             capital=capital,
         )
 
-        for i in range(max(21, 1), len(df)):
+        for i in range(max(5, min(21, len(df) // 10)), len(df)):
             bar = df.iloc[i]
             spot = float(bar["close"])
             bar_date = self._parse_bar_date(df, i)
-            bar_dates.append(str(df.index[i]) if not isinstance(df.index[i], int) else str(i))
+            bar_dates.append(_bar_ts(i))
 
             # ── 1. Regime classification ───
             price_history = closes[:i + 1]
@@ -241,8 +249,13 @@ class FnOBacktestEngine:
                     l.unrealised_pnl * l.contract.lot_size
                     for l in pos.legs if not l.is_closed
                 )
-                max_profit = pos.max_profit or abs(pos.net_premium) * pos.legs[0].contract.lot_size
-                max_loss = pos.max_loss or max_profit * 2
+                # Robust max_profit/max_loss computation (Issue #8)
+                # Use position's tracked values; fall back to net_premium × lot_size
+                # with a minimum floor to prevent erratic triggers.
+                _lot_size = pos.legs[0].contract.lot_size if pos.legs else 50
+                _premium_based = abs(pos.net_premium) * _lot_size
+                max_profit = pos.max_profit if (pos.max_profit and pos.max_profit > 0) else max(_premium_based, 500.0)
+                max_loss = pos.max_loss if (pos.max_loss and pos.max_loss > 0) else max(max_profit * 2, 1000.0)
 
                 # Profit target
                 if max_profit > 0 and current_pnl >= max_profit * (self.profit_target_pct / 100):
@@ -761,8 +774,12 @@ class FnOBacktestEngine:
         return struct_name in recommended or len(recommended) == 0
 
     def _parse_bar_date(self, df: pd.DataFrame, idx: int) -> date:
-        """Parse date from DataFrame index."""
-        val = df.index[idx]
+        """Parse date from DataFrame 'timestamp' column or index."""
+        # Prefer explicit 'timestamp' column (preserved from DatetimeIndex)
+        if "timestamp" in df.columns:
+            val = df["timestamp"].iloc[idx]
+        else:
+            val = df.index[idx]
         if isinstance(val, (datetime, pd.Timestamp)):
             return val.date()
         try:

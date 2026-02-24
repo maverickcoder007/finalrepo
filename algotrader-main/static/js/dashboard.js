@@ -345,8 +345,15 @@ function updateExecutionPanel(exec) {
     document.getElementById('exec-filled').textContent = exec.filled_orders || 0;
 }
 
-function getInstrumentName(token) {
-    return selectedInstruments.get(token) || token;
+function getInstrumentName(token, serverName) {
+    // 1. Try user-selected instruments map
+    if (selectedInstruments.has(token)) return selectedInstruments.get(token);
+    // 2. Try server-provided name
+    if (serverName) return serverName;
+    // 3. Try well-known presets from the HTML checkboxes
+    const el = document.querySelector(`#preset-instruments input[value="${token}"]`);
+    if (el) return el.getAttribute('data-name') || token;
+    return token;
 }
 
 function updateTicksTable(ticks) {
@@ -356,9 +363,15 @@ function updateTicksTable(ticks) {
         loadTicksFallback(el);
         return;
     }
+    // Auto-populate selectedInstruments from server-provided names
+    Object.values(ticks).forEach(t => {
+        if (t.name && !selectedInstruments.has(t.token)) {
+            selectedInstruments.set(t.token, t.name);
+        }
+    });
     el.innerHTML = Object.values(ticks).map(t => `
         <tr>
-            <td><span style="font-weight:600;color:#00d4aa">${getInstrumentName(t.token)}</span><br><span style="font-size:10px;color:#5c6e7e">${t.token}</span></td>
+            <td><span style="font-weight:600;color:#00d4aa">${getInstrumentName(t.token, t.name)}</span><br><span style="font-size:10px;color:#5c6e7e">${t.token}</span></td>
             <td style="font-weight:600">${formatNum(t.ltp)}</td>
             <td class="${pnlClass(t.change)}">${formatNum(t.change)}</td>
             <td>${formatNum(t.high)} / ${formatNum(t.low)}</td>
@@ -740,8 +753,11 @@ async function startLive() {
     const tokens = Array.from(selectedInstruments.keys());
     if (!tokens.length) { showToast('Select at least one instrument', 'error'); return; }
     const mode = document.getElementById('live-mode').value;
+    // Build token→name map for server-side name resolution
+    const names = {};
+    selectedInstruments.forEach((name, token) => { names[token] = name; });
     try {
-        const res = await API.post('/api/live/start', { tokens, mode });
+        const res = await API.post('/api/live/start', { tokens, mode, names });
         if (res.error) { showToast(res.error, 'error'); return; }
         showToast(`Live trading started with ${tokens.length} instruments`, 'success');
         hideModal('modal-start-live');
@@ -2573,6 +2589,7 @@ async function runPaperTradeSample() {
                 tradingsymbol: document.getElementById('paper-symbol')?.value?.trim()?.toUpperCase() || 'SAMPLE',
                 bars: 500,
                 capital: parseFloat(document.getElementById('paper-capital').value) || 100000,
+                interval: document.getElementById('paper-interval')?.value || '5minute',
             });
             if (result && result.error) {
                 loading.textContent = 'Error: ' + result.error;
@@ -2703,10 +2720,11 @@ function displayPaperResult(r) {
 
     // Summary
     const pnlClass = r.total_pnl >= 0 ? 'positive' : 'negative';
+    const paperSrcLabel = r.data_source ? (' <span style="color:#ffaa00">(' + r.data_source + ')</span>') : '';
     document.getElementById('paper-summary').innerHTML = `
         <div class="summary-grid">
             <div class="summary-item"><span class="summary-label">Strategy</span><span class="summary-value">${r.strategy_name}</span></div>
-            <div class="summary-item"><span class="summary-label">Symbol</span><span class="summary-value">${r.tradingsymbol}</span></div>
+            <div class="summary-item"><span class="summary-label">Symbol</span><span class="summary-value">${r.tradingsymbol}${paperSrcLabel}</span></div>
             <div class="summary-item"><span class="summary-label">Initial Capital</span><span class="summary-value">₹${fmtNum(r.initial_capital)}</span></div>
             <div class="summary-item"><span class="summary-label">Final Capital</span><span class="summary-value ${pnlClass}">₹${fmtNum(r.final_capital)}</span></div>
             <div class="summary-item"><span class="summary-label">Total P&L</span><span class="summary-value ${pnlClass}">₹${fmtNum(r.total_pnl)}</span></div>
@@ -3858,7 +3876,8 @@ async function runBacktestSampleInner() {
     return await API.post('/api/backtest/sample', {
         strategy: document.getElementById('bt-strategy').value,
         bars: parseInt(document.getElementById('bt-bars')?.value) || 500,
-        capital: parseFloat(document.getElementById('bt-capital').value) || 100000
+        capital: parseFloat(document.getElementById('bt-capital').value) || 100000,
+        interval: document.getElementById('bt-interval')?.value || 'day'
     });
 }
 
@@ -3874,7 +3893,11 @@ function displayBacktestResult(data) {
     const bench = data.benchmark || {};
 
     const profitColor = (m.total_return_pct || 0) >= 0 ? '#00d4aa' : '#ff5252';
+    const tfLabel = m.timeframe || 'day';
+    const srcLabel = m.data_source ? (' <span style="color:#ffaa00">(' + m.data_source + ')</span>') : '';
     document.getElementById('bt-summary').innerHTML =
+        '<div style="margin-bottom:8px;font-size:12px;color:#8899aa">' +
+        'Timeframe: <strong style="color:#e0e0e0">' + tfLabel + '</strong>' + srcLabel + '</div>' +
         '<div class="grid grid-3" style="margin-bottom:16px">' +
         metricCard('Total Return', (m.total_return_pct||0).toFixed(2) + '%', profitColor) +
         metricCard('Net P&L', '₹' + formatNum(m.total_pnl||0), profitColor) +
@@ -3927,6 +3950,7 @@ function displayBacktestResult(data) {
     }
     // Trade analytics
     const slStats = data.stop_loss_stats || {};
+    const tpStats = { tp_exits: slStats.tp_exits || 0, tp_total_pnl: slStats.tp_total_pnl || 0 };
     document.getElementById('bt-trade-analytics').innerHTML =
         '<div class="grid grid-2" style="margin-bottom:8px">' +
         metricCard('Avg Win', '₹' + (m.avg_win||0).toFixed(2)) +
@@ -3944,6 +3968,12 @@ function displayBacktestResult(data) {
             metricCard('Final Exits', slStats.final_exits || 0) +
             metricCard('SL P&L', '₹' + formatNum(slStats.sl_total_pnl||0), (slStats.sl_total_pnl||0) >= 0 ? '#00d4aa' : '#ff5252') +
             metricCard('Signal P&L', '₹' + formatNum(slStats.signal_total_pnl||0), (slStats.signal_total_pnl||0) >= 0 ? '#00d4aa' : '#ff5252') +
+            '</div></div>' : '') +
+        (tpStats && tpStats.tp_exits > 0 ? '<div style="margin-top:4px;padding:8px;background:#1a2e1a;border-radius:6px;border:1px solid #2a4a3a">' +
+            '<div style="color:#00d4aa;font-size:12px;margin-bottom:6px;font-weight:600">Profit Target Execution</div>' +
+            '<div class="grid grid-3" style="margin-bottom:0">' +
+            metricCard('TP Exits', tpStats.tp_exits) +
+            metricCard('TP P&L', '₹' + formatNum(tpStats.tp_total_pnl||0), '#00d4aa') +
             '</div></div>' : '');
     // Cost breakdown
     if (costs && costs.total !== undefined) {
@@ -4097,7 +4127,9 @@ function displayFnOBacktestResult(data) {
     document.getElementById('bt-fno-results').style.display = '';
 
     const profitColor = (m.total_return_pct || 0) >= 0 ? '#00d4aa' : '#ff5252';
+    const fnoSrcLabel = m.data_source ? (' <span style="color:#ffaa00">(' + m.data_source + ')</span>') : '';
     document.getElementById('bt-summary').innerHTML =
+        (fnoSrcLabel ? '<div style="margin-bottom:8px;font-size:12px;color:#8899aa">Data: ' + fnoSrcLabel + '</div>' : '') +
         '<div class="grid grid-3" style="margin-bottom:16px">' +
         metricCard('Total Return', (m.total_return_pct||0).toFixed(2) + '%', profitColor) +
         metricCard('Net P&L', '₹' + formatNum(m.total_pnl||0), profitColor) +

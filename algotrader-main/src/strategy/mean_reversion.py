@@ -56,7 +56,7 @@ class MeanReversionStrategy(BaseStrategy):
         return [signal] if signal else []
 
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
-        lookback = self.params["lookback_period"]
+        lookback = self._scale_period(self.params["lookback_period"])
         if len(data) < lookback:
             return None
 

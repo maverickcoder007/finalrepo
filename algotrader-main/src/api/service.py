@@ -18,6 +18,7 @@ from src.data.models import (
     TickMode,
 )
 from src.data.paper_trader import PaperTradingEngine
+from src.data.synthetic import generate_synthetic_ohlcv
 from src.derivatives.fno_backtest import FnOBacktestEngine
 from src.derivatives.fno_paper_trader import FnOPaperTradingEngine
 from src.execution.engine import ExecutionEngine
@@ -116,6 +117,18 @@ class TradingService:
         self._running = False
         self._subscribed_tokens: list[int] = []
         self._live_ticks: dict[int, dict[str, Any]] = {}
+        # Token → display name map (pre-seeded with common instruments)
+        self._token_name_map: dict[int, str] = {
+            256265: "NIFTY 50", 260105: "NIFTY BANK", 257801: "NIFTY FIN SERVICE",
+            265: "SENSEX", 738561: "RELIANCE", 341249: "HDFCBANK",
+            2953217: "TCS", 408065: "INFY", 2885377: "SBIN",
+            424961: "ICICIBANK", 1270529: "KOTAKBANK", 3861249: "AXISBANK",
+            2714625: "LT", 3465729: "TATAMOTORS", 3456769: "TATASTEEL",
+            969473: "MARUTI", 2760193: "BAJFINANCE", 895745: "HINDUNILVR",
+            81153: "ADANIENT", 3001089: "SUNPHARMA", 2815745: "WIPRO",
+            779521: "POWERGRID", 2929921: "TECHM", 5215745: "ASIANPAINT",
+            54273: "BHARTIARTL", 315393: "ITC", 261889: "NIFTY FIN SERVICE",
+        }
         self._signal_log: list[dict[str, Any]] = []
         self._ws_clients: list[Any] = []
         self._lock = asyncio.Lock()
@@ -844,6 +857,7 @@ class TradingService:
                 token = await self._market_data.resolve_token(symbol, "NSE")
                 if token:
                     tokens.append(token)
+                    self._token_name_map[token] = symbol
             except Exception as e:
                 logger.warning(f"Failed to resolve token for {symbol}: {e}")
         
@@ -872,6 +886,7 @@ class TradingService:
             self._ticker.connect(),
             self._execution.start_reconciliation_loop(),
             self._position_update_loop(),
+            self._index_quote_enrichment_loop(),
         ]:
             task = asyncio.create_task(coro)
             task.add_done_callback(self._task_exception_handler)
@@ -929,17 +944,21 @@ class TradingService:
 
     async def _on_ticks(self, ticks: list[Tick]) -> None:
         for tick in ticks:
+            is_index = (tick.instrument_token & 0xFF) == 9
+            # For index tokens, WS doesn't send volume/buy/sell — preserve cached values
+            prev = self._live_ticks.get(tick.instrument_token, {})
             tick_data = {
                 "token": tick.instrument_token,
+                "name": self._token_name_map.get(tick.instrument_token, ""),
                 "ltp": tick.last_price,
-                "volume": tick.volume_traded,
+                "volume": tick.volume_traded if (tick.volume_traded or not is_index) else prev.get("volume", 0),
                 "high": tick.ohlc.high,
                 "low": tick.ohlc.low,
                 "open": tick.ohlc.open,
                 "close": tick.ohlc.close,
                 "change": tick.change,
-                "buy_qty": tick.total_buy_quantity,
-                "sell_qty": tick.total_sell_quantity,
+                "buy_qty": tick.total_buy_quantity if (tick.total_buy_quantity or not is_index) else prev.get("buy_qty", 0),
+                "sell_qty": tick.total_sell_quantity if (tick.total_sell_quantity or not is_index) else prev.get("sell_qty", 0),
             }
             self._live_ticks[tick.instrument_token] = tick_data
 
@@ -1411,12 +1430,14 @@ class TradingService:
             result_dict["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record paper trades to journal for analytics
         try:
             self._journal_record_paper_trades(result_dict, strategy_name, tradingsymbol)
         except Exception as e:
             logger.error("paper_trade_journal_record_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         logger.info("paper_trade_complete", strategy=strategy_name, trades=result_dict.get("total_trades", len(result_dict.get("trades", []))))
         return result_dict
@@ -1427,53 +1448,54 @@ class TradingService:
         tradingsymbol: str = "SAMPLE",
         bars: int = 500,
         capital: float = 100000.0,
+        interval: str = "5minute",
         strategy_params: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Run paper trade with synthetic data (no auth required)."""
-        import numpy as np
-
+        """Run paper trade with sample data — prefers Zerodha historical, falls back to synthetic."""
         strategy = self._resolve_strategy(strategy_name, strategy_params)
         if isinstance(strategy, dict):
             return strategy
 
-        # Generate realistic synthetic OHLCV data with trending regimes
-        np.random.seed(42)
-        dates = pd.date_range("2024-01-01", periods=bars, freq="5min")
-        price = 100.0
-        opens, highs, lows, closes, volumes = [], [], [], [], []
-        regime_length = max(20, bars // 10)
-        trend = 0.0
-        vol_scale = 0.5
-        for i in range(bars):
-            # Switch regime periodically for trending & ranging moves
-            if i % regime_length == 0:
-                trend = np.random.choice([-0.15, -0.05, 0.0, 0.05, 0.15])
-                vol_scale = np.random.choice([0.3, 0.5, 0.8])
-            change = np.random.normal(trend, vol_scale)
-            o = price
-            c = price + change
-            h = max(o, c) + abs(np.random.normal(0, vol_scale * 0.4))
-            l = min(o, c) - abs(np.random.normal(0, vol_scale * 0.4))
-            # Volume with occasional spikes
-            v = int(np.random.uniform(20000, 80000))
-            if np.random.random() < 0.15:
-                v = int(v * np.random.uniform(2.0, 4.0))
-            opens.append(o)
-            highs.append(h)
-            lows.append(l)
-            closes.append(c)
-            volumes.append(v)
-            price = c
+        # ── Prefer Zerodha historical data; fall back to synthetic ──
+        df = pd.DataFrame()
+        data_source = "synthetic"
+        symbol = tradingsymbol
 
-        df = pd.DataFrame({
-            "timestamp": dates, "open": opens, "high": highs,
-            "low": lows, "close": closes, "volume": volumes,
-        })
+        if self._auth.is_authenticated:
+            try:
+                _token = 256265  # NIFTY 50
+                # Estimate days needed: ~75 intraday bars per day for 5min
+                _bars_per_day = {"day": 1, "60minute": 6, "30minute": 13,
+                                 "15minute": 25, "10minute": 38, "5minute": 75,
+                                 "3minute": 125, "minute": 375}
+                _bpd = _bars_per_day.get(interval, 75)
+                _days = max(int(bars / max(_bpd, 1)) + 10, 30)
+                df = await self._market_data.get_historical_df(
+                    _token, interval, days=_days,
+                )
+                if not df.empty and len(df) >= bars:
+                    df = df.tail(bars)
+                    data_source = "zerodha"
+                    symbol = "NIFTY 50"
+                else:
+                    df = pd.DataFrame()
+            except Exception as exc:
+                logger.warning("zerodha_paper_sample_fallback", error=str(exc))
+                df = pd.DataFrame()
+
+        if df.empty:
+            freq = self._INTERVAL_FREQ.get(interval, "5min")
+            df = generate_synthetic_ohlcv(
+                bars=bars, base_price=100.0, freq=freq, style="equity",
+            )
+            data_source = "synthetic"
+            symbol = tradingsymbol
 
         engine = PaperTradingEngine(strategy=strategy, initial_capital=capital)
-        result = engine.run(df, instrument_token=0, tradingsymbol=tradingsymbol, timeframe="5min")
+        result = engine.run(df, instrument_token=0, tradingsymbol=symbol, timeframe=interval)
         # BacktestEngine.run() returns a plain dict (not an object with to_dict_safe)
         result_dict = result if isinstance(result, dict) else result.to_dict_safe()
+        result_dict["data_source"] = data_source
         self._paper_results[strategy_name] = result_dict
 
         # Compute strategy health report and embed in result
@@ -1482,12 +1504,14 @@ class TradingService:
             result_dict["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record paper trades to journal
         try:
-            self._journal_record_paper_trades(result_dict, strategy_name, tradingsymbol)
+            self._journal_record_paper_trades(result_dict, strategy_name, symbol)
         except Exception as e:
             logger.error("paper_trade_sample_journal_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result_dict
 
@@ -2061,7 +2085,7 @@ class TradingService:
             is_intraday=is_intraday,
         )
 
-        result = engine.run(df, instrument_token, tradingsymbol)
+        result = engine.run(df, instrument_token, tradingsymbol, timeframe=interval)
         self._backtest_results = result
 
         # Compute strategy health report and embed in result
@@ -2071,14 +2095,23 @@ class TradingService:
             result["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record backtest trades to journal for analysis
         try:
             self._journal_record_backtest_trades(result, strategy_name, tradingsymbol)
         except Exception as e:
             logger.error("backtest_journal_record_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result
+
+    # Interval → pandas freq mapping for synthetic data generation
+    _INTERVAL_FREQ: dict[str, str] = {
+        "day": "D", "60minute": "60min", "30minute": "30min",
+        "15minute": "15min", "10minute": "10min", "5minute": "5min",
+        "3minute": "3min", "minute": "1min",
+    }
 
     async def run_backtest_sample(
         self,
@@ -2091,48 +2124,42 @@ class TradingService:
         is_intraday: bool = False,
         risk_per_trade: float = 0.02,
         capital_fraction: float = 0.10,
+        interval: str = "day",
         strategy_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run backtest on synthetic sample data."""
+        """Run backtest on sample data — prefers Zerodha historical, falls back to state-of-art synthetic."""
         strategy = self._resolve_strategy(strategy_name, strategy_params)
         if isinstance(strategy, dict):
             return strategy
 
-        import numpy as np
-        np.random.seed(42)
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=bars, freq="D")
-        base = 100.0
+        # ── Prefer Zerodha historical data; fall back to synthetic ──
+        df = pd.DataFrame()
+        data_source = "synthetic"
+        tradingsymbol = "SAMPLE"
 
-        # Generate realistic price data with trend regimes and mean-reversion
-        # Instead of pure random walk, create alternating trending/ranging periods
-        prices = np.zeros(bars)
-        prices[0] = base
-        regime_length = max(20, bars // 10)  # ~10 regime changes
-        trend = 0.0
-        volatility = 0.02
-        for i in range(1, bars):
-            # Switch regime every regime_length bars
-            if i % regime_length == 0:
-                trend = np.random.choice([-0.003, -0.001, 0.0, 0.001, 0.003])
-                volatility = np.random.choice([0.015, 0.02, 0.03])
-            noise = np.random.normal(trend, volatility)
-            prices[i] = prices[i - 1] * (1 + noise)
+        if self._auth.is_authenticated:
+            try:
+                _token = 256265  # NIFTY 50
+                df = await self._market_data.get_historical_df(
+                    _token, interval, days=max(bars * 2, 365),
+                )
+                if not df.empty and len(df) >= bars:
+                    df = df.tail(bars)
+                    data_source = "zerodha"
+                    tradingsymbol = "NIFTY 50"
+                else:
+                    df = pd.DataFrame()
+            except Exception as exc:
+                logger.warning("zerodha_sample_fallback", error=str(exc))
+                df = pd.DataFrame()
 
-        # Volume with spikes: base volume + occasional spikes for breakout signals
-        base_vol = np.random.randint(500_000, 2_000_000, bars).astype(float)
-        # Add volume spikes (~20% of bars get 1.5-3x volume)
-        spike_mask = np.random.random(bars) < 0.20
-        base_vol[spike_mask] *= np.random.uniform(1.5, 3.0, spike_mask.sum())
-        volumes = base_vol.astype(int)
-
-        df = pd.DataFrame({
-            "timestamp": dates,
-            "open": prices * (1 + np.random.uniform(-0.008, 0.008, bars)),
-            "high": prices * (1 + np.abs(np.random.normal(0, 0.012, bars))),
-            "low": prices * (1 - np.abs(np.random.normal(0, 0.012, bars))),
-            "close": prices,
-            "volume": volumes,
-        }, index=dates)
+        if df.empty:
+            freq = self._INTERVAL_FREQ.get(interval, "D")
+            df = generate_synthetic_ohlcv(
+                bars=bars, base_price=100.0, freq=freq, style="equity",
+            )
+            data_source = "synthetic"
+            tradingsymbol = "SAMPLE"
 
         engine = BacktestEngine(
             strategy=strategy, initial_capital=initial_capital,
@@ -2140,7 +2167,8 @@ class TradingService:
             risk_per_trade=risk_per_trade, capital_fraction=capital_fraction,
             use_indian_costs=use_indian_costs, is_intraday=is_intraday,
         )
-        result = engine.run(df, tradingsymbol="SAMPLE")
+        result = engine.run(df, tradingsymbol=tradingsymbol, timeframe=interval)
+        result["data_source"] = data_source
         self._backtest_results = result
 
         # Compute strategy health report and embed in result
@@ -2150,12 +2178,14 @@ class TradingService:
             result["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record backtest trades to journal for analysis
         try:
-            self._journal_record_backtest_trades(result, strategy_name, "SAMPLE")
+            self._journal_record_backtest_trades(result, strategy_name, tradingsymbol)
         except Exception as e:
             logger.error("backtest_sample_journal_record_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result
 
@@ -2350,12 +2380,14 @@ class TradingService:
             result["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record F&O backtest trades to journal
         try:
             self._journal_record_fno_backtest_trades(result, strategy_name, underlying)
         except Exception as e:
             logger.error("fno_backtest_journal_record_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result
 
@@ -2370,27 +2402,37 @@ class TradingService:
         stop_loss_pct: float = 100.0,
         delta_target: float = 0.16,
     ) -> dict[str, Any]:
-        """Run F&O backtest on synthetic data (no auth required)."""
+        """Run F&O backtest — prefers Zerodha underlying data, falls back to synthetic."""
         if not self._is_valid_fno_strategy(strategy_name):
             return {
                 "error": f"Unknown F&O strategy: {strategy_name}",
                 "available": self.FNO_STRATEGIES,
             }
 
-        import numpy as np
-        np.random.seed(42)
-        # Simulate index-like data (NIFTY ~20000)
-        base = 20000.0
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=bars, freq="D")
-        returns = np.random.normal(0.0003, 0.012, bars)
-        prices = base * np.cumprod(1 + returns)
-        df = pd.DataFrame({
-            "open": prices * (1 + np.random.uniform(-0.003, 0.003, bars)),
-            "high": prices * (1 + np.abs(np.random.normal(0, 0.008, bars))),
-            "low": prices * (1 - np.abs(np.random.normal(0, 0.008, bars))),
-            "close": prices,
-            "volume": np.random.randint(100000, 5000000, bars),
-        }, index=dates)
+        # ── Prefer Zerodha historical data; fall back to synthetic ──
+        df = pd.DataFrame()
+        data_source = "synthetic"
+
+        if self._auth.is_authenticated:
+            try:
+                _token = 256265  # NIFTY 50
+                df = await self._market_data.get_historical_df(
+                    _token, "day", days=max(bars * 2, 730),
+                )
+                if not df.empty and len(df) >= bars:
+                    df = df.tail(bars)
+                    data_source = "zerodha"
+                else:
+                    df = pd.DataFrame()
+            except Exception as exc:
+                logger.warning("zerodha_fno_sample_fallback", error=str(exc))
+                df = pd.DataFrame()
+
+        if df.empty:
+            df = generate_synthetic_ohlcv(
+                bars=bars, base_price=20000.0, freq="D", style="index",
+            )
+            data_source = "synthetic"
 
         engine = FnOBacktestEngine(
             strategy_name=strategy_name,
@@ -2402,6 +2444,7 @@ class TradingService:
             delta_target=delta_target,
         )
         result = engine.run(df, tradingsymbol=underlying)
+        result["data_source"] = data_source
         self._backtest_results = result
 
         # Compute strategy health report and embed in result
@@ -2410,12 +2453,14 @@ class TradingService:
             result["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record F&O backtest sample trades to journal
         try:
             self._journal_record_fno_backtest_trades(result, strategy_name, underlying)
         except Exception as e:
             logger.error("fno_backtest_sample_journal_record_error", error=str(e))
+            result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result
 
@@ -2475,12 +2520,14 @@ class TradingService:
             result_dict["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record F&O paper trades to journal
         try:
             self._journal_record_fno_paper_trades(result_dict, strategy_name, underlying)
         except Exception as e:
             logger.error("fno_paper_trade_journal_record_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result_dict
 
@@ -2495,26 +2542,37 @@ class TradingService:
         stop_loss_pct: float = 100.0,
         delta_target: float = 0.16,
     ) -> dict[str, Any]:
-        """Run F&O paper trade on synthetic data (no auth required)."""
+        """Run F&O paper trade — prefers Zerodha underlying data, falls back to synthetic."""
         if not self._is_valid_fno_strategy(strategy_name):
             return {
                 "error": f"Unknown F&O strategy: {strategy_name}",
                 "available": self.FNO_STRATEGIES,
             }
 
-        import numpy as np
-        np.random.seed(42)
-        base = 20000.0
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=bars, freq="D")
-        returns = np.random.normal(0.0003, 0.012, bars)
-        prices = base * np.cumprod(1 + returns)
-        df = pd.DataFrame({
-            "open": prices * (1 + np.random.uniform(-0.003, 0.003, bars)),
-            "high": prices * (1 + np.abs(np.random.normal(0, 0.008, bars))),
-            "low": prices * (1 - np.abs(np.random.normal(0, 0.008, bars))),
-            "close": prices,
-            "volume": np.random.randint(100000, 5000000, bars),
-        }, index=dates)
+        # ── Prefer Zerodha historical data; fall back to synthetic ──
+        df = pd.DataFrame()
+        data_source = "synthetic"
+
+        if self._auth.is_authenticated:
+            try:
+                _token = 256265  # NIFTY 50
+                df = await self._market_data.get_historical_df(
+                    _token, "day", days=max(bars * 2, 730),
+                )
+                if not df.empty and len(df) >= bars:
+                    df = df.tail(bars)
+                    data_source = "zerodha"
+                else:
+                    df = pd.DataFrame()
+            except Exception as exc:
+                logger.warning("zerodha_fno_paper_sample_fallback", error=str(exc))
+                df = pd.DataFrame()
+
+        if df.empty:
+            df = generate_synthetic_ohlcv(
+                bars=bars, base_price=20000.0, freq="D", style="index",
+            )
+            data_source = "synthetic"
 
         engine = FnOPaperTradingEngine(
             strategy_name=strategy_name,
@@ -2527,6 +2585,7 @@ class TradingService:
         )
         result = engine.run(df, tradingsymbol=underlying, timeframe="day")
         result_dict = result.to_dict_safe()
+        result_dict["data_source"] = data_source
         self._paper_results[f"fno_{strategy_name}"] = result_dict
 
         # Compute strategy health report and embed in result
@@ -2535,18 +2594,85 @@ class TradingService:
             result_dict["health_report"] = health
         except Exception as e:
             logger.error("health_compute_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Health computation failed: {e}")
 
         # Record F&O paper trade sample to journal
         try:
             self._journal_record_fno_paper_trades(result_dict, strategy_name, underlying)
         except Exception as e:
             logger.error("fno_paper_sample_journal_record_error", error=str(e))
+            result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
         return result_dict
 
     def get_fno_strategies(self) -> list[str]:
         """Get available F&O strategy names."""
         return self.FNO_STRATEGIES
+
+    # Well-known index instrument_token → NSE quote key mapping
+    _INDEX_QUOTE_MAP: dict[int, str] = {
+        256265: "NSE:NIFTY 50",       # NIFTY 50
+        260105: "NSE:NIFTY BANK",     # NIFTY BANK
+        257801: "NSE:NIFTY FIN SERVICE",  # FINNIFTY
+        265:    "BSE:SENSEX",         # SENSEX
+    }
+
+    async def _index_quote_enrichment_loop(self) -> None:
+        """Periodically fetch REST quotes for index tokens to enrich volume/buy/sell data.
+
+        The Kite WebSocket binary protocol doesn't include volume, buy_quantity,
+        or sell_quantity for index instruments (segment 9). This loop supplements
+        that data via the REST quote API every 15 seconds.
+        """
+        # Initial delay to let ticks start flowing
+        await asyncio.sleep(3)
+        while self._running:
+            try:
+                # Collect index tokens from subscribed tokens + any in live ticks
+                index_keys: list[str] = []
+                token_for_key: dict[str, int] = {}
+                all_tokens = set(self._subscribed_tokens) | set(self._live_ticks.keys())
+                for token in all_tokens:
+                    if (token & 0xFF) == 9:  # index segment
+                        key = self._INDEX_QUOTE_MAP.get(token)
+                        if key:
+                            index_keys.append(key)
+                            token_for_key[key] = token
+
+                if index_keys:
+                    try:
+                        quotes = await self._client.get_quote(index_keys)
+                        for key, q in quotes.items():
+                            token = token_for_key.get(key, q.instrument_token)
+                            if token in self._live_ticks:
+                                # Enrich existing tick data with REST-sourced volume/buy/sell
+                                self._live_ticks[token]["volume"] = q.volume or 0
+                                self._live_ticks[token]["buy_qty"] = q.buy_quantity or 0
+                                self._live_ticks[token]["sell_qty"] = q.sell_quantity or 0
+                            else:
+                                # Seed tick data from REST if not yet in cache
+                                change = 0.0
+                                if q.ohlc and q.ohlc.close and q.ohlc.close > 0:
+                                    change = q.last_price - q.ohlc.close
+                                self._live_ticks[token] = {
+                                    "token": token,
+                                    "name": self._token_name_map.get(token, ""),
+                                    "ltp": q.last_price,
+                                    "volume": q.volume or 0,
+                                    "high": q.ohlc.high if q.ohlc else 0,
+                                    "low": q.ohlc.low if q.ohlc else 0,
+                                    "open": q.ohlc.open if q.ohlc else 0,
+                                    "close": q.ohlc.close if q.ohlc else 0,
+                                    "change": change,
+                                    "buy_qty": q.buy_quantity or 0,
+                                    "sell_qty": q.sell_quantity or 0,
+                                }
+                        logger.debug("index_quote_enrichment_done", count=len(quotes))
+                    except Exception as e:
+                        logger.warning("index_quote_enrichment_error", error=str(e))
+            except Exception as e:
+                logger.error("index_enrichment_loop_error", error=str(e))
+            await asyncio.sleep(15)
 
     async def _position_update_loop(self) -> None:
         while self._running:

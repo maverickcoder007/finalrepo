@@ -56,7 +56,7 @@ class VWAPBreakoutStrategy(BaseStrategy):
         return [signal] if signal else []
 
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
-        vwap_period = self.params.get("vwap_period", 20)
+        vwap_period = self._scale_period(self.params.get("vwap_period", 20))
         min_bars = max(5, vwap_period)
         if len(data) < min_bars:
             return None

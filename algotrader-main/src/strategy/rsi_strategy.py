@@ -67,7 +67,7 @@ class RSIStrategy(BaseStrategy):
         return [signal] if signal else []
 
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
-        period = self.params["rsi_period"]
+        period = self._scale_period(self.params["rsi_period"])
         if len(data) < period + 1:
             return None
 

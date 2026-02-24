@@ -256,7 +256,11 @@ class FnOPaperTradingEngine:
         if missing:
             raise ValueError(f"Missing columns: {missing}")
 
-        df = data.copy().reset_index(drop=True)
+        df = data.copy()
+        # Preserve DatetimeIndex as 'timestamp' column if not already present
+        if "timestamp" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+            df["timestamp"] = df.index
+        df = df.reset_index(drop=True)
         closes = df["close"].values
         self._equity_curve.append(self.initial_capital)
 
@@ -270,11 +274,15 @@ class FnOPaperTradingEngine:
 
         total_costs = 0.0
 
-        for i in range(max(21, 1), len(df)):
+        _has_ts = "timestamp" in df.columns
+        def _bar_ts(idx: int) -> str:
+            return str(df["timestamp"].iloc[idx]) if _has_ts else str(idx)
+
+        for i in range(max(5, min(21, len(df) // 10)), len(df)):
             bar = df.iloc[i]
             spot = float(bar["close"])
             bar_date = self._parse_date(df, i)
-            bar_time = str(df.index[i]) if not isinstance(df.index[i], int) else str(i)
+            bar_time = _bar_ts(i)
 
             # 1. Classify regime
             regime = self._regime_engine.classify(closes[:i + 1])
@@ -346,8 +354,11 @@ class FnOPaperTradingEngine:
                     l.unrealised_pnl * l.contract.lot_size
                     for l in pos.legs if not l.is_closed
                 )
-                max_profit = pos.max_profit or abs(pos.net_premium) * pos.legs[0].contract.lot_size
-                max_loss = pos.max_loss or max_profit * 2
+                # Robust max_profit/max_loss computation (Issue #8)
+                _lot_size = pos.legs[0].contract.lot_size if pos.legs else 50
+                _premium_based = abs(pos.net_premium) * _lot_size
+                max_profit = pos.max_profit if (pos.max_profit and pos.max_profit > 0) else max(_premium_based, 500.0)
+                max_loss = pos.max_loss if (pos.max_loss and pos.max_loss > 0) else max(max_profit * 2, 1000.0)
 
                 should_close = False
                 reason = ""
@@ -390,7 +401,7 @@ class FnOPaperTradingEngine:
 
         # Force close remaining
         final_spot = float(df.iloc[-1]["close"])
-        final_time = str(df.index[-1]) if not isinstance(df.index[-1], int) else str(len(df) - 1)
+        final_time = _bar_ts(len(df) - 1)
         for pos in self.open_positions:
             pnl, costs = self._close_position(pos, final_time, "session_end")
             self._capital += pnl - costs
@@ -539,7 +550,11 @@ class FnOPaperTradingEngine:
                 leg.current_price = max(0.05, BlackScholes.put_price(spot, contract.strike, 0.065, tte, iv))
 
     def _parse_date(self, df: pd.DataFrame, idx: int) -> date:
-        val = df.index[idx]
+        # Prefer explicit 'timestamp' column (preserved from DatetimeIndex)
+        if "timestamp" in df.columns:
+            val = df["timestamp"].iloc[idx]
+        else:
+            val = df.index[idx]
         if isinstance(val, (datetime, pd.Timestamp)):
             return val.date()
         try:
@@ -597,8 +612,9 @@ class FnOPaperTradingEngine:
         total_pnl = self._capital - self.initial_capital
         total_return = (total_pnl / self.initial_capital * 100) if self.initial_capital > 0 else 0
 
-        start_date = str(df.index[0]) if not isinstance(df.index[0], int) else ""
-        end_date = str(df.index[-1]) if not isinstance(df.index[-1], int) else ""
+        _has_ts = "timestamp" in df.columns
+        start_date = str(df["timestamp"].iloc[0]) if _has_ts else ""
+        end_date = str(df["timestamp"].iloc[-1]) if _has_ts else ""
 
         return FnOPaperTradeResult(
             strategy_name=self.strategy_name,
