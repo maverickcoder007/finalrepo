@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from src.api.client import KiteClient
+from src.data.market_data_store import MarketDataStore
 from src.data.models import Interval
 from src.utils.logger import get_logger
 
@@ -60,8 +61,9 @@ KITE_MAX_DAYS: dict[str, int] = {
 class MarketDataProvider:
     """Unified market data provider for historical and live data."""
 
-    def __init__(self, client: KiteClient) -> None:
+    def __init__(self, client: KiteClient, store: MarketDataStore | None = None) -> None:
         self._client = client
+        self._store = store
         self._instrument_cache: dict[str, list[dict]] = {}
         self._token_map: dict[str, int] = {}  # symbol -> instrument_token
         self._chart_cache: dict[str, dict] = {}  # cache key -> OHLCV data
@@ -76,11 +78,32 @@ class MarketDataProvider:
         if key in self._token_map:
             return self._token_map[key]
 
+        # Try DB cache first
+        if self._store:
+            cached = self._store.get_instruments(exchange)
+            if cached:
+                for inst in cached:
+                    ck = f"{inst['exchange']}:{inst['tradingsymbol']}"
+                    self._token_map[ck] = inst["instrument_token"]
+                if key in self._token_map:
+                    return self._token_map[key]
+
         try:
             instruments = await self._client.get_instruments(exchange)
             for inst in instruments:
                 cache_key = f"{inst.exchange}:{inst.tradingsymbol}"
                 self._token_map[cache_key] = inst.instrument_token
+            # Store to DB
+            if self._store:
+                self._store.store_instruments(exchange, [
+                    {"instrument_token": i.instrument_token, "exchange_token": i.exchange_token,
+                     "tradingsymbol": i.tradingsymbol, "name": i.name,
+                     "last_price": i.last_price, "expiry": i.expiry,
+                     "strike": i.strike, "tick_size": i.tick_size,
+                     "lot_size": i.lot_size, "instrument_type": i.instrument_type,
+                     "segment": i.segment}
+                    for i in instruments
+                ])
             return self._token_map.get(key)
         except Exception as e:
             logger.error("token_resolve_failed", symbol=symbol, error=str(e))
@@ -89,7 +112,13 @@ class MarketDataProvider:
     async def search_instruments(
         self, query: str, exchange: str = "NSE", limit: int = 20
     ) -> list[dict[str, Any]]:
-        """Search instruments by name/symbol."""
+        """Search instruments by name/symbol.  Checks DB cache first."""
+        # Try DB cache first
+        if self._store:
+            cached = self._store.search_instruments(query, exchange=exchange, limit=limit)
+            if cached:
+                return cached
+
         try:
             instruments = await self._client.get_instruments(exchange)
             q = query.upper()
@@ -110,10 +139,89 @@ class MarketDataProvider:
                     })
                     if len(matches) >= limit:
                         break
+            # Cache full instrument set to DB while we have it
+            if self._store:
+                self._store.store_instruments(exchange, [
+                    {"instrument_token": i.instrument_token, "exchange_token": i.exchange_token,
+                     "tradingsymbol": i.tradingsymbol, "name": i.name,
+                     "last_price": i.last_price, "expiry": i.expiry,
+                     "strike": i.strike, "tick_size": i.tick_size,
+                     "lot_size": i.lot_size, "instrument_type": i.instrument_type,
+                     "segment": i.segment}
+                    for i in instruments
+                ])
             return matches
         except Exception as e:
             logger.error("instrument_search_failed", error=str(e))
             return []
+
+    async def get_instruments(self, exchange: str = "NSE") -> list[dict[str, Any]]:
+        """Get all instruments for an exchange.  DB-cached (refreshed daily).
+
+        Always returns a list of *dicts* (not Pydantic models) so callers
+        get a uniform interface whether data came from the cache or API.
+        """
+        # 1. Try DB cache (max 1 day old)
+        if self._store:
+            cached = self._store.get_instruments(exchange)
+            if cached:
+                logger.info("instruments_cache_hit", exchange=exchange, count=len(cached))
+                return cached
+
+        # 2. Fetch from Kite API
+        try:
+            raw = await self._client.get_instruments(exchange)
+            dicts = [
+                {
+                    "instrument_token": i.instrument_token,
+                    "exchange_token": getattr(i, "exchange_token", 0),
+                    "tradingsymbol": i.tradingsymbol,
+                    "name": i.name,
+                    "last_price": i.last_price,
+                    "expiry": i.expiry,
+                    "strike": i.strike,
+                    "tick_size": i.tick_size,
+                    "lot_size": i.lot_size,
+                    "instrument_type": i.instrument_type,
+                    "segment": i.segment,
+                    "exchange": exchange,
+                }
+                for i in raw
+            ]
+            # 3. Persist to DB
+            if self._store:
+                self._store.store_instruments(exchange, dicts)
+                logger.info("instruments_stored", exchange=exchange, count=len(dicts))
+            # Also populate in-memory token map
+            for d in dicts:
+                key = f"{d['exchange']}:{d['tradingsymbol']}"
+                self._token_map[key] = d["instrument_token"]
+            return dicts
+        except Exception as e:
+            logger.error("instruments_fetch_failed", exchange=exchange, error=str(e))
+            return []
+
+    async def fetch_historical_candles(
+        self,
+        instrument_token: int,
+        interval: str = "5minute",
+        from_date: str | None = None,
+        to_date: str | None = None,
+        days: int = 5,
+    ) -> list:
+        """Public wrapper around _fetch_historical_chunked returning raw HistoricalCandle objects.
+
+        This is the preferred entry point for code that needs candle
+        objects rather than a DataFrame.  It goes through the DB cache.
+        """
+        kite_interval = INTERVAL_MAP.get(interval, Interval("5minute"))
+        if to_date is None:
+            to_date = datetime.now().strftime("%Y-%m-%d")
+        if from_date is None:
+            from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        return await self._fetch_historical_chunked(
+            instrument_token, kite_interval, interval, from_date, to_date
+        )
 
     # ────────────────────────────────────────────────────────
     # Historical Chart Data
@@ -208,57 +316,108 @@ class MarketDataProvider:
         """
         Fetch historical candles in Kite-compliant date-range chunks.
 
+        Checks the SQLite cache first.  Any candles fetched from the API
+        are written to the cache for future use.
+
         Kite Connect enforces per-interval day limits.  When the requested
         range exceeds that limit we split into successive sub-ranges,
         fetch each one, and concatenate the results.
         """
+        # ── 1. Try DB cache first ────────────────────────────────
+        if self._store and self._store.has_candles(instrument_token, interval_str, from_date, to_date):
+            cached = self._store.get_candles(instrument_token, interval_str, from_date, to_date)
+            if cached:
+                logger.info(
+                    "historical_cache_hit",
+                    token=instrument_token,
+                    interval=interval_str,
+                    bars=len(cached),
+                )
+                # Convert dicts back to HistoricalCandle-like objects
+                from src.data.models import HistoricalCandle
+                return [
+                    HistoricalCandle(
+                        timestamp=c["ts"],
+                        open=c["open"],
+                        high=c["high"],
+                        low=c["low"],
+                        close=c["close"],
+                        volume=c["volume"],
+                        oi=c.get("oi"),
+                    )
+                    for c in cached
+                ]
+
+        # ── 2. Fetch from Kite API ───────────────────────────────
         max_days = KITE_MAX_DAYS.get(interval_str, 195)
         fmt = "%Y-%m-%d"
         start = datetime.strptime(from_date, fmt)
         end = datetime.strptime(to_date, fmt)
 
+        all_candles: list = []
         total_days = (end - start).days
         if total_days <= max_days:
             # Single request is within limits
-            return await self._client.get_historical_data(
+            all_candles = await self._client.get_historical_data(
                 instrument_token=instrument_token,
                 interval=kite_interval,
                 from_date=from_date,
                 to_date=to_date,
             )
-
-        # --- Chunk the date range ---
-        all_candles: list = []
-        chunk_start = start
-        while chunk_start < end:
-            chunk_end = min(chunk_start + timedelta(days=max_days), end)
-            logger.info(
-                "historical_chunk_fetch",
-                token=instrument_token,
-                interval=interval_str,
-                chunk_from=chunk_start.strftime(fmt),
-                chunk_to=chunk_end.strftime(fmt),
-            )
-            try:
-                candles = await self._client.get_historical_data(
-                    instrument_token=instrument_token,
-                    interval=kite_interval,
-                    from_date=chunk_start.strftime(fmt),
-                    to_date=chunk_end.strftime(fmt),
-                )
-                if candles:
-                    all_candles.extend(candles)
-            except Exception as e:
-                logger.error(
-                    "historical_chunk_error",
+        else:
+            # --- Chunk the date range ---
+            chunk_start = start
+            while chunk_start < end:
+                chunk_end = min(chunk_start + timedelta(days=max_days), end)
+                logger.info(
+                    "historical_chunk_fetch",
+                    token=instrument_token,
+                    interval=interval_str,
                     chunk_from=chunk_start.strftime(fmt),
                     chunk_to=chunk_end.strftime(fmt),
-                    error=str(e),
                 )
-            # Next chunk starts from the day after the current chunk end
-            chunk_start = chunk_end + timedelta(days=1)
-            # Small delay to be kind to the API rate-limiter
-            await asyncio.sleep(0.3)
+                try:
+                    candles = await self._client.get_historical_data(
+                        instrument_token=instrument_token,
+                        interval=kite_interval,
+                        from_date=chunk_start.strftime(fmt),
+                        to_date=chunk_end.strftime(fmt),
+                    )
+                    if candles:
+                        all_candles.extend(candles)
+                except Exception as e:
+                    logger.error(
+                        "historical_chunk_error",
+                        chunk_from=chunk_start.strftime(fmt),
+                        chunk_to=chunk_end.strftime(fmt),
+                        error=str(e),
+                    )
+                # Next chunk starts from the day after the current chunk end
+                chunk_start = chunk_end + timedelta(days=1)
+                # Small delay to be kind to the API rate-limiter
+                await asyncio.sleep(0.3)
+
+        # ── 3. Persist fetched candles to DB cache ───────────────
+        if self._store and all_candles:
+            store_rows = [
+                {
+                    "ts": c.timestamp,
+                    "open": c.open,
+                    "high": c.high,
+                    "low": c.low,
+                    "close": c.close,
+                    "volume": c.volume,
+                    "oi": c.oi,
+                }
+                for c in all_candles
+            ]
+            stored = self._store.store_candles(instrument_token, interval_str, store_rows)
+            logger.info(
+                "historical_cache_stored",
+                token=instrument_token,
+                interval=interval_str,
+                bars=stored,
+            )
 
         return all_candles
 
@@ -376,6 +535,7 @@ class MarketDataProvider:
 
     async def get_quote(self, instruments: list[str]) -> dict[str, Any]:
         """Get full market quote for instruments (e.g., ['NSE:RELIANCE', 'NSE:TCS'])."""
+        quotes = {}
         try:
             quotes = await self._client.get_quote(instruments)
             result = {}
@@ -416,6 +576,30 @@ class MarketDataProvider:
         except Exception as e:
             logger.error("quote_fetch_failed", error=str(e))
             return {"error": str(e)}
+        finally:
+            # Store-behind: persist quote snapshots to DB
+            if self._store and quotes:
+                try:
+                    snaps = [
+                        {
+                            "instrument_token": q.instrument_token,
+                            "ts": str(q.timestamp) if q.timestamp else "",
+                            "last_price": q.last_price,
+                            "volume": q.volume or 0,
+                            "oi": q.oi or 0,
+                            "buy_quantity": q.buy_quantity or 0,
+                            "sell_quantity": q.sell_quantity or 0,
+                            "open": q.ohlc.open if q.ohlc else 0,
+                            "high": q.ohlc.high if q.ohlc else 0,
+                            "low": q.ohlc.low if q.ohlc else 0,
+                            "close": q.ohlc.close if q.ohlc else 0,
+                            "net_change": q.net_change or 0,
+                        }
+                        for q in quotes.values()
+                    ]
+                    self._store.store_quote_snapshots(snaps)
+                except Exception:
+                    pass
 
     async def get_ltp(self, instruments: list[str]) -> dict[str, Any]:
         """Get last traded price for instruments."""

@@ -299,6 +299,9 @@ class MultiLegPosition:
 
         Returns float('inf') for undefined-risk structures (all-short
         or all-long without hedges, e.g. short strangle/straddle).
+
+        For multi-leg structures (iron butterfly, iron condor) uses
+        per-side wing width, NOT the full spread width.
         """
         if len(self.legs) < 2:
             return float("inf")
@@ -310,17 +313,43 @@ class MultiLegPosition:
         if not has_long or not has_short:
             return float("inf")
 
-        # Defined risk: has both long and short legs
-        # For vertical spreads: width of strikes − net premium
+        lot_size = max(leg.contract.lot_size for leg in self.legs)
+        lots = max(leg.lots for leg in self.legs)
+
+        # Split legs by option type for per-side width calculation
+        calls = [l for l in self.legs if l.contract.strike is not None and l.contract.is_call]
+        puts  = [l for l in self.legs if l.contract.strike is not None and not l.contract.is_call]
+
+        def _side_wing_width(side_legs: list) -> float:
+            """Max distance between a long and short strike on one side."""
+            if not side_legs:
+                return 0.0
+            long_strikes = [l.contract.strike for l in side_legs if l.quantity > 0]
+            short_strikes = [l.contract.strike for l in side_legs if l.quantity < 0]
+            if not long_strikes or not short_strikes:
+                return 0.0
+            return max(
+                abs(ls - ss)
+                for ls in long_strikes
+                for ss in short_strikes
+            )
+
+        call_width = _side_wing_width(calls)
+        put_width  = _side_wing_width(puts)
+
+        # For 4-leg structures (iron butterfly/condor) use per-side width
+        if len(calls) >= 1 and len(puts) >= 1 and (call_width > 0 or put_width > 0):
+            wing_width = max(call_width, put_width)
+            return max(0, (wing_width - abs(self.net_premium)) * lot_size * lots)
+
+        # Fallback for 2-leg verticals: use full distance
         strikes = sorted(set(
             leg.contract.strike for leg in self.legs
             if leg.contract.strike is not None
         ))
         if len(strikes) >= 2:
             width = strikes[-1] - strikes[0]
-            lot_size = max(leg.contract.lot_size for leg in self.legs)
-            lots = max(leg.lots for leg in self.legs)
-            return (width - abs(self.net_premium)) * lot_size * lots
+            return max(0, (width - abs(self.net_premium)) * lot_size * lots)
         return float("inf")
 
     def close_all(self, price_map: dict[str, float], exit_time: datetime | None = None) -> float:

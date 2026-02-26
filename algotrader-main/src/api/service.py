@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from src.analysis.scanner import StockScanner
@@ -19,6 +19,7 @@ from src.data.models import (
 )
 from src.data.paper_trader import PaperTradingEngine
 from src.data.synthetic import generate_synthetic_ohlcv
+from src.data.market_data_store import MarketDataStore
 from src.derivatives.fno_backtest import FnOBacktestEngine
 from src.derivatives.fno_paper_trader import FnOPaperTradingEngine
 from src.execution.engine import ExecutionEngine
@@ -35,6 +36,8 @@ from src.options.chain import OptionChainBuilder
 from src.options.oi_analysis import FuturesOIAnalyzer, OptionsOIAnalyzer
 from src.options.oi_tracker import NIFTY_TOKEN, SENSEX_TOKEN, OITracker
 from src.options.oi_strategy import OIStrategyEngine, OIStrategyConfig
+from src.options.call_credit_spread_runner import CallCreditSpreadRunnerStrategy
+from src.options.put_credit_spread_runner import PutCreditSpreadRunnerStrategy
 from src.options.strategies import (
     BearPutSpreadStrategy,
     BullCallSpreadStrategy,
@@ -135,10 +138,19 @@ class TradingService:
         self._custom_store = CustomStrategyStore()
         self._fno_strategy_store = FnOStrategyStore()
         self._paper_results: dict[str, Any] = {}  # cache latest paper trade results
-        self._market_data = MarketDataProvider(self._client)
+        self._data_store = MarketDataStore(db_path="data/market_data.db")
+        self._market_data = MarketDataProvider(self._client, store=self._data_store)
         self._portfolio_reporter = PortfolioReporter(self._client)
         self._backtest_results: dict[str, Any] = {}  # cache latest backtest results
         self._last_health_report: Optional[dict[str, Any]] = None  # cache latest health report
+        self._tested_strategies: set[str] = self._data_store.load_tested_strategies()
+
+    # ─── Tested Strategy Persistence ────────────────────────────
+
+    def _mark_strategy_tested(self, name: str) -> None:
+        """Add a strategy to the tested set and persist to DB."""
+        self._tested_strategies.add(name)
+        self._data_store.add_tested_strategy(name)
 
     # ─── Preflight API ──────────────────────────────────────────
 
@@ -196,25 +208,33 @@ class TradingService:
 
     async def search_instruments(self, query: str, exchange: str = "NSE") -> list[dict[str, Any]]:
         if exchange not in self._instruments_cache:
-            instruments = await self._client.get_instruments(exchange)
-            self._instruments_cache[exchange] = instruments
+            self._instruments_cache[exchange] = await self._market_data.get_instruments(exchange)
 
         results = []
         q = query.upper()
         eq_only = exchange in ("NSE", "BSE")
         for inst in self._instruments_cache[exchange]:
-            if eq_only and inst.instrument_type not in ("EQ", ""):
+            itype = inst.get("instrument_type", "") if isinstance(inst, dict) else getattr(inst, "instrument_type", "")
+            tsym = inst.get("tradingsymbol", "") if isinstance(inst, dict) else getattr(inst, "tradingsymbol", "")
+            iname = inst.get("name", "") if isinstance(inst, dict) else getattr(inst, "name", "")
+            itoken = inst.get("instrument_token", 0) if isinstance(inst, dict) else getattr(inst, "instrument_token", 0)
+            iexch = inst.get("exchange", exchange) if isinstance(inst, dict) else getattr(inst, "exchange", exchange)
+            ilot = inst.get("lot_size", 0) if isinstance(inst, dict) else getattr(inst, "lot_size", 0)
+            iexpiry = inst.get("expiry", "") if isinstance(inst, dict) else getattr(inst, "expiry", "")
+            istrike = inst.get("strike", 0) if isinstance(inst, dict) else getattr(inst, "strike", 0)
+
+            if eq_only and itype not in ("EQ", ""):
                 continue
-            if not q or q in inst.tradingsymbol.upper() or q in (inst.name or "").upper():
+            if not q or q in tsym.upper() or q in (iname or "").upper():
                 results.append({
-                    "token": inst.instrument_token,
-                    "symbol": inst.tradingsymbol,
-                    "name": inst.name or inst.tradingsymbol,
-                    "exchange": inst.exchange,
-                    "type": inst.instrument_type,
-                    "lot_size": inst.lot_size,
-                    "expiry": inst.expiry or "",
-                    "strike": inst.strike,
+                    "token": itoken,
+                    "symbol": tsym,
+                    "name": iname or tsym,
+                    "exchange": iexch,
+                    "type": itype,
+                    "lot_size": ilot,
+                    "expiry": iexpiry or "",
+                    "strike": istrike,
                 })
             if len(results) >= 50:
                 break
@@ -230,11 +250,25 @@ class TradingService:
 
     async def get_orders(self) -> list[dict[str, Any]]:
         orders = await self._client.get_orders()
-        return [o.model_dump() for o in orders]
+        order_dicts = [o.model_dump() for o in orders]
+        # Persist to store
+        if self._data_store:
+            try:
+                self._data_store.store_orders(order_dicts)
+            except Exception:
+                pass
+        return order_dicts
 
     async def get_positions(self) -> dict[str, Any]:
         positions = await self._client.get_positions()
-        return positions.model_dump()
+        pos_dump = positions.model_dump()
+        # Persist net positions to store
+        if self._data_store and pos_dump.get("net"):
+            try:
+                self._data_store.store_positions(pos_dump["net"])
+            except Exception:
+                pass
+        return pos_dump
 
     async def get_holdings(self) -> list[dict[str, Any]]:
         holdings = await self._client.get_holdings()
@@ -456,11 +490,11 @@ class TradingService:
         # Auto-discover instruments if not provided
         if not instruments and not self._oi_tracker.get_tracked_tokens():
             try:
-                nfo_instruments = await self._client.get_instruments("NFO")
+                nfo_instruments = await self._market_data.get_instruments("NFO")
                 inst_dicts = [
-                    i.model_dump() if hasattr(i, "model_dump") else i
+                    i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else i)
                     for i in nfo_instruments
-                    if (i.instrument_type if hasattr(i, "instrument_type") else i.get("instrument_type", "")) in ("CE", "PE")
+                    if (i.get("instrument_type", "") if isinstance(i, dict) else getattr(i, "instrument_type", "")) in ("CE", "PE")
                 ]
                 self._oi_tracker.register_instruments(inst_dicts)
                 logger.info("oi_instruments_auto_loaded", count=len(inst_dicts))
@@ -575,6 +609,7 @@ class TradingService:
             batch = quote_keys[i:i + BATCH_SIZE]
             try:
                 quotes = await self._client.get_quote(batch)
+                snap_batch: list[dict] = []
                 for key, q in quotes.items():
                     token = token_to_key.get(key, q.instrument_token)
                     if token and (q.oi or q.oi_day_high):
@@ -587,6 +622,26 @@ class TradingService:
                             "oi_day_high": q.oi_day_high or 0,
                             "oi_day_low": q.oi_day_low or 0,
                         })
+                    # Store quote snapshot
+                    snap_batch.append({
+                        "instrument_token": token or q.instrument_token,
+                        "ts": str(q.timestamp) if q.timestamp else datetime.now().isoformat(),
+                        "last_price": q.last_price,
+                        "volume": q.volume or 0,
+                        "oi": q.oi or 0,
+                        "buy_quantity": q.buy_quantity or 0,
+                        "sell_quantity": q.sell_quantity or 0,
+                        "open": q.ohlc.open if q.ohlc else 0,
+                        "high": q.ohlc.high if q.ohlc else 0,
+                        "low": q.ohlc.low if q.ohlc else 0,
+                        "close": q.ohlc.close if q.ohlc else 0,
+                        "net_change": q.net_change or 0,
+                    })
+                if self._data_store and snap_batch:
+                    try:
+                        self._data_store.store_quote_snapshots(snap_batch)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.warning("oi_rest_poll_batch_error", error=str(e), batch_start=i)
                 await asyncio.sleep(0.5)
@@ -660,6 +715,30 @@ class TradingService:
 
             # Fetch live quotes in batches
             quotes = await self._client.get_quote(symbols_to_fetch)
+
+            # Store-behind: persist quote snapshots
+            if self._data_store and quotes:
+                try:
+                    snap_batch = [
+                        {
+                            "instrument_token": q.instrument_token,
+                            "ts": str(q.timestamp) if q.timestamp else datetime.now().isoformat(),
+                            "last_price": q.last_price,
+                            "volume": q.volume or 0,
+                            "oi": q.oi or 0,
+                            "buy_quantity": q.buy_quantity or 0,
+                            "sell_quantity": q.sell_quantity or 0,
+                            "open": q.ohlc.open if q.ohlc else 0,
+                            "high": q.ohlc.high if q.ohlc else 0,
+                            "low": q.ohlc.low if q.ohlc else 0,
+                            "close": q.ohlc.close if q.ohlc else 0,
+                            "net_change": q.net_change or 0,
+                        }
+                        for q in quotes.values()
+                    ]
+                    self._data_store.store_quote_snapshots(snap_batch)
+                except Exception:
+                    pass
 
             sl_pct = self._oi_strategy.config.stop_loss_pct / 100
             tgt_pct = self._oi_strategy.config.target_pct / 100
@@ -804,18 +883,49 @@ class TradingService:
         except Exception as e:
             logger.error("oi_journal_record_error", error=str(e))
 
-    def add_strategy(self, name: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    # Valid timeframe choices for live trading
+    VALID_TIMEFRAMES = [
+        "minute", "3minute", "5minute", "10minute",
+        "15minute", "30minute", "60minute", "day",
+    ]
+
+    async def add_strategy(
+        self, name: str, params: Optional[dict[str, Any]] = None,
+        timeframe: str = "5minute", require_tested: bool = True,
+    ) -> dict[str, Any]:
+        from src.strategy.analysis_strategies import ANALYSIS_STRATEGIES
+
+        # ── Validate timeframe ──────────────────────────────────
+        if timeframe not in self.VALID_TIMEFRAMES:
+            return {
+                "error": f"Invalid timeframe: {timeframe}",
+                "valid_timeframes": self.VALID_TIMEFRAMES,
+            }
+
+        # ── Backtest / paper-trade gate ─────────────────────────
+        if require_tested and name not in self._tested_strategies:
+            return {
+                "error": f"Strategy '{name}' has not been backtested or paper-traded yet.",
+                "hint": "Run a backtest or paper trade for this strategy first, then add it for live trading.",
+                "tested_strategies": sorted(self._tested_strategies),
+            }
+
         strategy_map = {
             "ema_crossover": EMACrossoverStrategy,
             "vwap_breakout": VWAPBreakoutStrategy,
             "mean_reversion": MeanReversionStrategy,
             "rsi": RSIStrategy,
+            "rsi_strategy": RSIStrategy,
             "scanner_strategy": ScannerStrategy,
             "iron_condor": IronCondorStrategy,
             "straddle_strangle": StraddleStrangleStrategy,
             "bull_call_spread": BullCallSpreadStrategy,
             "bear_put_spread": BearPutSpreadStrategy,
+            "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+            "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
         }
+        # Merge all analysis strategies (cci_extreme, mfi_strategy, bollinger, etc.)
+        strategy_map.update(ANALYSIS_STRATEGIES)
         cls = strategy_map.get(name)
         if cls:
             strategy = cls(params)
@@ -826,9 +936,31 @@ class TradingService:
                 strategy = custom
             else:
                 return {"error": f"Unknown strategy: {name}", "available": list(strategy_map.keys())}
+
+        # ── Apply timeframe ─────────────────────────────────────
+        strategy.set_timeframe(timeframe)
+        logger.info("strategy_timeframe_set", name=name, timeframe=timeframe)
+
         self._strategies.append(strategy)
-        logger.info("strategy_added", name=name)
-        return {"success": True, "name": strategy.name}
+        logger.info("strategy_added", name=name, timeframe=timeframe)
+
+        # Push the current token→symbol map so signals use real symbols
+        self._sync_tradingsymbol_map()
+
+        # If live trading is already running, seed bar data for the new strategy
+        if self._running and self._subscribed_tokens:
+            try:
+                for token in self._subscribed_tokens:
+                    df = await self._market_data.get_historical_df(
+                        instrument_token=token, interval="5minute", days=5
+                    )
+                    if not df.empty:
+                        strategy.update_bar_data(token, df)
+                logger.info("strategy_bar_data_seeded_mid_live", name=name)
+            except Exception as e:
+                logger.warning("strategy_bar_data_seed_failed_mid_live", name=name, error=str(e))
+
+        return {"success": True, "name": strategy.name, "timeframe": timeframe}
 
     def remove_strategy(self, name: str) -> dict[str, Any]:
         self._strategies = [s for s in self._strategies if s.name != name]
@@ -870,8 +1002,29 @@ class TradingService:
         if self._running:
             return {"error": "Already running"}
 
+        if not self._strategies:
+            logger.warning("start_live_no_strategies", msg="No strategies registered. Add at least one strategy before starting live trading.")
+            return {
+                "error": "No strategies added. Please add at least one strategy before starting live trading.",
+                "hint": "Click '+ Strategy' to add a strategy first.",
+            }
+
         self._running = True
-        self._subscribed_tokens = tokens
+        self._subscribed_tokens = list(tokens)  # copy so we can extend
+
+        # ── Auto-add NIFTY / SENSEX futures for options strategies ──
+        options_strat_names = {
+            "iron_condor", "straddle_strangle", "bull_call_spread", "bear_put_spread",
+            "call_credit_spread_runner", "put_credit_spread_runner",
+        }
+        has_options = any(s.name in options_strat_names for s in self._strategies)
+        if has_options:
+            futures_tokens = await self._resolve_index_futures_tokens()
+            for ft, fn in futures_tokens:
+                if ft not in self._subscribed_tokens:
+                    self._subscribed_tokens.append(ft)
+                    self._token_name_map[ft] = fn
+                    logger.info("auto_subscribed_index_future", token=ft, name=fn)
 
         self._ticker.on_ticks = self._on_ticks
         self._ticker.on_connect = self._on_connect
@@ -879,20 +1032,24 @@ class TradingService:
         self._ticker.on_error = self._on_error
         self._ticker.on_order_update = self._on_order_update
 
-        await self._seed_bar_data(tokens)
-        await self._ticker.subscribe(tokens, TickMode(mode))
+        await self._seed_bar_data(self._subscribed_tokens)
+        # Inject token→symbol map into all strategies so signals use real trading symbols
+        self._sync_tradingsymbol_map()
+        await self._ticker.subscribe(self._subscribed_tokens, TickMode(mode))
 
         for coro in [
             self._ticker.connect(),
             self._execution.start_reconciliation_loop(),
             self._position_update_loop(),
             self._index_quote_enrichment_loop(),
+            self._option_chain_refresh_loop(),
         ]:
             task = asyncio.create_task(coro)
             task.add_done_callback(self._task_exception_handler)
 
-        logger.info("live_trading_started", tokens=tokens)
-        return {"success": True, "tokens": tokens}
+        strategy_names = [s.name for s in self._strategies]
+        logger.info("live_trading_started", tokens=self._subscribed_tokens, strategies=strategy_names, count=len(strategy_names))
+        return {"success": True, "tokens": self._subscribed_tokens, "strategies": strategy_names}
 
     async def stop_live(self) -> dict[str, Any]:
         self._running = False
@@ -900,6 +1057,61 @@ class TradingService:
         await self._ticker.disconnect()
         logger.info("live_trading_stopped")
         return {"success": True}
+
+    async def _resolve_index_futures_tokens(self) -> list[tuple[int, str]]:
+        """Resolve current-month NIFTY and SENSEX futures instrument tokens.
+
+        Returns list of (token, tradingsymbol) tuples for the nearest expiry
+        futures contracts. These are needed for options strategies that require
+        the underlying futures price for hedging/Greeks.
+        """
+        results: list[tuple[int, str]] = []
+        today = datetime.now().date()
+
+        def _parse_expiry(raw: str | None):
+            """Parse expiry string (YYYY-MM-DD) to date, return None on failure."""
+            if not raw:
+                return None
+            try:
+                return datetime.strptime(raw, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return None
+
+        for underlying, exchange in [("NIFTY", "NFO"), ("SENSEX", "BFO")]:
+            try:
+                instruments = await self._market_data.get_instruments(exchange)
+                # Find FUT instruments for this underlying
+                fut_candidates = []
+                for inst in instruments:
+                    # Works with both dicts (from cache) and Pydantic models
+                    _get = (lambda k, d="": inst.get(k, d)) if isinstance(inst, dict) else (lambda k, d="": getattr(inst, k, d))
+                    exp_date = _parse_expiry(_get("expiry"))
+                    if (
+                        _get("name") == underlying
+                        and _get("instrument_type") == "FUT"
+                        and exp_date
+                        and exp_date >= today
+                    ):
+                        fut_candidates.append((inst, exp_date))
+
+                if fut_candidates:
+                    # Pick nearest expiry future
+                    nearest_inst, nearest_exp = min(fut_candidates, key=lambda t: t[1])
+                    _g = (lambda k, d=0: nearest_inst.get(k, d)) if isinstance(nearest_inst, dict) else (lambda k, d=0: getattr(nearest_inst, k, d))
+                    results.append((_g("instrument_token"), _g("tradingsymbol", "")))
+                    logger.info(
+                        "index_future_resolved",
+                        underlying=underlying,
+                        tradingsymbol=_g("tradingsymbol", ""),
+                        token=_g("instrument_token"),
+                        expiry=str(nearest_exp),
+                    )
+                else:
+                    logger.warning("index_future_not_found", underlying=underlying)
+            except Exception as e:
+                logger.warning("index_future_resolve_failed", underlying=underlying, error=str(e))
+
+        return results
 
     def register_ws_client(self, ws: Any) -> None:
         self._ws_clients.append(ws)
@@ -919,28 +1131,33 @@ class TradingService:
             self._ws_clients.remove(ws)
 
     async def _seed_bar_data(self, tokens: list[int]) -> None:
-        from datetime import timedelta
-        to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        from_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
         for token in tokens:
             try:
-                candles = await self._client.get_historical_data(
-                    instrument_token=token,
-                    interval=Interval.MINUTE_5,
-                    from_date=from_date,
-                    to_date=to_date,
+                df = await self._market_data.get_historical_df(
+                    instrument_token=token, interval="5minute", days=5
                 )
-                if candles:
-                    rows = [
-                        {"timestamp": c.timestamp, "open": c.open, "high": c.high,
-                         "low": c.low, "close": c.close, "volume": c.volume}
-                        for c in candles
-                    ]
-                    df = pd.DataFrame(rows)
+                if not df.empty:
                     for strategy in self._strategies:
                         strategy.update_bar_data(token, df)
             except Exception as e:
                 logger.warning("bar_data_seed_failed", token=token, error=str(e))
+
+    def _sync_tradingsymbol_map(self) -> None:
+        """Push the service's token→name map into every strategy's params.
+
+        Strategies use ``params["tradingsymbol_map"][token]`` to resolve
+        instrument tokens to real trading symbols (e.g. "RELIANCE").
+        Without this, they fall back to "TOKEN_738561" which makes the
+        execution layer's quote/liquidity lookups fail.
+        """
+        # Build the map with both int and str keys (some strategies use str keys)
+        sym_map: dict = {}
+        for token, name in self._token_name_map.items():
+            sym_map[token] = name
+            sym_map[str(token)] = name
+
+        for strategy in self._strategies:
+            strategy.params["tradingsymbol_map"] = sym_map
 
     async def _on_ticks(self, ticks: list[Tick]) -> None:
         for tick in ticks:
@@ -1379,31 +1596,19 @@ class TradingService:
         if isinstance(strategy, dict):  # error dict
             return strategy
 
-        # Fetch historical data
-        from datetime import timedelta
-        to_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-
+        # Fetch historical data (through cache)
         try:
-            candles = await self._client.get_historical_data(
+            df = await self._market_data.get_historical_df(
                 instrument_token=instrument_token,
-                interval=Interval(interval),
-                from_date=from_date,
-                to_date=to_date,
+                interval=interval,
+                days=days,
             )
         except Exception as e:
             logger.error("paper_trade_data_fetch_failed", error=str(e))
             return {"error": f"Failed to fetch data: {str(e)}"}
 
-        if not candles:
+        if df.empty:
             return {"error": "No historical data returned. Check instrument token and date range."}
-
-        rows = [
-            {"timestamp": c.timestamp, "open": c.open, "high": c.high,
-             "low": c.low, "close": c.close, "volume": c.volume}
-            for c in candles
-        ]
-        df = pd.DataFrame(rows)
 
         # Run paper trade
         engine = PaperTradingEngine(
@@ -1423,6 +1628,9 @@ class TradingService:
         # BacktestEngine.run() returns a plain dict (not an object with to_dict_safe)
         result_dict = result if isinstance(result, dict) else result.to_dict_safe()
         self._paper_results[strategy_name] = result_dict
+        # Mark strategy as tested so it can be added for live trading
+        self._mark_strategy_tested(strategy_name)
+        logger.info("strategy_marked_tested", name=strategy_name, via="paper_trade")
 
         # Compute strategy health report and embed in result
         try:
@@ -1450,46 +1658,25 @@ class TradingService:
         capital: float = 100000.0,
         interval: str = "5minute",
         strategy_params: Optional[dict[str, Any]] = None,
+        allow_synthetic: bool = False,
     ) -> dict[str, Any]:
-        """Run paper trade with sample data — prefers Zerodha historical, falls back to synthetic."""
+        """Run paper trade with sample data — Live → DB cache → Synthetic (with confirmation)."""
         strategy = self._resolve_strategy(strategy_name, strategy_params)
         if isinstance(strategy, dict):
             return strategy
 
-        # ── Prefer Zerodha historical data; fall back to synthetic ──
-        df = pd.DataFrame()
-        data_source = "synthetic"
-        symbol = tradingsymbol
+        df, data_source, err = await self._resolve_sample_data(
+            instrument_token=256265,
+            interval=interval,
+            bars=bars,
+            allow_synthetic=allow_synthetic,
+            base_price=100.0,
+            style="equity",
+        )
+        if err:
+            return {"error": err, "needs_synthetic_confirmation": True}
 
-        if self._auth.is_authenticated:
-            try:
-                _token = 256265  # NIFTY 50
-                # Estimate days needed: ~75 intraday bars per day for 5min
-                _bars_per_day = {"day": 1, "60minute": 6, "30minute": 13,
-                                 "15minute": 25, "10minute": 38, "5minute": 75,
-                                 "3minute": 125, "minute": 375}
-                _bpd = _bars_per_day.get(interval, 75)
-                _days = max(int(bars / max(_bpd, 1)) + 10, 30)
-                df = await self._market_data.get_historical_df(
-                    _token, interval, days=_days,
-                )
-                if not df.empty and len(df) >= bars:
-                    df = df.tail(bars)
-                    data_source = "zerodha"
-                    symbol = "NIFTY 50"
-                else:
-                    df = pd.DataFrame()
-            except Exception as exc:
-                logger.warning("zerodha_paper_sample_fallback", error=str(exc))
-                df = pd.DataFrame()
-
-        if df.empty:
-            freq = self._INTERVAL_FREQ.get(interval, "5min")
-            df = generate_synthetic_ohlcv(
-                bars=bars, base_price=100.0, freq=freq, style="equity",
-            )
-            data_source = "synthetic"
-            symbol = tradingsymbol
+        symbol = "NIFTY 50" if data_source in ("zerodha", "db_cache") else tradingsymbol
 
         engine = PaperTradingEngine(strategy=strategy, initial_capital=capital)
         result = engine.run(df, instrument_token=0, tradingsymbol=symbol, timeframe=interval)
@@ -1497,6 +1684,8 @@ class TradingService:
         result_dict = result if isinstance(result, dict) else result.to_dict_safe()
         result_dict["data_source"] = data_source
         self._paper_results[strategy_name] = result_dict
+        self._mark_strategy_tested(strategy_name)
+        logger.info("strategy_marked_tested", name=strategy_name, via="paper_trade_sample")
 
         # Compute strategy health report and embed in result
         try:
@@ -1531,6 +1720,8 @@ class TradingService:
             "rsi": RSIStrategy,
             "rsi_strategy": RSIStrategy,
             "scanner_strategy": ScannerStrategy,
+            "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+            "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
         }
         # Merge analysis strategies into the map
         strategy_map.update(ANALYSIS_STRATEGIES)
@@ -2087,6 +2278,8 @@ class TradingService:
 
         result = engine.run(df, instrument_token, tradingsymbol, timeframe=interval)
         self._backtest_results = result
+        self._mark_strategy_tested(strategy_name)
+        logger.info("strategy_marked_tested", name=strategy_name, via="backtest")
 
         # Compute strategy health report and embed in result
         try:
@@ -2113,6 +2306,107 @@ class TradingService:
         "3minute": "3min", "minute": "1min",
     }
 
+    # Bars-per-day lookup used to estimate how many calendar days to fetch
+    _BARS_PER_DAY: dict[str, int] = {
+        "day": 1, "60minute": 6, "30minute": 13,
+        "15minute": 25, "10minute": 38, "5minute": 75,
+        "3minute": 125, "minute": 375,
+    }
+
+    async def _resolve_sample_data(
+        self,
+        *,
+        instrument_token: int = 256265,
+        interval: str = "day",
+        bars: int = 500,
+        allow_synthetic: bool = False,
+        base_price: float = 100.0,
+        style: str = "equity",
+    ) -> tuple[pd.DataFrame, str, str | None]:
+        """Centralised three-tier data resolver for sample / demo flows.
+
+        Priority:
+            1. **Live** – Zerodha historical via ``get_historical_df``
+               (which itself checks the DB cache first, then the Kite API).
+            2. **DB cache** – If not authenticated, query ``MarketDataStore``
+               directly for any previously-cached candles.
+            3. **Synthetic** – Only if ``allow_synthetic=True``; otherwise
+               returns an empty DataFrame so the caller can signal the user.
+
+        Returns
+        -------
+        (df, data_source, error_msg | None)
+            *data_source* is one of ``"zerodha"``, ``"db_cache"``, ``"synthetic"``.
+            *error_msg* is ``None`` on success; when non-``None`` the caller
+            should return it as the API response asking the user to confirm
+            synthetic usage.
+        """
+        df = pd.DataFrame()
+        data_source = "synthetic"
+
+        # ── Tier 1: Live / cached via MarketDataProvider ───────────
+        if self._auth.is_authenticated:
+            try:
+                _bpd = self._BARS_PER_DAY.get(interval, 75)
+                _days = max(int(bars / max(_bpd, 1)) + 10, 30)
+                if interval == "day":
+                    _days = max(bars * 2, 365)
+                df = await self._market_data.get_historical_df(
+                    instrument_token, interval, days=_days,
+                )
+                if not df.empty and len(df) >= bars:
+                    df = df.tail(bars)
+                    data_source = "zerodha"
+                    return df, data_source, None
+                df = pd.DataFrame()  # not enough rows
+            except Exception as exc:
+                logger.warning("resolve_data_live_fallback", error=str(exc))
+                df = pd.DataFrame()
+
+        # ── Tier 2: DB cache (even when not authenticated) ────────
+        if df.empty and self._data_store:
+            try:
+                _bpd = self._BARS_PER_DAY.get(interval, 75)
+                _days = max(int(bars / max(_bpd, 1)) + 10, 30)
+                if interval == "day":
+                    _days = max(bars * 2, 730)
+                to_date = datetime.now().strftime("%Y-%m-%d")
+                from_date = (datetime.now() - timedelta(days=_days)).strftime("%Y-%m-%d")
+                cached = self._data_store.get_candles(
+                    instrument_token, interval, from_date, to_date,
+                )
+                if cached and len(cached) >= bars:
+                    rows = [{
+                        "timestamp": c["ts"],
+                        "open": c["open"],
+                        "high": c["high"],
+                        "low": c["low"],
+                        "close": c["close"],
+                        "volume": c.get("volume", 0),
+                    } for c in cached]
+                    df = pd.DataFrame(rows)
+                    df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    df.set_index("timestamp", inplace=True)
+                    df = df.tail(bars)
+                    data_source = "db_cache"
+                    return df, data_source, None
+            except Exception as exc:
+                logger.warning("resolve_data_db_cache_fallback", error=str(exc))
+
+        # ── Tier 3: Synthetic (only if explicitly allowed) ────────
+        if not allow_synthetic:
+            return pd.DataFrame(), "none", (
+                "No live or cached market data available. "
+                "Set allow_synthetic=true to run with synthetic data."
+            )
+
+        freq = self._INTERVAL_FREQ.get(interval, "D")
+        df = generate_synthetic_ohlcv(
+            bars=bars, base_price=base_price, freq=freq, style=style,
+        )
+        data_source = "synthetic"
+        return df, data_source, None
+
     async def run_backtest_sample(
         self,
         strategy_name: str,
@@ -2126,40 +2420,25 @@ class TradingService:
         capital_fraction: float = 0.10,
         interval: str = "day",
         strategy_params: dict[str, Any] | None = None,
+        allow_synthetic: bool = False,
     ) -> dict[str, Any]:
-        """Run backtest on sample data — prefers Zerodha historical, falls back to state-of-art synthetic."""
+        """Run backtest on sample data — Live → DB cache → Synthetic (with confirmation)."""
         strategy = self._resolve_strategy(strategy_name, strategy_params)
         if isinstance(strategy, dict):
             return strategy
 
-        # ── Prefer Zerodha historical data; fall back to synthetic ──
-        df = pd.DataFrame()
-        data_source = "synthetic"
-        tradingsymbol = "SAMPLE"
+        df, data_source, err = await self._resolve_sample_data(
+            instrument_token=256265,
+            interval=interval,
+            bars=bars,
+            allow_synthetic=allow_synthetic,
+            base_price=100.0,
+            style="equity",
+        )
+        if err:
+            return {"error": err, "needs_synthetic_confirmation": True}
 
-        if self._auth.is_authenticated:
-            try:
-                _token = 256265  # NIFTY 50
-                df = await self._market_data.get_historical_df(
-                    _token, interval, days=max(bars * 2, 365),
-                )
-                if not df.empty and len(df) >= bars:
-                    df = df.tail(bars)
-                    data_source = "zerodha"
-                    tradingsymbol = "NIFTY 50"
-                else:
-                    df = pd.DataFrame()
-            except Exception as exc:
-                logger.warning("zerodha_sample_fallback", error=str(exc))
-                df = pd.DataFrame()
-
-        if df.empty:
-            freq = self._INTERVAL_FREQ.get(interval, "D")
-            df = generate_synthetic_ohlcv(
-                bars=bars, base_price=100.0, freq=freq, style="equity",
-            )
-            data_source = "synthetic"
-            tradingsymbol = "SAMPLE"
+        tradingsymbol = "NIFTY 50" if data_source in ("zerodha", "db_cache") else "SAMPLE"
 
         engine = BacktestEngine(
             strategy=strategy, initial_capital=initial_capital,
@@ -2170,6 +2449,8 @@ class TradingService:
         result = engine.run(df, tradingsymbol=tradingsymbol, timeframe=interval)
         result["data_source"] = data_source
         self._backtest_results = result
+        self._mark_strategy_tested(strategy_name)
+        logger.info("strategy_marked_tested", name=strategy_name, via="backtest_sample")
 
         # Compute strategy health report and embed in result
         try:
@@ -2286,6 +2567,7 @@ class TradingService:
         "short_straddle", "strangle", "short_strangle",
         "iron_butterfly", "covered_call", "protective_put",
         "calendar_spread",
+        "call_credit_spread_runner", "put_credit_spread_runner",
     ]
 
     def _is_valid_fno_strategy(self, name: str) -> bool:
@@ -2373,6 +2655,8 @@ class TradingService:
 
         result = engine.run(df, tradingsymbol=underlying)
         self._backtest_results = result
+        self._mark_strategy_tested(strategy_name)
+        logger.info("strategy_marked_tested", name=strategy_name, via="fno_backtest")
 
         # Compute strategy health report and embed in result
         try:
@@ -2401,38 +2685,25 @@ class TradingService:
         profit_target_pct: float = 50.0,
         stop_loss_pct: float = 100.0,
         delta_target: float = 0.16,
+        allow_synthetic: bool = False,
     ) -> dict[str, Any]:
-        """Run F&O backtest — prefers Zerodha underlying data, falls back to synthetic."""
+        """Run F&O backtest — Live → DB cache → Synthetic (with confirmation)."""
         if not self._is_valid_fno_strategy(strategy_name):
             return {
                 "error": f"Unknown F&O strategy: {strategy_name}",
                 "available": self.FNO_STRATEGIES,
             }
 
-        # ── Prefer Zerodha historical data; fall back to synthetic ──
-        df = pd.DataFrame()
-        data_source = "synthetic"
-
-        if self._auth.is_authenticated:
-            try:
-                _token = 256265  # NIFTY 50
-                df = await self._market_data.get_historical_df(
-                    _token, "day", days=max(bars * 2, 730),
-                )
-                if not df.empty and len(df) >= bars:
-                    df = df.tail(bars)
-                    data_source = "zerodha"
-                else:
-                    df = pd.DataFrame()
-            except Exception as exc:
-                logger.warning("zerodha_fno_sample_fallback", error=str(exc))
-                df = pd.DataFrame()
-
-        if df.empty:
-            df = generate_synthetic_ohlcv(
-                bars=bars, base_price=20000.0, freq="D", style="index",
-            )
-            data_source = "synthetic"
+        df, data_source, err = await self._resolve_sample_data(
+            instrument_token=256265,
+            interval="day",
+            bars=bars,
+            allow_synthetic=allow_synthetic,
+            base_price=20000.0,
+            style="index",
+        )
+        if err:
+            return {"error": err, "needs_synthetic_confirmation": True}
 
         engine = FnOBacktestEngine(
             strategy_name=strategy_name,
@@ -2446,6 +2717,8 @@ class TradingService:
         result = engine.run(df, tradingsymbol=underlying)
         result["data_source"] = data_source
         self._backtest_results = result
+        self._mark_strategy_tested(strategy_name)
+        logger.info("strategy_marked_tested", name=strategy_name, via="fno_backtest_sample")
 
         # Compute strategy health report and embed in result
         try:
@@ -2541,38 +2814,25 @@ class TradingService:
         profit_target_pct: float = 50.0,
         stop_loss_pct: float = 100.0,
         delta_target: float = 0.16,
+        allow_synthetic: bool = False,
     ) -> dict[str, Any]:
-        """Run F&O paper trade — prefers Zerodha underlying data, falls back to synthetic."""
+        """Run F&O paper trade — Live → DB cache → Synthetic (with confirmation)."""
         if not self._is_valid_fno_strategy(strategy_name):
             return {
                 "error": f"Unknown F&O strategy: {strategy_name}",
                 "available": self.FNO_STRATEGIES,
             }
 
-        # ── Prefer Zerodha historical data; fall back to synthetic ──
-        df = pd.DataFrame()
-        data_source = "synthetic"
-
-        if self._auth.is_authenticated:
-            try:
-                _token = 256265  # NIFTY 50
-                df = await self._market_data.get_historical_df(
-                    _token, "day", days=max(bars * 2, 730),
-                )
-                if not df.empty and len(df) >= bars:
-                    df = df.tail(bars)
-                    data_source = "zerodha"
-                else:
-                    df = pd.DataFrame()
-            except Exception as exc:
-                logger.warning("zerodha_fno_paper_sample_fallback", error=str(exc))
-                df = pd.DataFrame()
-
-        if df.empty:
-            df = generate_synthetic_ohlcv(
-                bars=bars, base_price=20000.0, freq="D", style="index",
-            )
-            data_source = "synthetic"
+        df, data_source, err = await self._resolve_sample_data(
+            instrument_token=256265,
+            interval="day",
+            bars=bars,
+            allow_synthetic=allow_synthetic,
+            base_price=20000.0,
+            style="index",
+        )
+        if err:
+            return {"error": err, "needs_synthetic_confirmation": True}
 
         engine = FnOPaperTradingEngine(
             strategy_name=strategy_name,
@@ -2617,6 +2877,184 @@ class TradingService:
         265:    "BSE:SENSEX",         # SENSEX
     }
 
+    # ── Option Chain Refresh (feeds live chain data to option strategies) ──
+
+    async def _option_chain_refresh_loop(self) -> None:
+        """Periodically build option chains and feed them to OptionStrategyBase strategies.
+
+        Without this, option strategies (credit spreads etc.) never receive
+        chain data in the live loop and can neither enter nor manage positions.
+        Runs every 10 seconds; uses REST quotes (≤500 instruments per call batch).
+        """
+        await asyncio.sleep(5)  # Let ticks start flowing first
+
+        # Determine which underlyings our option strategies care about
+        underlyings: set[str] = set()
+        option_strategies: list[OptionStrategyBase] = []
+        for s in self._strategies:
+            if isinstance(s, OptionStrategyBase):
+                option_strategies.append(s)
+                underlyings.add(s.params.get("underlying", "NIFTY"))
+
+        if not option_strategies:
+            logger.debug("option_chain_refresh_loop_skipped", reason="no option strategies")
+            return
+
+        logger.info(
+            "option_chain_refresh_loop_started",
+            underlyings=list(underlyings),
+            strategies=[s.name for s in option_strategies],
+        )
+
+        # Pre-fetch NFO/BFO instruments once (they don't change intra-day)
+        instruments_by_underlying: dict[str, list[dict[str, Any]]] = {}
+        try:
+            nfo_instruments = await self._market_data.get_instruments("NFO")
+            nfo_list = [
+                i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
+                for i in nfo_instruments
+            ]
+            for underlying in underlyings:
+                instruments_by_underlying[underlying] = [
+                    i for i in nfo_list
+                    if i.get("instrument_type") in ("CE", "PE")
+                    and i.get("name", "").upper() == underlying.upper()
+                ]
+            # Also try BFO for SENSEX
+            if "SENSEX" in underlyings:
+                try:
+                    bfo_instruments = await self._market_data.get_instruments("BFO")
+                    bfo_list = [
+                        i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
+                        for i in bfo_instruments
+                    ]
+                    sensex_opts = [
+                        i for i in bfo_list
+                        if i.get("instrument_type") in ("CE", "PE")
+                        and i.get("name", "").upper() == "SENSEX"
+                    ]
+                    instruments_by_underlying["SENSEX"] = sensex_opts or instruments_by_underlying.get("SENSEX", [])
+                except Exception:
+                    pass
+            logger.info("option_chain_instruments_loaded", counts={u: len(v) for u, v in instruments_by_underlying.items()})
+        except Exception as e:
+            logger.error("option_chain_instruments_load_failed", error=str(e))
+            return
+
+        while self._running:
+            for underlying in underlyings:
+                try:
+                    # 1. Get spot price from cached live ticks
+                    spot = 0.0
+                    spot_token = {"NIFTY": 256265, "SENSEX": 265, "BANKNIFTY": 260105}.get(underlying, 0)
+                    if spot_token and spot_token in self._live_ticks:
+                        spot = self._live_ticks[spot_token].get("ltp", 0.0)
+                    if spot <= 0:
+                        # Fallback: try REST LTP
+                        try:
+                            ltp_key = {"NIFTY": "NSE:NIFTY 50", "SENSEX": "BSE:SENSEX", "BANKNIFTY": "NSE:NIFTY BANK"}.get(underlying)
+                            if ltp_key:
+                                ltp_data = await self._client.get_ltp([ltp_key])
+                                for v in ltp_data.values():
+                                    p = v.last_price if hasattr(v, "last_price") else 0
+                                    if p > 0:
+                                        spot = p
+                        except Exception:
+                            pass
+                    if spot <= 0:
+                        logger.debug("option_chain_skip_no_spot", underlying=underlying)
+                        continue
+
+                    # 2. Filter instruments to near-ATM strikes (±10 strikes) to limit quote calls
+                    all_instruments = instruments_by_underlying.get(underlying, [])
+                    if not all_instruments:
+                        continue
+
+                    # Find nearest expiry
+                    from datetime import date as _date
+                    today = _date.today()
+                    expiries: set[str] = set()
+                    for inst in all_instruments:
+                        exp = inst.get("expiry", "")
+                        if exp:
+                            try:
+                                exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
+                                if exp_dt >= today:
+                                    expiries.add(exp)
+                            except (ValueError, TypeError):
+                                pass
+                    if not expiries:
+                        continue
+                    nearest_expiry = min(expiries)
+
+                    expiry_instruments = [
+                        i for i in all_instruments if i.get("expiry") == nearest_expiry
+                    ]
+
+                    # Narrow to ±10 strikes around ATM to keep quote counts small
+                    strikes = sorted(set(i.get("strike", 0) for i in expiry_instruments if i.get("strike", 0) > 0))
+                    if not strikes:
+                        continue
+                    atm_strike = min(strikes, key=lambda s: abs(s - spot))
+                    atm_idx = strikes.index(atm_strike)
+                    lo = max(0, atm_idx - 10)
+                    hi = min(len(strikes), atm_idx + 11)
+                    near_strikes = set(strikes[lo:hi])
+
+                    near_instruments = [
+                        i for i in expiry_instruments if i.get("strike", 0) in near_strikes
+                    ]
+
+                    # 3. Fetch quotes for these instruments
+                    quote_keys = []
+                    for inst in near_instruments:
+                        exch = inst.get("exchange", "NFO")
+                        tsym = inst.get("tradingsymbol", "")
+                        if tsym:
+                            quote_keys.append(f"{exch}:{tsym}")
+
+                    quotes: dict[str, dict[str, Any]] = {}
+                    # Zerodha allows max ~500 instruments per quote call
+                    for batch_start in range(0, len(quote_keys), 400):
+                        batch = quote_keys[batch_start:batch_start + 400]
+                        try:
+                            raw = await self._client.get_quote(batch)
+                            for k, q in raw.items():
+                                quotes[k] = {
+                                    "last_price": q.last_price if hasattr(q, "last_price") else 0,
+                                    "volume": q.volume if hasattr(q, "volume") else 0,
+                                    "oi": q.oi if hasattr(q, "oi") else 0,
+                                }
+                        except Exception as e:
+                            logger.warning("option_chain_quote_batch_error", underlying=underlying, error=str(e))
+
+                    # 4. Build chain
+                    chain = self._chain_builder.build_chain(
+                        underlying=underlying,
+                        spot_price=spot,
+                        instruments=near_instruments,
+                        quotes=quotes,
+                        expiry_filter=nearest_expiry,
+                    )
+
+                    # 5. Feed chain to all option strategies that trade this underlying
+                    for strat in option_strategies:
+                        if strat.params.get("underlying", "NIFTY") == underlying:
+                            strat.update_chain(chain)
+
+                    logger.debug(
+                        "option_chain_refreshed",
+                        underlying=underlying,
+                        expiry=nearest_expiry,
+                        entries=len(chain.entries),
+                        spot=round(spot, 2),
+                        atm_iv=chain.atm_iv,
+                    )
+                except Exception as e:
+                    logger.error("option_chain_refresh_error", underlying=underlying, error=str(e))
+
+            await asyncio.sleep(10)
+
     async def _index_quote_enrichment_loop(self) -> None:
         """Periodically fetch REST quotes for index tokens to enrich volume/buy/sell data.
 
@@ -2642,6 +3080,7 @@ class TradingService:
                 if index_keys:
                     try:
                         quotes = await self._client.get_quote(index_keys)
+                        snap_batch: list[dict] = []
                         for key, q in quotes.items():
                             token = token_for_key.get(key, q.instrument_token)
                             if token in self._live_ticks:
@@ -2667,6 +3106,26 @@ class TradingService:
                                     "buy_qty": q.buy_quantity or 0,
                                     "sell_qty": q.sell_quantity or 0,
                                 }
+                            # Collect for DB snapshot
+                            snap_batch.append({
+                                "instrument_token": token or q.instrument_token,
+                                "ts": str(q.timestamp) if q.timestamp else datetime.now().isoformat(),
+                                "last_price": q.last_price,
+                                "volume": q.volume or 0,
+                                "oi": q.oi or 0,
+                                "buy_quantity": q.buy_quantity or 0,
+                                "sell_quantity": q.sell_quantity or 0,
+                                "open": q.ohlc.open if q.ohlc else 0,
+                                "high": q.ohlc.high if q.ohlc else 0,
+                                "low": q.ohlc.low if q.ohlc else 0,
+                                "close": q.ohlc.close if q.ohlc else 0,
+                                "net_change": q.net_change or 0,
+                            })
+                        if self._data_store and snap_batch:
+                            try:
+                                self._data_store.store_quote_snapshots(snap_batch)
+                            except Exception:
+                                pass
                         logger.debug("index_quote_enrichment_done", count=len(quotes))
                     except Exception as e:
                         logger.warning("index_quote_enrichment_error", error=str(e))
@@ -2681,6 +3140,26 @@ class TradingService:
                 self._risk.update_positions(positions.net)
                 daily_pnl = sum(p.pnl for p in positions.net)
                 self._risk.update_daily_pnl(daily_pnl)
+                # Persist position snapshot to store
+                if self._data_store:
+                    try:
+                        pos_dicts = [
+                            {
+                                "tradingsymbol": p.tradingsymbol,
+                                "exchange": p.exchange,
+                                "product": p.product,
+                                "quantity": p.quantity,
+                                "average_price": p.average_price,
+                                "last_price": p.last_price,
+                                "pnl": p.pnl,
+                                "buy_quantity": p.buy_quantity,
+                                "sell_quantity": p.sell_quantity,
+                            }
+                            for p in positions.net
+                        ]
+                        self._data_store.store_positions(pos_dicts)
+                    except Exception:
+                        pass
                 await self._broadcast_ws({
                     "type": "positions",
                     "data": positions.model_dump(),

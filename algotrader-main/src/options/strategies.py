@@ -75,13 +75,16 @@ class OptionStrategyBase(BaseStrategy):
         metadata: Optional[dict[str, Any]] = None,
     ) -> Signal:
         quantity = self.params["lot_size"] * self.params["lots"]
+        # Use MARKET orders for live-trading safety.  LIMIT orders with stale
+        # last_price from the chain snapshot are rejected by the exchange when
+        # the market moves even slightly between chain-build and order-place.
         return Signal(
             tradingsymbol=contract.tradingsymbol,
             exchange=Exchange(self.params["exchange"]),
             transaction_type=transaction_type,
             quantity=quantity,
-            price=contract.last_price,
-            order_type=OrderType.LIMIT,
+            price=0,
+            order_type=OrderType.MARKET,
             product=ProductType(self.params["product"]),
             strategy_name=self.name,
             confidence=confidence,

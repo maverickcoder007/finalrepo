@@ -502,6 +502,8 @@ async function removeStrategy(name) {
 
 function showModal(id) {
     document.getElementById(id).classList.add('show');
+    // Load tested strategies when opening the add-strategy modal
+    if (id === 'modal-add-strategy') loadTestedStrategies();
 }
 
 function hideModal(id) {
@@ -510,6 +512,7 @@ function hideModal(id) {
 
 async function addStrategy() {
     const name = document.getElementById('strat-select').value;
+    const timeframe = document.getElementById('strat-timeframe').value;
     const paramsStr = document.getElementById('strat-params').value.trim();
     let params = null;
     if (paramsStr) {
@@ -517,12 +520,43 @@ async function addStrategy() {
         catch { showToast('Invalid JSON params', 'error'); return; }
     }
     try {
-        const res = await API.post('/api/strategies/add', { name, params });
-        if (res.error) { showToast(res.error, 'error'); return; }
-        showToast(`Added ${name}`, 'success');
+        const res = await API.post('/api/strategies/add', { name, params, timeframe });
+        if (res.error) {
+            showToast(res.error, 'error');
+            if (res.hint) showToast(res.hint, 'info');
+            return;
+        }
+        showToast(`Added ${name} (${timeframe})`, 'success');
         hideModal('modal-add-strategy');
         loadStatus();
     } catch (e) { showToast(e.message, 'error'); }
+}
+
+// Load tested strategies when modal opens to show eligibility notice
+async function loadTestedStrategies() {
+    try {
+        const res = await API.get('/api/strategies/tested');
+        const notice = document.getElementById('strat-tested-notice');
+        const listEl = document.getElementById('strat-tested-list');
+        if (res.tested && res.tested.length > 0) {
+            notice.style.display = 'block';
+            listEl.textContent = 'Tested: ' + res.tested.join(', ');
+            // Highlight tested options in the dropdown
+            const select = document.getElementById('strat-select');
+            for (const opt of select.options) {
+                if (res.tested.includes(opt.value)) {
+                    opt.textContent = opt.textContent.replace(/ ✓$/, '') + ' ✓';
+                    opt.style.color = '#00d4aa';
+                } else {
+                    opt.textContent = opt.textContent.replace(/ ✓$/, '');
+                    opt.style.color = '';
+                }
+            }
+        } else {
+            notice.style.display = 'block';
+            listEl.textContent = 'No strategies tested yet. Run a backtest or paper trade first.';
+        }
+    } catch (e) { /* silently ignore */ }
 }
 
 let selectedInstruments = new Map();
@@ -758,8 +792,13 @@ async function startLive() {
     selectedInstruments.forEach((name, token) => { names[token] = name; });
     try {
         const res = await API.post('/api/live/start', { tokens, mode, names });
-        if (res.error) { showToast(res.error, 'error'); return; }
-        showToast(`Live trading started with ${tokens.length} instruments`, 'success');
+        if (res.error) {
+            showToast(res.error, 'error');
+            if (res.hint) showToast(res.hint, 'info');
+            return;
+        }
+        const stratCount = (res.strategies || []).length;
+        showToast(`Live trading started with ${tokens.length} instruments and ${stratCount} strategies`, 'success');
         hideModal('modal-start-live');
         loadStatus();
     } catch (e) { showToast(e.message, 'error'); }

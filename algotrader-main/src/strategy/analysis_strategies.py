@@ -123,7 +123,7 @@ class SingleTriggerStrategy(BaseStrategy):
     def _compute_atr_sl(self, data: pd.DataFrame, ltp: float, direction: str) -> float:
         if not self.params.get("use_atr_sl"):
             return 0.0
-        atr_vals = atr(data["high"], data["low"], data["close"])
+        atr_vals = atr(data)
         if atr_vals is None or len(atr_vals) < 1:
             return 0.0
         last_atr = float(atr_vals.iloc[-1])
@@ -150,7 +150,8 @@ class MACDCrossoverStrategy(SingleTriggerStrategy):
         close = data["close"]
         ltp = float(close.iloc[-1])
 
-        macd_line, signal_line, histogram = compute_macd(close)
+        m = compute_macd(close)
+        histogram = m["histogram"]
         if histogram is None or len(histogram) < 2:
             return None
 
@@ -256,13 +257,13 @@ class BollingerBandsStrategy(SingleTriggerStrategy):
         close = data["close"]
         ltp = float(close.iloc[-1])
 
-        upper, middle, lower = bollinger_bands(close)
+        bb = bollinger_bands(close)
         bw = bollinger_bandwidth(close)
-        if upper is None or lower is None:
+        if bb is None:
             return None
 
-        u = float(upper.iloc[-1])
-        l_ = float(lower.iloc[-1])
+        u = float(bb["upper"].iloc[-1])
+        l_ = float(bb["lower"].iloc[-1])
         squeeze = self.params.get("squeeze_threshold", 5.0)
 
         # Below lower band → BUY
@@ -298,7 +299,8 @@ class StochasticStrategy(SingleTriggerStrategy):
         close = data["close"]
         ltp = float(close.iloc[-1])
 
-        k, d = stochastic(data["high"], data["low"], close)
+        stoch = stochastic(data)
+        k, d = stoch["k"], stoch["d"]
         if k is None or d is None or len(k) < 1:
             return None
 
@@ -335,7 +337,7 @@ class IchimokuStrategy(SingleTriggerStrategy):
         ltp = float(close.iloc[-1])
 
         try:
-            ichi = ichimoku(data["high"], data["low"], close)
+            ichi = ichimoku(data)
             if ichi is None:
                 return None
             span_a = float(ichi["senkou_a"].iloc[-1]) if "senkou_a" in ichi else None
@@ -376,7 +378,7 @@ class VCPStrategy(SingleTriggerStrategy):
         ltp = float(close.iloc[-1])
 
         try:
-            vcp = detect_vcp(data, lookback=60)
+            vcp = detect_vcp(data)
             if vcp and vcp.get("detected"):
                 sl = self._compute_atr_sl(data, ltp, "BUY")
                 confidence = min(90.0, 50.0 + vcp.get("tightness", 0) * 10)
@@ -403,8 +405,8 @@ class PocketPivotStrategy(SingleTriggerStrategy):
         ltp = float(close.iloc[-1])
 
         try:
-            pp = detect_pocket_pivot(data)
-            if pp and pp.get("detected"):
+            detected = detect_pocket_pivot(data)
+            if detected:
                 sl = self._compute_atr_sl(data, ltp, "BUY")
                 return self._make_signal(instrument_token, ltp, "BUY", 75.0, "pocket_pivot", sl)
         except Exception:
@@ -506,7 +508,7 @@ class MFIStrategy(SingleTriggerStrategy):
         close = data["close"]
         ltp = float(close.iloc[-1])
 
-        mfi_vals = compute_mfi(data["high"], data["low"], close, data["volume"])
+        mfi_vals = compute_mfi(data)
         if mfi_vals is None or len(mfi_vals) < 1:
             return None
 

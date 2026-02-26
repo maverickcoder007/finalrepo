@@ -737,7 +737,17 @@ class FnOBacktestEngine:
             # Get current price
             exit_price = leg.current_price
             if exit_price <= 0:
-                exit_price = max(0.05, leg.entry_price * 0.1)
+                # Use intrinsic value as realistic floor, not arbitrary
+                # fraction of entry price (which gifted free profit to
+                # short legs).
+                if leg.contract.strike is not None:
+                    if leg.contract.is_call:
+                        intrinsic = max(0.0, spot - leg.contract.strike)
+                    else:
+                        intrinsic = max(0.0, leg.contract.strike - spot)
+                else:
+                    intrinsic = 0.0
+                exit_price = max(0.05, intrinsic)
 
             # Calculate P&L
             if leg.quantity > 0:
@@ -867,6 +877,19 @@ class FnOBacktestEngine:
 
         total_pnl = round(total_wins - total_losses, 2)
 
+        # ── Expectancy (the single most important metric) ──
+        wr_frac = win_rate / 100.0
+        expectancy = (wr_frac * avg_win) - ((1 - wr_frac) * abs(avg_loss)) if total_trades else 0
+
+        # ── Synthetic-backtest sanity flags ──
+        warnings: list[str] = []
+        if total_trades > 0 and total_trades < 15:
+            warnings.append("low_trade_count")
+        if win_rate > 85:
+            warnings.append("win_rate_suspiciously_high")
+        if profit_factor > 5:
+            warnings.append("profit_factor_suspiciously_high")
+
         return {
             "total_trades": total_trades,
             "winning_trades": len(wins),
@@ -874,11 +897,13 @@ class FnOBacktestEngine:
             "win_rate": round(win_rate, 2),
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
+            "expectancy": round(expectancy, 2),
             "profit_factor": round(profit_factor, 2),
             "total_pnl": total_pnl,
             "max_drawdown_pct": round(max_dd_pct, 2),
             "sharpe_ratio": round(sharpe, 4),
             "sortino_ratio": round(sortino, 4),
+            "backtest_warnings": warnings,
         }
 
     @staticmethod

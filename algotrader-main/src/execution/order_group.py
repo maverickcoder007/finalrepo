@@ -81,10 +81,11 @@ class MultiLegOrderGroup:
         
         # All legs must be filled for group to be valid
         all_filled = all(validation.values())
+        any_partial = any(leg.filled_quantity > 0 for leg in self.legs)
         
         if all_filled:
             self.status = OrderGroupStatus.COMPLETE
-        elif any(validation.values()):
+        elif any_partial:
             self.status = OrderGroupStatus.PARTIAL
         else:
             self.status = OrderGroupStatus.FAILED

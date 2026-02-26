@@ -317,7 +317,47 @@ async def add_strategy(request: Request) -> dict[str, Any]:
     body = await request.json()
     name = body.get("name", "")
     params = body.get("params")
-    return get_user_service(request).add_strategy(name, params)
+    timeframe = body.get("timeframe", "5minute")
+    require_tested = body.get("require_tested", True)
+    return await get_user_service(request).add_strategy(
+        name, params, timeframe=timeframe, require_tested=require_tested,
+    )
+
+
+@app.get("/api/strategies/tested")
+async def get_tested_strategies(request: Request) -> dict[str, Any]:
+    """Return strategies that have been backtested/paper-traded and are eligible for live."""
+    svc = get_user_service(request)
+    return {"tested": sorted(svc._tested_strategies)}
+
+
+# ─── Market Data Cache Endpoints ────────────────────────────────
+
+@app.get("/api/cache/stats")
+async def get_cache_stats(request: Request) -> dict[str, Any]:
+    """Return market data cache statistics."""
+    svc = get_user_service(request)
+    return svc._data_store.get_cache_stats()
+
+
+@app.post("/api/cache/purge")
+async def purge_cache(request: Request) -> dict[str, Any]:
+    """Purge old candle data. Body: {days_to_keep: int (default 730)}."""
+    svc = get_user_service(request)
+    body = await request.json()
+    days = body.get("days_to_keep", 730)
+    deleted = svc._data_store.purge_old_candles(days_to_keep=days)
+    return {"deleted_bars": deleted, "days_kept": days}
+
+
+@app.get("/api/cache/candle-range")
+async def get_cached_candle_range(
+    request: Request, token: int = 0, interval: str = "day"
+) -> dict[str, Any]:
+    """Get cached date range for a token+interval."""
+    svc = get_user_service(request)
+    min_ts, max_ts = svc._data_store.get_cached_date_range(token, interval)
+    return {"instrument_token": token, "interval": interval, "from": min_ts, "to": max_ts}
 
 
 @app.post("/api/strategies/remove")
@@ -673,6 +713,7 @@ async def run_paper_trade_sample(request: Request) -> dict[str, Any]:
             capital=body.get("capital", 100000),
             interval=body.get("interval", "5minute"),
             strategy_params=body.get("strategy_params"),
+            allow_synthetic=body.get("allow_synthetic", False),
         )
     except Exception as e:
         logger.error("paper_trade_sample_error", error=str(e))
@@ -1114,6 +1155,7 @@ async def run_backtest_sample(request: Request) -> dict[str, Any]:
             capital_fraction=body.get("capital_fraction", 0.10),
             interval=body.get("interval", "day"),
             strategy_params=body.get("strategy_params"),
+            allow_synthetic=body.get("allow_synthetic", False),
         )
         return result
     except Exception as e:
@@ -1183,6 +1225,7 @@ async def run_fno_backtest_sample(request: Request) -> dict[str, Any]:
             profit_target_pct=float(body.get("profit_target_pct", 50)),
             stop_loss_pct=float(body.get("stop_loss_pct", 100)),
             delta_target=float(body.get("delta_target", 0.16)),
+            allow_synthetic=body.get("allow_synthetic", False),
         )
     except Exception as e:
         logger.error("fno_backtest_sample_error", error=str(e), strategy=body.get("strategy"))
@@ -1230,6 +1273,7 @@ async def run_fno_paper_trade_sample(request: Request) -> dict[str, Any]:
             profit_target_pct=float(body.get("profit_target_pct", 50)),
             stop_loss_pct=float(body.get("stop_loss_pct", 100)),
             delta_target=float(body.get("delta_target", 0.16)),
+            allow_synthetic=body.get("allow_synthetic", False),
         )
     except Exception as e:
         logger.error("fno_paper_trade_sample_error", error=str(e), strategy=body.get("strategy"))

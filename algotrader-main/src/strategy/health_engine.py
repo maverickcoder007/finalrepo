@@ -460,6 +460,19 @@ def _compute_profitability(result: dict, th: dict) -> PillarResult:
         p.notes.append("Profit factor >3 may indicate overfitting")
         pf_score = min(pf_score, 75)
 
+    # Synthetic backtest sanity flags (from fno_backtest engine)
+    bt_warnings = result.get("backtest_warnings", [])
+    if "win_rate_suspiciously_high" in bt_warnings:
+        p.notes.append("Win rate >85% flagged — verify with realistic data")
+        exp_score = min(exp_score, 60)
+        pf_score = min(pf_score, 60)
+    if "low_trade_count" in bt_warnings:
+        p.notes.append("Low trade count (<15) — results statistically unreliable")
+        exp_score = min(exp_score, 50)
+    if "profit_factor_suspiciously_high" in bt_warnings:
+        p.notes.append("Profit factor >5 flagged — likely synthetic data artifact")
+        pf_score = min(pf_score, 50)
+
     # Sharpe
     sharpe = result.get("sharpe_ratio", 0)
     p.metrics["sharpe_ratio"] = round(sharpe, 4)
