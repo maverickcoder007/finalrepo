@@ -291,6 +291,7 @@ tr:hover td { background: var(--bg-hover); }
 
 .type-equity { background: rgba(29, 161, 242, 0.15); color: var(--accent-blue); }
 .type-option { background: rgba(124, 77, 255, 0.15); color: var(--accent-purple); }
+.type-custom { background: rgba(255, 145, 0, 0.15); color: #ff9100; }
 
 .strategy-actions { display: flex; gap: 6px; }
 

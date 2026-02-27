@@ -158,6 +158,7 @@ async def api_status(request: Request, full: bool = False) -> dict[str, Any]:
         "running": svc.is_running,
         "zerodha_id": svc.zerodha_id,
         "strategies": svc.get_strategies_info(),
+        "custom_strategies": svc.list_custom_strategies(),
         "risk": svc.get_risk_summary(),
         "journal": svc.get_journal_summary(),
         "execution": svc.get_execution_summary(),

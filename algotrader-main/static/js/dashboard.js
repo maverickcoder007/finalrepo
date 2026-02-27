@@ -300,23 +300,60 @@ function updateStrategiesList(strategies) {
         el.innerHTML = '<div class="empty-state"><p>No strategies added</p></div>';
         return;
     }
-    el.innerHTML = strategies.map(s => `
-        <div class="strategy-card">
-            <div class="strategy-info">
-                <h4>${s.name}</h4>
-                <span class="type-tag type-${s.type}">${s.type}</span>
-                <span style="margin-left:8px;color:${s.is_active ? 'var(--accent-green)' : 'var(--accent-red)'}">
-                    ${s.is_active ? 'Active' : 'Paused'}
-                </span>
+
+    const activeStrats = strategies.filter(s => s.source !== 'custom_builder');
+    const customStrats = strategies.filter(s => s.source === 'custom_builder');
+
+    let html = '';
+
+    // Active / running strategies
+    if (activeStrats.length > 0) {
+        html += activeStrats.map(s => `
+            <div class="strategy-card">
+                <div class="strategy-info">
+                    <h4>${s.name}</h4>
+                    <span class="type-tag type-${s.type}">${s.type}</span>
+                    <span style="margin-left:8px;color:${s.is_active ? 'var(--accent-green)' : 'var(--accent-red)'}">
+                        ${s.is_active ? 'Active' : 'Paused'}
+                    </span>
+                </div>
+                <div class="strategy-actions">
+                    <button class="btn btn-sm btn-outline" onclick="toggleStrategy('${s.name}')">
+                        ${s.is_active ? 'Pause' : 'Resume'}
+                    </button>
+                    <button class="btn btn-sm btn-danger" onclick="removeStrategy('${s.name}')">Remove</button>
+                </div>
             </div>
-            <div class="strategy-actions">
-                <button class="btn btn-sm btn-outline" onclick="toggleStrategy('${s.name}')">
-                    ${s.is_active ? 'Pause' : 'Resume'}
-                </button>
-                <button class="btn btn-sm btn-danger" onclick="removeStrategy('${s.name}')">Remove</button>
+        `).join('');
+    }
+
+    // Custom strategies from builder (available but not added for live)
+    if (customStrats.length > 0) {
+        html += '<div style="margin-top:12px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08)">';
+        html += '<div style="color:var(--text-muted);font-size:11px;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Custom Strategies (Builder)</div>';
+        html += customStrats.map(s => `
+            <div class="strategy-card" style="opacity:0.85">
+                <div class="strategy-info">
+                    <h4>${s.name}</h4>
+                    <span class="type-tag type-custom">custom</span>
+                    <span style="margin-left:8px;color:var(--text-muted);font-size:11px">
+                        ${s.description || ''} &bull; ${s.entry_rules || 0} entry, ${s.exit_rules || 0} exit rules
+                    </span>
+                </div>
+                <div class="strategy-actions">
+                    <button class="btn btn-sm btn-outline" onclick="backtestCustomStrategy('${s.name}')">Backtest</button>
+                    <button class="btn btn-sm btn-outline" onclick="paperTradeCustom('${s.name}')">Paper Trade</button>
+                </div>
             </div>
-        </div>
-    `).join('');
+        `).join('');
+        html += '</div>';
+    }
+
+    if (!html) {
+        el.innerHTML = '<div class="empty-state"><p>No strategies added</p></div>';
+    } else {
+        el.innerHTML = html;
+    }
 }
 
 function updateRiskPanel(risk) {
@@ -3081,7 +3118,7 @@ async function loadCustomStrategiesDropdowns() {
     try {
         const strategies = await API.get('/api/strategy-builder/list');
         const html = (strategies || []).map(s =>
-            `<option value="${s.name}">${s.name}</option>`
+            `<option value="${s.name}">${s.name} — ${s.description || 'Custom'}</option>`
         ).join('');
         // Paper trading dropdown
         const paperGroup = document.getElementById('paper-custom-strategies');
@@ -3092,7 +3129,10 @@ async function loadCustomStrategiesDropdowns() {
         // Add strategy modal dropdown
         const modalGroup = document.getElementById('modal-custom-strategies');
         if (modalGroup) modalGroup.innerHTML = html;
-    } catch (e) {}
+        console.log('Custom strategies loaded into dropdowns:', (strategies || []).length);
+    } catch (e) {
+        console.error('Failed to load custom strategies into dropdowns:', e);
+    }
 }
 
 async function deleteCustomStrategy(name) {
@@ -3112,6 +3152,12 @@ async function paperTradeCustom(name) {
     switchTab('paper-trading');
     document.getElementById('paper-strategy').value = name;
     await runPaperTradeSample();
+}
+
+async function backtestCustomStrategy(name) {
+    // Switch to backtest tab and set strategy
+    switchTab('backtesting');
+    document.getElementById('bt-strategy').value = name;
 }
 
 function showBuilderStatus(msg, isError) {
@@ -3375,7 +3421,9 @@ async function loadFnOCustomStrategiesList() {
                 </div>
             </div>
         `).join('');
-    } catch (e) {}
+    } catch (e) {
+        console.error('Failed to load F&O custom strategies list', e);
+    }
 }
 
 async function loadFnOCustomStrategiesDropdowns() {
@@ -3388,7 +3436,9 @@ async function loadFnOCustomStrategiesDropdowns() {
             const el = document.getElementById(id);
             if (el) el.innerHTML = html;
         });
-    } catch (e) {}
+    } catch (e) {
+        console.error('Failed to load F&O custom strategies dropdowns', e);
+    }
 }
 
 async function loadFnOBuilderStrategy(name) {

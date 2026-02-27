@@ -81,13 +81,21 @@ class TradingService:
     _instance: Optional[TradingService] = None
 
     def __init__(self, api_key: str = "", api_secret: str = "", zerodha_id: str = "") -> None:
+        import os
         self._settings = get_settings()
         self._zerodha_id = zerodha_id
         self._auth = KiteAuthenticator(api_key=api_key, api_secret=api_secret, zerodha_id=zerodha_id)
         self._client = KiteClient(self._auth)
         self._ticker = KiteTicker(self._auth)
         self._risk = RiskManager()
-        
+
+        # ── DB initialization: create files if missing ──
+        os.makedirs("data", exist_ok=True)
+        db_files = ["data/journal.db", "data/market_data.db"]
+        for db_file in db_files:
+            if not os.path.exists(db_file):
+                open(db_file, "a").close()
+
         # Pre-flight checker: consolidated gate before any order
         self._preflight = PreflightChecker(
             client=self._client,
@@ -97,13 +105,13 @@ class TradingService:
             config=PreflightConfig(),
         )
         set_preflight_checker(self._preflight)
-        
+
         self._execution = ExecutionEngine(self._client, self._risk, preflight=self._preflight)
         self._journal = TradeJournal()
         self._journal_store = JournalStore(db_path="data/journal.db")
         self._journal_analytics = JournalAnalytics(self._journal_store)
         self._portfolio_health = PortfolioHealthTracker(self._journal_store)
-        
+
         # Wire execution engine → journal callbacks
         self._execution.set_on_fill_callback(self._on_execution_fill)
         self._execution.set_on_exit_callback(self._on_execution_exit)
@@ -404,15 +412,67 @@ class TradingService:
         return self._signal_log[-limit:]
 
     def get_strategies_info(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": s.name,
-                "is_active": s.is_active,
-                "params": s.params,
-                "type": "option" if isinstance(s, OptionStrategyBase) else "equity",
+        from src.strategy.analysis_strategies import ANALYSIS_STRATEGIES
+        # Build full strategy map
+        strategy_map = {
+            "ema_crossover": EMACrossoverStrategy,
+            "vwap_breakout": VWAPBreakoutStrategy,
+            "mean_reversion": MeanReversionStrategy,
+            "rsi": RSIStrategy,
+            "rsi_strategy": RSIStrategy,
+            "scanner_strategy": ScannerStrategy,
+            "iron_condor": IronCondorStrategy,
+            "straddle_strangle": StraddleStrangleStrategy,
+            "bull_call_spread": BullCallSpreadStrategy,
+            "bear_put_spread": BearPutSpreadStrategy,
+            "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+            "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
+        }
+        strategy_map.update(ANALYSIS_STRATEGIES)
+
+        # Active/running strategies
+        # Only mark as active if added for live trading (not backtest)
+        active_names = {s.name for s in self._strategies if getattr(s, 'is_live', True)}
+        active = {s.name: s for s in self._strategies if getattr(s, 'is_live', True)}
+
+        # Health report cache
+        health = self.get_last_health_report() or {}
+        tested = self._tested_strategies
+
+        # List all available strategies
+        all_strats = []
+        for name, cls in strategy_map.items():
+            strat_info = {
+                "name": name,
+                "is_active": name in active_names,
+                "params": active[name].params if name in active else {},
+                "type": "option" if issubclass(cls, OptionStrategyBase) else "equity",
+                "source": "builtin",
+                "tested": name in tested,
+                "health_score": health.get("overall_score") if health.get("strategy_name") == name else None,
+                "execution_ready": health.get("execution_ready") if health.get("strategy_name") == name else None,
             }
-            for s in self._strategies
-        ]
+            all_strats.append(strat_info)
+
+        # Custom strategies from builder
+        for cs in self._custom_store.list_strategies():
+            name = cs["name"]
+            strat_info = {
+                "name": name,
+                "is_active": name in active_names,
+                "params": active[name].params if name in active else {},
+                "type": "custom",
+                "source": "custom_builder",
+                "description": cs.get("description", ""),
+                "entry_rules": cs.get("entry_rules", 0),
+                "exit_rules": cs.get("exit_rules", 0),
+                "tested": name in tested,
+                "health_score": health.get("overall_score") if health.get("strategy_name") == name else None,
+                "execution_ready": health.get("execution_ready") if health.get("strategy_name") == name else None,
+            }
+            all_strats.append(strat_info)
+
+        return all_strats
 
     def get_execution_summary(self) -> dict[str, Any]:
         return self._execution.get_execution_summary()
@@ -902,13 +962,24 @@ class TradingService:
                 "valid_timeframes": self.VALID_TIMEFRAMES,
             }
 
-        # ── Backtest / paper-trade gate ─────────────────────────
-        if require_tested and name not in self._tested_strategies:
-            return {
-                "error": f"Strategy '{name}' has not been backtested or paper-traded yet.",
-                "hint": "Run a backtest or paper trade for this strategy first, then add it for live trading.",
-                "tested_strategies": sorted(self._tested_strategies),
-            }
+
+        # ── Backtest / paper-trade + health benchmark gate ───────────────
+        if require_tested:
+            if name not in self._tested_strategies:
+                return {
+                    "error": f"Strategy '{name}' has not been backtested or paper-traded yet.",
+                    "hint": "Run a backtest or paper trade for this strategy first, then add it for live trading.",
+                    "tested_strategies": sorted(self._tested_strategies),
+                }
+            # Enforce health benchmark: must have execution_ready==True (score >= 60)
+            health = self.get_last_health_report()
+            if not health or not health.get("execution_ready", False):
+                score = health.get("overall_score") if health else None
+                return {
+                    "error": f"Strategy '{name}' does not meet the minimum health benchmark (score >= 60 required).",
+                    "score": score,
+                    "hint": "Improve backtest/paper-trade results until health score is at least 60.",
+                }
 
         strategy_map = {
             "ema_crossover": EMACrossoverStrategy,
@@ -941,6 +1012,8 @@ class TradingService:
         strategy.set_timeframe(timeframe)
         logger.info("strategy_timeframe_set", name=name, timeframe=timeframe)
 
+        # Mark as live strategy (for UI tracking/removal)
+        setattr(strategy, "is_live", True)
         self._strategies.append(strategy)
         logger.info("strategy_added", name=name, timeframe=timeframe)
 
