@@ -283,6 +283,7 @@ class FnOPaperTradingEngine:
             spot = float(bar["close"])
             bar_date = self._parse_date(df, i)
             bar_time = _bar_ts(i)
+            logger.info(f"[PAPER BAR] bar={i} date={bar_date} spot={spot}")
 
             # 1. Classify regime
             regime = self._regime_engine.classify(closes[:i + 1])
@@ -312,6 +313,7 @@ class FnOPaperTradingEngine:
             for pos in self.open_positions:
                 events = self._expiry_engine.process_expiry(pos, spot, bar_date)
                 for evt in events:
+                    logger.info(f"[PAPER EXPIRY] position_id={pos.position_id} structure={pos.structure.value} event={evt.event_type.value} pnl={evt.pnl} spot={spot} date={bar_date}")
                     self._capital += evt.pnl
                     self._orders.append(FnOPaperOrder(
                         order_id=f"EXP_{uuid.uuid4().hex[:8]}",
@@ -370,9 +372,11 @@ class FnOPaperTradingEngine:
                 if max_profit > 0 and current_pnl >= max_profit * (self.profit_target_pct / 100):
                     should_close = True
                     reason = "profit_target"
+                    logger.info(f"[PAPER PROFIT TARGET] position_id={pos.position_id} structure={pos.structure.value} pnl={current_pnl} bar={i} date={bar_date}")
                 elif max_loss > 0 and current_pnl <= -max_loss * (self.stop_loss_pct / 100):
                     should_close = True
                     reason = "stop_loss"
+                    logger.warning(f"[PAPER STOP LOSS] position_id={pos.position_id} structure={pos.structure.value} pnl={current_pnl} bar={i} date={bar_date}")
 
                 if should_close:
                     pnl, costs = self._close_position(pos, bar_time, reason)
@@ -383,6 +387,7 @@ class FnOPaperTradingEngine:
             if len(self.open_positions) < self.max_positions and chain.dte >= self.entry_dte_min:
                 new_pos, entry_costs = self._open_position(chain, spot, bar_time, bar_date)
                 if new_pos is not None:
+                    logger.info(f"[PAPER ENTRY] position_id={new_pos.position_id} structure={self.structure_type.value} spot={spot} bar={i} date={bar_date}")
                     self._positions.append(new_pos)
                     self._capital -= entry_costs
                     total_costs += entry_costs
@@ -410,6 +415,7 @@ class FnOPaperTradingEngine:
         final_spot = float(df.iloc[-1]["close"])
         final_time = _bar_ts(len(df) - 1)
         for pos in self.open_positions:
+            logger.warning(f"[PAPER FINAL EXIT] position_id={pos.position_id} structure={pos.structure.value} bar={len(df) - 1} date={final_time}")
             pnl, costs = self._close_position(pos, final_time, "session_end")
             self._capital += pnl - costs
             total_costs += costs

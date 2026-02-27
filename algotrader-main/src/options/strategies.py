@@ -425,6 +425,7 @@ class StraddleStrangleStrategy(OptionStrategyBase):
             profit_target = total_premium * (self.params["profit_target_pct"] / 100)
             max_profit = float("inf")
         
+        stop_loss = round(0.3 * max_loss, 2)
         meta = {
             "strategy_type": self.params["mode"],
             "direction": self.params["direction"],
@@ -436,6 +437,7 @@ class StraddleStrangleStrategy(OptionStrategyBase):
             "pe_strike": pe.strike,
             "spot_price": chain.spot_price,
             "atm_iv": chain.atm_iv,
+            "stop_loss": stop_loss,
         }
 
         signals = [
@@ -529,6 +531,7 @@ class BullCallSpreadStrategy(OptionStrategyBase):
         if risk_reward < self.params["min_risk_reward"]:
             return []
 
+        stop_loss = round(0.3 * max_profit, 2)
         meta = {
             "strategy_type": "bull_call_spread",
             "net_debit": round(net_debit, 2),
@@ -538,6 +541,7 @@ class BullCallSpreadStrategy(OptionStrategyBase):
             "buy_strike": buy_ce.strike,
             "sell_strike": sell_ce.strike,
             "spot_price": chain.spot_price,
+            "stop_loss": stop_loss,
         }
 
         signals = [

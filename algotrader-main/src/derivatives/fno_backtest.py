@@ -169,11 +169,7 @@ class FnOBacktestEngine:
         )
 
         logger.info(
-            "fno_backtest_start",
-            strategy=self.strategy_name,
-            underlying=self.underlying,
-            bars=len(df),
-            capital=capital,
+            f"[FNO BACKTEST START] strategy={self.strategy_name} underlying={self.underlying} bars={len(df)} capital={capital}"
         )
 
         for i in range(max(5, min(21, len(df) // 10)), len(df)):
@@ -218,6 +214,7 @@ class FnOBacktestEngine:
                     timestamp=datetime.combine(bar_date, datetime.min.time()),
                 )
                 for evt in events:
+                    logger.info(f"[EXPIRY] position_id={pos.position_id} structure={pos.structure.value} event={evt.event_type.value} pnl={evt.pnl} spot={spot} date={bar_date}")
                     trades.append({
                         "type": "EXPIRY",
                         "structure": pos.structure.value,
@@ -271,6 +268,7 @@ class FnOBacktestEngine:
 
                 # Profit target
                 if max_profit > 0 and current_pnl >= max_profit * (self.profit_target_pct / 100):
+                    logger.info(f"[PROFIT TARGET] position_id={pos.position_id} structure={pos.structure.value} pnl={current_pnl} bar={i} date={bar_date}")
                     exit_pnl, exit_costs = self._close_position(pos, chain, spot, i, bar_date)
                     capital += exit_pnl - exit_costs
                     total_costs += exit_costs
@@ -292,6 +290,7 @@ class FnOBacktestEngine:
 
                 # Stop loss
                 elif max_loss > 0 and current_pnl <= -max_loss * (self.stop_loss_pct / 100):
+                    logger.warning(f"[STOP LOSS] position_id={pos.position_id} structure={pos.structure.value} pnl={current_pnl} bar={i} date={bar_date}")
                     exit_pnl, exit_costs = self._close_position(pos, chain, spot, i, bar_date)
                     capital += exit_pnl - exit_costs
                     total_costs += exit_costs
@@ -328,6 +327,7 @@ class FnOBacktestEngine:
                         chain, spot, capital, i, bar_date, position_counter
                     )
                     if new_pos is not None:
+                        logger.info(f"[ENTRY] position_id={new_pos.position_id} structure={self.structure_type.value} spot={spot} bar={i} date={bar_date}")
                         positions.append(new_pos)
                         position_counter += 1
                         capital -= entry_costs
@@ -378,6 +378,7 @@ class FnOBacktestEngine:
         for pos in positions:
             if pos.is_closed:
                 continue
+            logger.warning(f"[FINAL EXIT] position_id={pos.position_id} structure={pos.structure.value} bar={len(df) - 1} date={final_date}")
             exit_pnl, exit_costs = self._close_position(
                 pos, None, final_spot, len(df) - 1, final_date
             )

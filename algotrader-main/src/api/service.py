@@ -413,7 +413,7 @@ class TradingService:
 
     def get_strategies_info(self) -> list[dict[str, Any]]:
         from src.strategy.analysis_strategies import ANALYSIS_STRATEGIES
-        # Build full strategy map
+        # Build full strategy map (equity/options)
         strategy_map = {
             "ema_crossover": EMACrossoverStrategy,
             "vwap_breakout": VWAPBreakoutStrategy,
@@ -431,7 +431,6 @@ class TradingService:
         strategy_map.update(ANALYSIS_STRATEGIES)
 
         # Active/running strategies
-        # Only mark as active if added for live trading (not backtest)
         active_names = {s.name for s in self._strategies if getattr(s, 'is_live', True)}
         active = {s.name: s for s in self._strategies if getattr(s, 'is_live', True)}
 
@@ -439,8 +438,8 @@ class TradingService:
         health = self.get_last_health_report() or {}
         tested = self._tested_strategies
 
-        # List all available strategies
         all_strats = []
+        # Equity/options strategies
         for name, cls in strategy_map.items():
             strat_info = {
                 "name": name,
@@ -466,6 +465,37 @@ class TradingService:
                 "description": cs.get("description", ""),
                 "entry_rules": cs.get("entry_rules", 0),
                 "exit_rules": cs.get("exit_rules", 0),
+                "tested": name in tested,
+                "health_score": health.get("overall_score") if health.get("strategy_name") == name else None,
+                "execution_ready": health.get("execution_ready") if health.get("strategy_name") == name else None,
+            }
+            all_strats.append(strat_info)
+
+        # FNO strategies (built-in)
+        for fname in self.FNO_STRATEGIES:
+            strat_info = {
+                "name": fname,
+                "is_active": fname in active_names,
+                "params": active[fname].params if fname in active else {},
+                "type": "fno",
+                "source": "fno_builtin",
+                "tested": fname in tested,
+                "health_score": health.get("overall_score") if health.get("strategy_name") == fname else None,
+                "execution_ready": health.get("execution_ready") if health.get("strategy_name") == fname else None,
+            }
+            all_strats.append(strat_info)
+
+        # Custom FNO builder strategies
+        for fno_cs in self._fno_strategy_store.list_all():
+            name = fno_cs.get("name", "")
+            strat_info = {
+                "name": name,
+                "is_active": name in active_names,
+                "params": active[name].params if name in active else {},
+                "type": "fno",
+                "source": "fno_custom_builder",
+                "description": fno_cs.get("description", ""),
+                "legs": fno_cs.get("legs", []),
                 "tested": name in tested,
                 "health_score": health.get("overall_score") if health.get("strategy_name") == name else None,
                 "execution_ready": health.get("execution_ready") if health.get("strategy_name") == name else None,

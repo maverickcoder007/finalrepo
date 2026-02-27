@@ -140,6 +140,7 @@ class BullCallCreditSpreadStrategy(OptionStrategyBase):
 
         profit_target = net_credit * (self.params["profit_target_pct"] / 100)
 
+        stop_loss = round(0.3 * max_loss, 2)
         meta = {
             "strategy_type": "bull_call_credit_spread",
             "net_credit": round(net_credit, 2),
@@ -150,6 +151,7 @@ class BullCallCreditSpreadStrategy(OptionStrategyBase):
             "long_call_strike": long_call.strike,
             "spot_price": chain.spot_price,
             "atm_iv": chain.atm_iv,
+            "stop_loss": stop_loss,
         }
 
         signals = [
@@ -313,6 +315,7 @@ class BearPutCreditSpreadStrategy(OptionStrategyBase):
 
         profit_target = net_credit * (self.params["profit_target_pct"] / 100)
 
+        stop_loss = round(0.3 * max_loss, 2)
         meta = {
             "strategy_type": "bear_put_credit_spread",
             "net_credit": round(net_credit, 2),
@@ -323,6 +326,7 @@ class BearPutCreditSpreadStrategy(OptionStrategyBase):
             "long_put_strike": long_put.strike,
             "spot_price": chain.spot_price,
             "atm_iv": chain.atm_iv,
+            "stop_loss": stop_loss,
         }
 
         signals = [
