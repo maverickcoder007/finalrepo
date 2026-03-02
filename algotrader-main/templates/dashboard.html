@@ -1205,6 +1205,8 @@
                                 <option value="fno_bear_put_spread">Bear Put Spread</option>
                                 <option value="fno_bull_put_spread">Bull Put Spread</option>
                                 <option value="fno_bear_call_spread">Bear Call Spread</option>
+                                <option value="fno_call_credit_spread_runner">Call Credit Spread Runner</option>
+                                <option value="fno_put_credit_spread_runner">Put Credit Spread Runner</option>
                                 <option value="fno_straddle">Long Straddle</option>
                                 <option value="fno_short_straddle">Short Straddle</option>
                                 <option value="fno_strangle">Long Strangle</option>
@@ -1227,7 +1229,12 @@
                             <label>Symbol</label>
                             <div style="display:flex;gap:6px">
                                 <input id="bt-symbol" type="text" placeholder="e.g. RELIANCE" value="RELIANCE" style="flex:1">
-                                <select id="bt-exchange" style="width:80px"><option value="NSE">NSE</option></select>
+                                <select id="bt-exchange" style="width:100px" onchange="onBtExchangeChange()">
+                                    <option value="NSE" selected>NSE</option>
+                                    <option value="BSE">BSE</option>
+                                    <option value="NFO">NFO (NIFTY)</option>
+                                    <option value="BFO">BFO (SENSEX)</option>
+                                </select>
                             </div>
                         </div>
                         <div class="grid grid-2" style="margin-bottom:0">
@@ -1251,11 +1258,8 @@
                         <div class="form-group">
                             <label>Underlying</label>
                             <select id="bt-underlying">
-                                <option value="NIFTY">NIFTY 50</option>
-                                <option value="BANKNIFTY">BANK NIFTY</option>
-                                <option value="FINNIFTY">FIN NIFTY</option>
-                                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
-                                <option value="SENSEX">SENSEX</option>
+                                <option value="NIFTY">NIFTY (NFO)</option>
+                                <option value="SENSEX">SENSEX (BFO)</option>
                             </select>
                         </div>
                         <div class="grid grid-2" style="margin-bottom:0">
@@ -1289,6 +1293,55 @@
                     <div class="card-title">Backtest Summary</div>
                     <div id="bt-summary" style="color:var(--text-muted);font-size:13px">Run a backtest to see results</div>
                 </div>
+            </div>
+            <!-- F&O Data Management Card -->
+            <div class="card" style="margin-bottom:16px">
+                <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+                    <span>F&O Data Management</span>
+                    <span id="fno-data-status" style="font-size:12px;color:var(--text-muted)"></span>
+                </div>
+                <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">
+                    Download F&O historical data from Kite Connect for offline backtesting. Once downloaded, backtests will use real market data instead of synthetic chains.
+                </p>
+                <div class="grid grid-2" style="margin-bottom:12px">
+                    <div class="form-group">
+                        <label>Underlying</label>
+                        <select id="fno-data-underlying">
+                            <option value="NIFTY">NIFTY (NFO)</option>
+                            <option value="SENSEX">SENSEX (BFO)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Interval</label>
+                        <select id="fno-data-interval">
+                            <option value="minute">1 Minute</option>
+                            <option value="5minute">5 Minute</option>
+                            <option value="15minute">15 Minute</option>
+                            <option value="day" selected>Daily</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="grid grid-2" style="margin-bottom:12px">
+                    <div class="form-group">
+                        <label>From Date</label>
+                        <input type="date" id="fno-data-from" value="">
+                    </div>
+                    <div class="form-group">
+                        <label>To Date</label>
+                        <input type="date" id="fno-data-to" value="">
+                    </div>
+                </div>
+                <div class="form-group" style="margin-bottom:12px">
+                    <label style="display:flex;align-items:center;gap:6px">
+                        <input type="checkbox" id="fno-data-options" checked> Include Option Chain Snapshots
+                    </label>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-primary" onclick="fetchFnOData()" id="btn-fetch-fno">Download F&O Data</button>
+                    <button class="btn btn-outline" onclick="takeFnOSnapshot()">Take Snapshot Now</button>
+                    <button class="btn btn-sm" onclick="loadFnODataStats()">Refresh Stats</button>
+                </div>
+                <div id="fno-data-coverage" style="margin-top:12px;font-size:12px;color:var(--text-muted)"></div>
             </div>
             <!-- Strategy Health Report Card -->
             <div id="bt-health-report" class="card" style="margin-bottom:16px;display:none">
@@ -1459,6 +1512,8 @@
                                 <option value="fno_bear_put_spread">Bear Put Spread</option>
                                 <option value="fno_bull_put_spread">Bull Put Spread</option>
                                 <option value="fno_bear_call_spread">Bear Call Spread</option>
+                                <option value="fno_call_credit_spread_runner">Call Credit Spread Runner</option>
+                                <option value="fno_put_credit_spread_runner">Put Credit Spread Runner</option>
                                 <option value="fno_straddle">Long Straddle</option>
                                 <option value="fno_short_straddle">Short Straddle</option>
                                 <option value="fno_strangle">Long Strangle</option>
@@ -1488,7 +1543,8 @@
                             <select id="paper-exchange" onchange="resolveToken('paper')">
                                 <option value="NSE" selected>NSE</option>
                                 <option value="BSE">BSE</option>
-                                <option value="NFO">NFO</option>
+                                <option value="NFO">NFO (NIFTY)</option>
+                                <option value="BFO">BFO (SENSEX)</option>
                             </select>
                         </div>
                         <div class="form-group">
@@ -1517,11 +1573,8 @@
                         <div class="form-group">
                             <label>Underlying</label>
                             <select id="paper-underlying">
-                                <option value="NIFTY">NIFTY 50</option>
-                                <option value="BANKNIFTY">BANK NIFTY</option>
-                                <option value="FINNIFTY">FIN NIFTY</option>
-                                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
-                                <option value="SENSEX">SENSEX</option>
+                                <option value="NIFTY">NIFTY (NFO)</option>
+                                <option value="SENSEX">SENSEX (BFO)</option>
                             </select>
                         </div>
                         <div class="grid grid-2" style="margin-bottom:0">
@@ -1732,11 +1785,8 @@
                             <div class="form-group">
                                 <label>Underlying</label>
                                 <select id="fno-builder-underlying" onchange="updateFnOBuilderLotSize()">
-                                    <option value="NIFTY">NIFTY 50</option>
-                                    <option value="BANKNIFTY">BANK NIFTY</option>
-                                    <option value="FINNIFTY">FIN NIFTY</option>
-                                    <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
-                                    <option value="SENSEX">SENSEX</option>
+                                    <option value="NIFTY">NIFTY (NFO)</option>
+                                    <option value="SENSEX">SENSEX (BFO)</option>
                                 </select>
                             </div>
                             <div class="form-group">
@@ -1866,6 +1916,7 @@
                     </select>
                     <button class="btn btn-primary btn-sm" onclick="loadJournal()">Apply</button>
                     <button class="btn btn-outline btn-sm" onclick="exportJournal()">Export</button>
+                    <button class="btn btn-sm" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;color:#fff" onclick="openAITradeAnalysis()">🤖 AI Analysis</button>
                 </div>
             </div>
 
@@ -2259,6 +2310,16 @@
                         <option value="straddle_strangle">Straddle / Strangle</option>
                         <option value="bull_call_spread">Bull Call Spread</option>
                         <option value="bear_put_spread">Bear Put Spread</option>
+                        <option value="bull_put_spread">Bull Put Spread</option>
+                        <option value="bear_call_spread">Bear Call Spread</option>
+                        <option value="short_straddle">Short Straddle</option>
+                        <option value="short_strangle">Short Strangle</option>
+                        <option value="iron_butterfly">Iron Butterfly</option>
+                        <option value="covered_call">Covered Call</option>
+                        <option value="protective_put">Protective Put</option>
+                        <option value="calendar_spread">Calendar Spread</option>
+                        <option value="call_credit_spread_runner">Call Credit Spread Runner</option>
+                        <option value="put_credit_spread_runner">Put Credit Spread Runner</option>
                     </optgroup>
                     <optgroup id="modal-custom-strategies" label="Custom Strategies"></optgroup>
                 </select>
@@ -2289,55 +2350,172 @@
 
     <!-- Start Live Modal -->
     <div id="modal-start-live" class="modal-overlay" onclick="if(event.target===this)hideModal('modal-start-live')">
-        <div class="modal" style="max-width:650px;max-height:85vh;overflow-y:auto">
+        <div class="modal" style="max-width:750px;max-height:90vh;overflow-y:auto">
             <div class="modal-title">Start Live Trading</div>
 
-            <div class="form-group">
-                <label style="font-weight:600;color:#00d4aa;margin-bottom:8px;display:block">Popular Instruments</label>
-                <div id="preset-instruments" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:200px;overflow-y:auto;padding:4px">
-                    <label class="inst-check"><input type="checkbox" value="256265" data-name="NIFTY 50"> <span class="inst-token">256265</span> NIFTY 50</label>
-                    <label class="inst-check"><input type="checkbox" value="260105" data-name="SENSEX"> <span class="inst-token">260105</span> SENSEX</label>
-                    <label class="inst-check"><input type="checkbox" value="257801" data-name="NIFTY BANK"> <span class="inst-token">257801</span> NIFTY BANK</label>
-                    <label class="inst-check"><input type="checkbox" value="261889" data-name="NIFTY FIN SERVICE"> <span class="inst-token">261889</span> NIFTY FIN SVC</label>
-                    <label class="inst-check"><input type="checkbox" value="738561" data-name="RELIANCE"> <span class="inst-token">738561</span> RELIANCE</label>
-                    <label class="inst-check"><input type="checkbox" value="341249" data-name="HDFCBANK"> <span class="inst-token">341249</span> HDFC BANK</label>
-                    <label class="inst-check"><input type="checkbox" value="2953217" data-name="TCS"> <span class="inst-token">2953217</span> TCS</label>
-                    <label class="inst-check"><input type="checkbox" value="408065" data-name="INFY"> <span class="inst-token">408065</span> INFOSYS</label>
-                    <label class="inst-check"><input type="checkbox" value="2885377" data-name="SBIN"> <span class="inst-token">2885377</span> SBI</label>
-                    <label class="inst-check"><input type="checkbox" value="424961" data-name="ICICIBANK"> <span class="inst-token">424961</span> ICICI BANK</label>
-                    <label class="inst-check"><input type="checkbox" value="1270529" data-name="KOTAKBANK"> <span class="inst-token">1270529</span> KOTAK BANK</label>
-                    <label class="inst-check"><input type="checkbox" value="3861249" data-name="AXISBANK"> <span class="inst-token">3861249</span> AXIS BANK</label>
-                    <label class="inst-check"><input type="checkbox" value="2714625" data-name="LT"> <span class="inst-token">2714625</span> L&T</label>
-                    <label class="inst-check"><input type="checkbox" value="3465729" data-name="TATAMOTORS"> <span class="inst-token">3465729</span> TATA MOTORS</label>
-                    <label class="inst-check"><input type="checkbox" value="3456769" data-name="TATASTEEL"> <span class="inst-token">3456769</span> TATA STEEL</label>
-                    <label class="inst-check"><input type="checkbox" value="969473" data-name="MARUTI"> <span class="inst-token">969473</span> MARUTI</label>
-                    <label class="inst-check"><input type="checkbox" value="2760193" data-name="BAJFINANCE"> <span class="inst-token">2760193</span> BAJAJ FINANCE</label>
-                    <label class="inst-check"><input type="checkbox" value="895745" data-name="HINDUNILVR"> <span class="inst-token">895745</span> HUL</label>
-                    <label class="inst-check"><input type="checkbox" value="81153" data-name="ADANIENT"> <span class="inst-token">81153</span> ADANI ENT</label>
-                    <label class="inst-check"><input type="checkbox" value="3001089" data-name="SUNPHARMA"> <span class="inst-token">3001089</span> SUN PHARMA</label>
-                    <label class="inst-check"><input type="checkbox" value="2815745" data-name="WIPRO"> <span class="inst-token">2815745</span> WIPRO</label>
-                    <label class="inst-check"><input type="checkbox" value="779521" data-name="POWERGRID"> <span class="inst-token">779521</span> POWER GRID</label>
-                    <label class="inst-check"><input type="checkbox" value="2929921" data-name="TECHM"> <span class="inst-token">2929921</span> TECH MAHINDRA</label>
-                    <label class="inst-check"><input type="checkbox" value="5215745" data-name="ASIANPAINT"> <span class="inst-token">5215745</span> ASIAN PAINTS</label>
+            <!-- Segment Tabs -->
+            <div class="live-segment-tabs" style="display:flex;gap:0;margin-bottom:16px;border:1px solid #2a3a4a;border-radius:8px;overflow:hidden">
+                <button id="live-seg-equity" class="live-seg-tab active" onclick="switchLiveSegment('equity')" style="flex:1;padding:10px 16px;background:#1a2332;color:#00d4aa;border:none;cursor:pointer;font-weight:600;font-size:14px;transition:all 0.2s">
+                    📈 Equity (Cash)
+                </button>
+                <button id="live-seg-fno" class="live-seg-tab" onclick="switchLiveSegment('fno')" style="flex:1;padding:10px 16px;background:#0d1821;color:#8899aa;border:none;border-left:1px solid #2a3a4a;cursor:pointer;font-weight:600;font-size:14px;transition:all 0.2s">
+                    📊 F&O (Derivatives)
+                </button>
+            </div>
+
+            <!-- EQUITY SEGMENT -->
+            <div id="live-equity-panel">
+                <div class="form-group">
+                    <label style="font-weight:600;color:#00d4aa;margin-bottom:8px;display:block">Popular Instruments</label>
+                    <div id="preset-instruments" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:180px;overflow-y:auto;padding:4px">
+                        <label class="inst-check"><input type="checkbox" value="256265" data-name="NIFTY 50"> <span class="inst-token">256265</span> NIFTY 50</label>
+                        <label class="inst-check"><input type="checkbox" value="260105" data-name="SENSEX"> <span class="inst-token">260105</span> SENSEX</label>
+                        <label class="inst-check"><input type="checkbox" value="257801" data-name="NIFTY BANK"> <span class="inst-token">257801</span> NIFTY BANK</label>
+                        <label class="inst-check"><input type="checkbox" value="261889" data-name="NIFTY FIN SERVICE"> <span class="inst-token">261889</span> NIFTY FIN SVC</label>
+                        <label class="inst-check"><input type="checkbox" value="738561" data-name="RELIANCE"> <span class="inst-token">738561</span> RELIANCE</label>
+                        <label class="inst-check"><input type="checkbox" value="341249" data-name="HDFCBANK"> <span class="inst-token">341249</span> HDFC BANK</label>
+                        <label class="inst-check"><input type="checkbox" value="2953217" data-name="TCS"> <span class="inst-token">2953217</span> TCS</label>
+                        <label class="inst-check"><input type="checkbox" value="408065" data-name="INFY"> <span class="inst-token">408065</span> INFOSYS</label>
+                        <label class="inst-check"><input type="checkbox" value="2885377" data-name="SBIN"> <span class="inst-token">2885377</span> SBI</label>
+                        <label class="inst-check"><input type="checkbox" value="424961" data-name="ICICIBANK"> <span class="inst-token">424961</span> ICICI BANK</label>
+                        <label class="inst-check"><input type="checkbox" value="1270529" data-name="KOTAKBANK"> <span class="inst-token">1270529</span> KOTAK BANK</label>
+                        <label class="inst-check"><input type="checkbox" value="3861249" data-name="AXISBANK"> <span class="inst-token">3861249</span> AXIS BANK</label>
+                        <label class="inst-check"><input type="checkbox" value="2714625" data-name="LT"> <span class="inst-token">2714625</span> L&T</label>
+                        <label class="inst-check"><input type="checkbox" value="3465729" data-name="TATAMOTORS"> <span class="inst-token">3465729</span> TATA MOTORS</label>
+                        <label class="inst-check"><input type="checkbox" value="3456769" data-name="TATASTEEL"> <span class="inst-token">3456769</span> TATA STEEL</label>
+                        <label class="inst-check"><input type="checkbox" value="969473" data-name="MARUTI"> <span class="inst-token">969473</span> MARUTI</label>
+                        <label class="inst-check"><input type="checkbox" value="2760193" data-name="BAJFINANCE"> <span class="inst-token">2760193</span> BAJAJ FINANCE</label>
+                        <label class="inst-check"><input type="checkbox" value="895745" data-name="HINDUNILVR"> <span class="inst-token">895745</span> HUL</label>
+                        <label class="inst-check"><input type="checkbox" value="81153" data-name="ADANIENT"> <span class="inst-token">81153</span> ADANI ENT</label>
+                        <label class="inst-check"><input type="checkbox" value="3001089" data-name="SUNPHARMA"> <span class="inst-token">3001089</span> SUN PHARMA</label>
+                        <label class="inst-check"><input type="checkbox" value="2815745" data-name="WIPRO"> <span class="inst-token">2815745</span> WIPRO</label>
+                        <label class="inst-check"><input type="checkbox" value="779521" data-name="POWERGRID"> <span class="inst-token">779521</span> POWER GRID</label>
+                        <label class="inst-check"><input type="checkbox" value="2929921" data-name="TECHM"> <span class="inst-token">2929921</span> TECH MAHINDRA</label>
+                        <label class="inst-check"><input type="checkbox" value="5215745" data-name="ASIANPAINT"> <span class="inst-token">5215745</span> ASIAN PAINTS</label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label style="font-weight:600;color:#00d4aa;margin-bottom:8px;display:block">Search Equity Instruments</label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <select id="search-exchange" style="width:100px;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px">
+                            <option value="NSE" selected>NSE</option>
+                            <option value="BSE">BSE</option>
+                        </select>
+                        <input id="search-inst-query" type="text" placeholder="Search by name or symbol..." style="flex:1;padding:6px 10px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px">
+                        <button class="btn btn-outline btn-sm" onclick="searchInstruments()">Search</button>
+                    </div>
+                    <div id="search-results" style="max-height:150px;overflow-y:auto;margin-top:8px;display:none"></div>
                 </div>
             </div>
 
-            <div class="form-group">
-                <label style="font-weight:600;color:#00d4aa;margin-bottom:8px;display:block">Search Instruments</label>
-                <div style="display:flex;gap:8px;align-items:center">
-                    <select id="search-exchange" style="width:100px;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px">
-                        <option value="NSE" selected>NSE</option>
-                        <option value="BSE">BSE</option>
-                        <option value="NFO">NFO</option>
-                        <option value="BFO">BFO</option>
-                        <option value="MCX">MCX</option>
-                    </select>
-                    <input id="search-inst-query" type="text" placeholder="Search by name or symbol..." style="flex:1;padding:6px 10px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px">
-                    <button class="btn btn-outline btn-sm" onclick="searchInstruments()">Search</button>
+            <!-- F&O SEGMENT -->
+            <div id="live-fno-panel" style="display:none">
+                <div class="form-group">
+                    <label style="font-weight:600;color:#ff9100;margin-bottom:8px;display:block">F&O Instrument Selection</label>
+                    
+                    <!-- F&O Strategy Selection -->
+                    <div style="margin-bottom:12px">
+                        <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Strategy</label>
+                        <select id="fno-strategy" onchange="onFnoStrategyChange()" style="width:100%;padding:8px 10px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:13px;font-weight:500">
+                            <optgroup label="NIFTY Strategies">
+                                <option value="nifty_call_credit_spread" data-underlying="NIFTY">NIFTY Call Credit Spread</option>
+                                <option value="nifty_put_credit_spread" data-underlying="NIFTY">NIFTY Put Credit Spread</option>
+                                <option value="nifty_iron_condor" data-underlying="NIFTY">NIFTY Iron Condor</option>
+                                <option value="nifty_straddle" data-underlying="NIFTY">NIFTY Straddle</option>
+                                <option value="nifty_strangle" data-underlying="NIFTY">NIFTY Strangle</option>
+                            </optgroup>
+                            <optgroup label="SENSEX Strategies">
+                                <option value="sensex_call_credit_spread" data-underlying="SENSEX">SENSEX Call Credit Spread</option>
+                                <option value="sensex_put_credit_spread" data-underlying="SENSEX">SENSEX Put Credit Spread</option>
+                                <option value="sensex_iron_condor" data-underlying="SENSEX">SENSEX Iron Condor</option>
+                                <option value="sensex_straddle" data-underlying="SENSEX">SENSEX Straddle</option>
+                                <option value="sensex_strangle" data-underlying="SENSEX">SENSEX Strangle</option>
+                            </optgroup>
+                        </select>
+                    </div>
+                    
+                    <!-- Spot Price Display -->
+                    <div id="fno-spot-display" style="margin-bottom:12px;padding:10px;background:#1a2633;border-radius:6px;display:none">
+                        <div style="display:flex;justify-content:space-between;align-items:center">
+                            <span style="font-size:12px;color:#8899aa">Spot Price</span>
+                            <span id="fno-spot-price" style="font-size:16px;font-weight:600;color:#00d4aa">--</span>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
+                            <span style="font-size:11px;color:#667788">ATM Strike</span>
+                            <span id="fno-atm-strike" style="font-size:13px;font-weight:500;color:#ff9100">--</span>
+                        </div>
+                    </div>
+                    
+                    <!-- FnO Type Tabs -->
+                    <div style="display:flex;gap:0;margin-bottom:12px;border:1px solid #2a3a4a;border-radius:6px;overflow:hidden">
+                        <button id="fno-type-futures" class="fno-type-tab active" onclick="switchFnoType('FUT')" style="flex:1;padding:8px 12px;background:#1a2332;color:#ff9100;border:none;cursor:pointer;font-weight:500;font-size:13px">
+                            Futures
+                        </button>
+                        <button id="fno-type-options" class="fno-type-tab" onclick="switchFnoType('OPT')" style="flex:1;padding:8px 12px;background:#0d1821;color:#8899aa;border:none;border-left:1px solid #2a3a4a;cursor:pointer;font-weight:500;font-size:13px">
+                            Options
+                        </button>
+                    </div>
+
+                    <!-- FnO Filters -->
+                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px">
+                        <div>
+                            <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Exchange</label>
+                            <select id="fno-exchange" onchange="loadFnoExpiries()" style="width:100%;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:12px" disabled>
+                                <option value="NFO" selected>NFO (NSE F&O)</option>
+                                <option value="BFO">BFO (BSE F&O)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Underlying</label>
+                            <select id="fno-underlying" onchange="onFnoUnderlyingChange()" style="width:100%;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:12px" disabled>
+                                <option value="NIFTY" selected>NIFTY</option>
+                                <option value="SENSEX">SENSEX</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Expiry</label>
+                            <select id="fno-expiry" onchange="onFnoExpiryChange()" style="width:100%;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:12px">
+                                <option value="">Nearest</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Options-specific filters (hidden for futures) -->
+                    <div id="fno-options-filters" style="display:none;margin-bottom:12px">
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                            <div>
+                                <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Option Type</label>
+                                <select id="fno-option-type" style="width:100%;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:12px">
+                                    <option value="">All</option>
+                                    <option value="CE">Call (CE)</option>
+                                    <option value="PE">Put (PE)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Strike Range</label>
+                                <select id="fno-strike-range" style="width:100%;padding:6px 8px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:12px">
+                                    <option value="atm" selected>Near ATM (±5 strikes)</option>
+                                    <option value="all">All Strikes</option>
+                                    <option value="itm">ITM Only</option>
+                                    <option value="otm">OTM Only</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Search F&O -->
+                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                        <input id="fno-search-query" type="text" placeholder="Search F&O instruments (e.g., NIFTY25MAR, BANKNIFTY24000CE)..." style="flex:1;padding:6px 10px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:12px">
+                        <button class="btn btn-outline btn-sm" onclick="searchFnoInstruments()">Search</button>
+                    </div>
+
+                    <!-- F&O Results -->
+                    <div id="fno-search-results" style="max-height:200px;overflow-y:auto;background:#0a1018;border:1px solid #2a3a4a;border-radius:6px;display:none"></div>
                 </div>
-                <div id="search-results" style="max-height:150px;overflow-y:auto;margin-top:8px;display:none"></div>
             </div>
 
+            <!-- SELECTED INSTRUMENTS (Shared) -->
             <div class="form-group">
                 <label style="font-weight:600;color:#8899aa;margin-bottom:4px;display:block">Selected (<span id="selected-count">0</span>)</label>
                 <div id="selected-instruments" style="min-height:32px;padding:6px;background:#0d1821;border:1px solid #2a3a4a;border-radius:6px;display:flex;flex-wrap:wrap;gap:6px">
@@ -2359,6 +2537,114 @@
             </div>
         </div>
     </div>
+
+    <!-- AI Trade Execution Analysis Modal -->
+    <div id="modal-ai-analysis" class="modal-overlay" onclick="if(event.target===this)hideModal('modal-ai-analysis')">
+        <div class="modal" style="max-width:900px;max-height:90vh;overflow-y:auto">
+            <div class="modal-title" style="display:flex;align-items:center;gap:8px">
+                <span style="font-size:24px">🤖</span>
+                AI Trade Execution Analysis
+            </div>
+            <div id="ai-analysis-status" style="margin-bottom:16px;padding:10px;border-radius:8px;background:#1a2633">
+                <span id="ai-status-text">Checking analysis availability...</span>
+            </div>
+            
+            <!-- Analysis Context Options -->
+            <div style="background:#1a2633;border-radius:8px;padding:12px;margin-bottom:16px">
+                <div style="font-weight:600;margin-bottom:8px;color:#6366f1">📊 Analysis Context (Order Plan)</div>
+                <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                        <input type="checkbox" id="ai-use-analysis" checked style="width:16px;height:16px">
+                        <span>Use Analysis Tab signals as order plan</span>
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                        <input type="checkbox" id="ai-filter-analysis" style="width:16px;height:16px">
+                        <span>Only analyze symbols with analysis signals</span>
+                    </label>
+                </div>
+                <div style="font-size:11px;color:#667788;margin-top:6px">
+                    When enabled, AI will compare your trades against scanner signals/recommendations to identify missed opportunities and incorrect trades.
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Analyze By</label>
+                <select id="ai-analysis-mode" onchange="toggleAIAnalysisMode()">
+                    <option value="filters">Use Current Journal Filters</option>
+                    <option value="recent">Recent Trades (Last 20)</option>
+                    <option value="strategy">Specific Strategy</option>
+                    <option value="instrument">Specific Instrument</option>
+                </select>
+            </div>
+            
+            <div id="ai-filter-strategy" class="form-group" style="display:none">
+                <label>Strategy</label>
+                <select id="ai-strategy-select">
+                    <option value="">All Strategies</option>
+                </select>
+            </div>
+            
+            <div id="ai-filter-instrument" class="form-group" style="display:none">
+                <label>Instrument</label>
+                <input type="text" id="ai-instrument-input" placeholder="e.g., NIFTY, BANKNIFTY, RELIANCE">
+            </div>
+            
+            <div class="form-group">
+                <label>Max Trades to Analyze</label>
+                <input type="number" id="ai-limit" value="20" min="1" max="50">
+            </div>
+            
+            <div id="ai-analysis-loading" style="display:none;text-align:center;padding:40px">
+                <div style="font-size:40px;animation:spin 1s linear infinite">⚙️</div>
+                <div style="margin-top:12px;color:#667788">Analyzing trades with AI... This may take 30-60 seconds.</div>
+            </div>
+            
+            <div id="ai-analysis-result" style="display:none">
+                <div style="background:#1a2633;border-radius:8px;padding:16px;margin-bottom:16px">
+                    <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:12px">
+                        <div style="text-align:center">
+                            <div style="font-size:11px;color:#667788">Trades Analyzed</div>
+                            <div id="ai-trades-count" style="font-size:20px;font-weight:700;color:#00d4aa">—</div>
+                        </div>
+                        <div style="text-align:center">
+                            <div style="font-size:11px;color:#667788">Win Rate</div>
+                            <div id="ai-win-rate" style="font-size:20px;font-weight:700;color:#00d4aa">—</div>
+                        </div>
+                        <div style="text-align:center">
+                            <div style="font-size:11px;color:#667788">Avg Slippage</div>
+                            <div id="ai-avg-slippage" style="font-size:20px;font-weight:700;color:#ffd93d">—</div>
+                        </div>
+                        <div style="text-align:center">
+                            <div style="font-size:11px;color:#667788">Avg Edge Ratio</div>
+                            <div id="ai-edge-ratio" style="font-size:20px;font-weight:700;color:#e0e6ed">—</div>
+                        </div>
+                        <div style="text-align:center" id="ai-analysis-symbols-container" style="display:none">
+                            <div style="font-size:11px;color:#667788">Analysis Symbols</div>
+                            <div id="ai-analysis-symbols" style="font-size:20px;font-weight:700;color:#6366f1">—</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="font-weight:600;margin-bottom:8px;color:#e0e6ed">AI Critical Analysis — Order Plan Compliance</div>
+                <div id="ai-analysis-content" style="background:#0d1821;border:1px solid #2a3a4a;border-radius:8px;padding:16px;white-space:pre-wrap;font-family:monospace;font-size:13px;line-height:1.6;max-height:400px;overflow-y:auto"></div>
+            </div>
+            
+            <div id="ai-analysis-error" style="display:none;color:#ff5252;padding:20px;text-align:center;background:#1a2633;border-radius:8px">
+            </div>
+            
+            <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+                <button class="btn btn-outline" onclick="hideModal('modal-ai-analysis')">Close</button>
+                <button class="btn btn-primary" id="ai-run-btn" onclick="runAIAnalysis()">Run Analysis</button>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+    </style>
 
     <script src="/static/js/dashboard.js"></script>
 </body>

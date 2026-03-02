@@ -77,11 +77,16 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
             "be_trigger_points": 60,        # move to BE after 60 pts in favour
             "profit_target_pct": 80.0,      # close at 80% of max profit
             "short_put_delta": 0.30,        # ~30 delta short put (absolute)
-            "max_risk_per_spread": 10000.0, # max loss cap per spread
+            "max_risk_pct": 0.02,           # 2% of capital per spread
+            "capital": 500000.0,            # default capital for risk calc
             "min_credit": 15.0,             # minimum net credit per lot
         }
         merged = {**defaults, **(params or {})}
+        # Calculate max_risk_per_spread from capital * max_risk_pct
+        if "max_risk_per_spread" not in (params or {}):
+            merged["max_risk_per_spread"] = merged["capital"] * merged["max_risk_pct"]
         super().__init__("put_credit_spread_runner", merged)
+        self._user_params = params  # Store to check user overrides later
 
         # ── Internal state ──
         self._state = PutSpreadState.IDLE
@@ -139,7 +144,13 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         if not chain or not chain.entries:
             return []
 
-        spread_width = self.params["spread_width"]
+        # Dynamic spread width: 300 for SENSEX (~80k), 100 for NIFTY (~24k)
+        if "spread_width" in (self._user_params or {}):
+            spread_width = self.params["spread_width"]  # User override
+        elif chain.spot_price > 50000:
+            spread_width = 300  # SENSEX
+        else:
+            spread_width = 100  # NIFTY
 
         # 1. Find the short put — use delta-based selection
         #    PE deltas are negative; we match by absolute value

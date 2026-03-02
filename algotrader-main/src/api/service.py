@@ -45,6 +45,16 @@ from src.options.strategies import (
     OptionStrategyBase,
     StraddleStrangleStrategy,
 )
+from src.options.extra_strategies import (
+    BullPutSpreadStrategy,
+    BearCallSpreadStrategy,
+    ShortStraddleStrategy,
+    ShortStrangleStrategy,
+    IronButterflyStrategy,
+    CoveredCallStrategy,
+    ProtectivePutStrategy,
+    CalendarSpreadStrategy,
+)
 from src.risk.manager import RiskManager
 from src.risk.preflight import PreflightChecker, PreflightConfig, TradingMode, set_preflight_checker
 from src.strategy.base import BaseStrategy
@@ -153,6 +163,64 @@ class TradingService:
         self._last_health_report: Optional[dict[str, Any]] = None  # cache latest health report
         self._tested_strategies: set[str] = self._data_store.load_tested_strategies()
 
+        # ── Load persisted active strategies ──
+        self._load_persisted_strategies()
+
+    def _load_persisted_strategies(self) -> None:
+        """Load active strategies from DB on startup."""
+        from src.strategy.analysis_strategies import ANALYSIS_STRATEGIES
+        
+        strategy_map = {
+            "ema_crossover": EMACrossoverStrategy,
+            "vwap_breakout": VWAPBreakoutStrategy,
+            "mean_reversion": MeanReversionStrategy,
+            "rsi": RSIStrategy,
+            "rsi_strategy": RSIStrategy,
+            "scanner_strategy": ScannerStrategy,
+            "iron_condor": IronCondorStrategy,
+            "straddle_strangle": StraddleStrangleStrategy,
+            "bull_call_spread": BullCallSpreadStrategy,
+            "bear_put_spread": BearPutSpreadStrategy,
+            "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+            "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
+            "bull_put_spread": BullPutSpreadStrategy,
+            "bear_call_spread": BearCallSpreadStrategy,
+            "short_straddle": ShortStraddleStrategy,
+            "short_strangle": ShortStrangleStrategy,
+            "iron_butterfly": IronButterflyStrategy,
+            "covered_call": CoveredCallStrategy,
+            "protective_put": ProtectivePutStrategy,
+            "calendar_spread": CalendarSpreadStrategy,
+        }
+        strategy_map.update(ANALYSIS_STRATEGIES)
+        
+        persisted = self._data_store.load_active_strategies(user_id=self._zerodha_id)
+        for strat_cfg in persisted:
+            name = strat_cfg["name"]
+            params = strat_cfg.get("params", {})
+            timeframe = strat_cfg.get("timeframe", "5minute")
+            
+            cls = strategy_map.get(name)
+            if cls:
+                try:
+                    strategy = cls(params)
+                    strategy.set_timeframe(timeframe)
+                    setattr(strategy, "is_live", True)
+                    self._strategies.append(strategy)
+                    logger.info("strategy_loaded_from_db", name=name, timeframe=timeframe)
+                except Exception as e:
+                    logger.error("strategy_load_failed", name=name, error=str(e))
+            else:
+                # Try custom strategy
+                custom = self._custom_store.build_strategy(name)
+                if custom:
+                    custom.set_timeframe(timeframe)
+                    setattr(custom, "is_live", True)
+                    self._strategies.append(custom)
+                    logger.info("custom_strategy_loaded_from_db", name=name)
+                else:
+                    logger.warning("strategy_not_found_for_load", name=name)
+
     # ─── Tested Strategy Persistence ────────────────────────────
 
     def _mark_strategy_tested(self, name: str) -> None:
@@ -247,6 +315,262 @@ class TradingService:
             if len(results) >= 50:
                 break
         return results
+
+    async def search_fno_instruments(
+        self,
+        query: str = "",
+        exchange: str = "NFO",
+        underlying: str = "",
+        expiry: str = "",
+        instrument_type: str = "",  # FUT, CE, PE
+        option_type: str = "",  # CE, PE
+        strike_range: str = "atm",
+        spot_price: float = 0,
+    ) -> list[dict[str, Any]]:
+        """Search F&O instruments with filters."""
+        from datetime import datetime, date as dt_date
+
+        if exchange not in self._instruments_cache:
+            self._instruments_cache[exchange] = await self._market_data.get_instruments(exchange)
+
+        # Get spot price if not provided and doing ATM filtering
+        if strike_range == "atm" and spot_price <= 0 and underlying:
+            # Try to get from live ticks
+            spot_token_map = {
+                "NIFTY": 256265, "BANKNIFTY": 260105, "FINNIFTY": 257801,
+                "SENSEX": 265, "MIDCPNIFTY": 288009,
+            }
+            token = spot_token_map.get(underlying.upper())
+            if token and token in self._live_ticks:
+                spot_price = self._live_ticks[token].get("ltp", 0)
+            # Fallback: try REST LTP
+            if spot_price <= 0:
+                try:
+                    ltp_key_map = {
+                        "NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK",
+                        "FINNIFTY": "NSE:NIFTY FIN SERVICE", "SENSEX": "BSE:SENSEX",
+                    }
+                    key = ltp_key_map.get(underlying.upper())
+                    if key:
+                        ltp_data = await self._client.get_ltp([key])
+                        for v in ltp_data.values():
+                            p = v.last_price if hasattr(v, "last_price") else 0
+                            if p > 0:
+                                spot_price = p
+                except Exception:
+                    pass
+
+        results = []
+        q = query.upper() if query else ""
+        underlying_upper = underlying.upper() if underlying else ""
+        today = dt_date.today()
+
+        # First pass: collect all matching instruments
+        all_matching = []
+        for inst in self._instruments_cache[exchange]:
+            itype = inst.get("instrument_type", "") if isinstance(inst, dict) else getattr(inst, "instrument_type", "")
+            tsym = inst.get("tradingsymbol", "") if isinstance(inst, dict) else getattr(inst, "tradingsymbol", "")
+            iname = inst.get("name", "") if isinstance(inst, dict) else getattr(inst, "name", "")
+            itoken = inst.get("instrument_token", 0) if isinstance(inst, dict) else getattr(inst, "instrument_token", 0)
+            iexch = inst.get("exchange", exchange) if isinstance(inst, dict) else getattr(inst, "exchange", exchange)
+            ilot = inst.get("lot_size", 0) if isinstance(inst, dict) else getattr(inst, "lot_size", 0)
+            iexpiry = inst.get("expiry", "") if isinstance(inst, dict) else getattr(inst, "expiry", "")
+            istrike = inst.get("strike", 0) if isinstance(inst, dict) else getattr(inst, "strike", 0)
+
+            # Filter by instrument type (FUT for futures, CE/PE for options)
+            if instrument_type:
+                if instrument_type == "FUT" and itype != "FUT":
+                    continue
+                if instrument_type == "OPT" and itype not in ("CE", "PE"):
+                    continue
+
+            # Filter by option type (CE or PE)
+            if option_type and itype != option_type:
+                continue
+
+            # Filter by underlying
+            if underlying_upper and not tsym.upper().startswith(underlying_upper):
+                continue
+
+            # Filter by expiry
+            if expiry:
+                inst_expiry_str = ""
+                if iexpiry:
+                    if isinstance(iexpiry, str):
+                        inst_expiry_str = iexpiry
+                    elif hasattr(iexpiry, "strftime"):
+                        inst_expiry_str = iexpiry.strftime("%Y-%m-%d")
+                if expiry not in inst_expiry_str:
+                    continue
+
+            # Filter expired instruments
+            if iexpiry:
+                try:
+                    if isinstance(iexpiry, str):
+                        exp_date = datetime.strptime(iexpiry, "%Y-%m-%d").date()
+                    elif hasattr(iexpiry, "date"):
+                        exp_date = iexpiry.date() if hasattr(iexpiry, "date") else iexpiry
+                    else:
+                        exp_date = iexpiry
+                    if exp_date < today:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # Search query filter
+            if q and q not in tsym.upper() and q not in (iname or "").upper():
+                continue
+
+            # Format expiry for display
+            expiry_str = ""
+            if iexpiry:
+                if isinstance(iexpiry, str):
+                    expiry_str = iexpiry
+                elif hasattr(iexpiry, "strftime"):
+                    expiry_str = iexpiry.strftime("%d-%b-%Y")
+                else:
+                    expiry_str = str(iexpiry)
+
+            all_matching.append({
+                "token": itoken,
+                "symbol": tsym,
+                "name": iname or tsym,
+                "exchange": iexch,
+                "type": itype,
+                "lot_size": ilot,
+                "expiry": expiry_str,
+                "strike": istrike,
+            })
+
+        # Apply strike_range filtering for options
+        if strike_range == "atm" and spot_price > 0:
+            # Determine strike interval based on underlying
+            strike_interval = 50  # default for NIFTY
+            if underlying_upper in ("SENSEX",):
+                strike_interval = 100
+            elif underlying_upper in ("BANKNIFTY",):
+                strike_interval = 100
+            elif underlying_upper in ("MIDCPNIFTY",):
+                strike_interval = 25
+            elif underlying_upper in ("FINNIFTY",):
+                strike_interval = 50
+            
+            # Calculate ATM strike
+            atm_strike = round(spot_price / strike_interval) * strike_interval
+            atm_range = 5  # ±5 strikes around ATM
+            min_strike = atm_strike - (atm_range * strike_interval)
+            max_strike = atm_strike + (atm_range * strike_interval)
+            
+            logger.info(f"search_fno_atm_filter underlying={underlying_upper} spot={spot_price} atm={atm_strike} range=[{min_strike}, {max_strike}]")
+            
+            # Filter to ATM range
+            filtered = []
+            for inst in all_matching:
+                strike = inst.get("strike", 0)
+                if strike == 0:  # Futures or other non-option instruments
+                    filtered.append(inst)
+                elif min_strike <= strike <= max_strike:
+                    filtered.append(inst)
+            results = filtered
+        elif strike_range == "itm" and spot_price > 0:
+            # ITM: CE strike < spot, PE strike > spot
+            filtered = []
+            for inst in all_matching:
+                strike = inst.get("strike", 0)
+                itype = inst.get("type", "")
+                if strike == 0:
+                    filtered.append(inst)
+                elif itype == "CE" and strike < spot_price:
+                    filtered.append(inst)
+                elif itype == "PE" and strike > spot_price:
+                    filtered.append(inst)
+            results = filtered
+        elif strike_range == "otm" and spot_price > 0:
+            # OTM: CE strike > spot, PE strike < spot
+            filtered = []
+            for inst in all_matching:
+                strike = inst.get("strike", 0)
+                itype = inst.get("type", "")
+                if strike == 0:
+                    filtered.append(inst)
+                elif itype == "CE" and strike > spot_price:
+                    filtered.append(inst)
+                elif itype == "PE" and strike < spot_price:
+                    filtered.append(inst)
+            results = filtered
+        else:
+            results = all_matching
+
+        # Sort by expiry (nearest first), then by strike
+        def sort_key(x):
+            exp = x.get("expiry", "")
+            try:
+                exp_date = datetime.strptime(exp, "%d-%b-%Y") if exp else datetime.max
+            except ValueError:
+                try:
+                    exp_date = datetime.strptime(exp, "%Y-%m-%d") if exp else datetime.max
+                except ValueError:
+                    exp_date = datetime.max
+            return (exp_date, x.get("strike", 0), x.get("symbol", ""))
+
+        results.sort(key=sort_key)
+        # Limit results to prevent huge payloads
+        return results[:200]
+
+    async def get_fno_expiries(
+        self,
+        exchange: str = "NFO",
+        underlying: str = "NIFTY",
+        instrument_type: str = "FUT",
+    ) -> list[str]:
+        """Get unique expiry dates for F&O instruments."""
+        from datetime import datetime, date as dt_date
+
+        if exchange not in self._instruments_cache:
+            self._instruments_cache[exchange] = await self._market_data.get_instruments(exchange)
+
+        expiries_set = set()
+        underlying_upper = underlying.upper() if underlying else ""
+        today = dt_date.today()
+
+        for inst in self._instruments_cache[exchange]:
+            itype = inst.get("instrument_type", "") if isinstance(inst, dict) else getattr(inst, "instrument_type", "")
+            tsym = inst.get("tradingsymbol", "") if isinstance(inst, dict) else getattr(inst, "tradingsymbol", "")
+            iexpiry = inst.get("expiry", "") if isinstance(inst, dict) else getattr(inst, "expiry", "")
+
+            # Filter by instrument type
+            if instrument_type == "FUT" and itype != "FUT":
+                continue
+            if instrument_type == "OPT" and itype not in ("CE", "PE"):
+                continue
+
+            # Filter by underlying
+            if underlying_upper and not tsym.upper().startswith(underlying_upper):
+                continue
+
+            if not iexpiry:
+                continue
+
+            # Parse and validate expiry
+            try:
+                if isinstance(iexpiry, str):
+                    exp_date = datetime.strptime(iexpiry, "%Y-%m-%d").date()
+                    exp_str = exp_date.strftime("%Y-%m-%d")
+                elif hasattr(iexpiry, "strftime"):
+                    exp_date = iexpiry if isinstance(iexpiry, dt_date) else iexpiry.date()
+                    exp_str = exp_date.strftime("%Y-%m-%d")
+                else:
+                    continue
+
+                # Only include non-expired
+                if exp_date >= today:
+                    expiries_set.add(exp_str)
+            except (ValueError, TypeError):
+                pass
+
+        # Sort expiries by date (nearest first)
+        sorted_expiries = sorted(expiries_set)
+        return sorted_expiries[:20]  # Return up to 20 expiries
 
     async def get_profile(self) -> dict[str, Any]:
         profile = await self._client.get_profile()
@@ -412,6 +736,241 @@ class TradingService:
         return self._signal_log[-limit:]
 
     def get_strategies_info(self) -> list[dict[str, Any]]:
+        """Return info for strategies that have been ADDED (in self._strategies)."""
+        from src.strategy.analysis_strategies import ANALYSIS_STRATEGIES
+
+        # Build full strategy map for type classification
+        strategy_map = {
+            "ema_crossover": EMACrossoverStrategy,
+            "vwap_breakout": VWAPBreakoutStrategy,
+            "mean_reversion": MeanReversionStrategy,
+            "rsi": RSIStrategy,
+            "rsi_strategy": RSIStrategy,
+            "scanner_strategy": ScannerStrategy,
+            "iron_condor": IronCondorStrategy,
+            "straddle_strangle": StraddleStrangleStrategy,
+            "bull_call_spread": BullCallSpreadStrategy,
+            "bear_put_spread": BearPutSpreadStrategy,
+            "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+            "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
+            "bull_put_spread": BullPutSpreadStrategy,
+            "bear_call_spread": BearCallSpreadStrategy,
+            "short_straddle": ShortStraddleStrategy,
+            "short_strangle": ShortStrangleStrategy,
+            "iron_butterfly": IronButterflyStrategy,
+            "covered_call": CoveredCallStrategy,
+            "protective_put": ProtectivePutStrategy,
+            "calendar_spread": CalendarSpreadStrategy,
+        }
+        strategy_map.update(ANALYSIS_STRATEGIES)
+
+        # Health report cache
+        health = self.get_last_health_report() or {}
+        tested = self._tested_strategies
+
+        # Only return strategies that have been ADDED (exist in self._strategies)
+        result = []
+        for s in self._strategies:
+            name = s.name
+            # Determine type
+            cls = strategy_map.get(name)
+            if cls:
+                stype = "option" if issubclass(cls, OptionStrategyBase) else "equity"
+                source = "builtin"
+            elif name in self.FNO_STRATEGIES:
+                stype = "fno"
+                source = "fno_builtin"
+            elif hasattr(s, 'source') and getattr(s, 'source', None) == 'custom_builder':
+                stype = "custom"
+                source = "custom_builder"
+            elif hasattr(s, 'legs'):
+                stype = "fno"
+                source = "fno_custom_builder"
+            else:
+                stype = "equity"
+                source = "builtin"
+
+            # Options strategies use real-time LTP, not OHLC timeframes
+            if stype == "option":
+                timeframe_display = "Real-time"
+            else:
+                timeframe_display = getattr(s, '_timeframe', 'day')
+            
+            strat_info = {
+                "name": name,
+                "is_active": s.is_active,  # Use the actual is_active property
+                "params": getattr(s, 'params', {}),
+                "type": stype,
+                "source": source,
+                "tested": name in tested,
+                "health_score": health.get("overall_score") if health.get("strategy_name") == name else None,
+                "execution_ready": health.get("execution_ready") if health.get("strategy_name") == name else None,
+                "timeframe": timeframe_display,
+                "details": self._get_strategy_details(s),
+            }
+            result.append(strat_info)
+
+        return result
+
+    def _get_strategy_details(self, strategy) -> dict[str, Any]:
+        """Extract detailed info from a strategy for UI display."""
+        details = {}
+        params = getattr(strategy, 'params', {})
+        
+        # Base info
+        details["underlying"] = params.get("underlying", params.get("tradingsymbol", "N/A"))
+        
+        # Option strategy specific
+        if hasattr(strategy, '_state'):
+            details["state"] = str(getattr(strategy, '_state', 'N/A'))
+        if hasattr(strategy, '_entry_credit'):
+            details["entry_credit"] = getattr(strategy, '_entry_credit', 0)
+        if hasattr(strategy, '_short_leg') and getattr(strategy, '_short_leg'):
+            leg = getattr(strategy, '_short_leg')
+            details["short_leg"] = {
+                "strike": leg.get("strike", 0),
+                "premium": leg.get("entry_premium", 0),
+                "sl_premium": leg.get("sl_premium", 0),
+            }
+        if hasattr(strategy, '_long_leg') and getattr(strategy, '_long_leg'):
+            leg = getattr(strategy, '_long_leg')
+            details["long_leg"] = {
+                "strike": leg.get("strike", 0),
+                "premium": leg.get("entry_premium", 0),
+            }
+        
+        # Entry conditions
+        entry_rules = []
+        if "spread_width" in params:
+            entry_rules.append(f"Spread Width: {params['spread_width']} pts")
+        if "short_call_delta" in params:
+            entry_rules.append(f"Short Call Delta: {params['short_call_delta']}")
+        if "short_put_delta" in params:
+            entry_rules.append(f"Short Put Delta: {params['short_put_delta']}")
+        if "min_credit" in params:
+            entry_rules.append(f"Min Credit: ₹{params['min_credit']}")
+        if "rsi_period" in params:
+            entry_rules.append(f"RSI Period: {params['rsi_period']}")
+        if "oversold" in params:
+            entry_rules.append(f"Buy when RSI < {params['oversold']}")
+        if "overbought" in params:
+            entry_rules.append(f"Sell when RSI > {params['overbought']}")
+        if "ema_fast" in params:
+            entry_rules.append(f"Fast EMA: {params['ema_fast']}")
+        if "ema_slow" in params:
+            entry_rules.append(f"Slow EMA: {params['ema_slow']}")
+        details["entry_rules"] = entry_rules if entry_rules else ["Default entry conditions"]
+        
+        # Stop loss
+        if "sl_premium_points" in params:
+            details["stop_loss"] = f"+{params['sl_premium_points']} pts on premium"
+        elif "atr_sl_multiple" in params and params.get("use_atr_sl"):
+            details["stop_loss"] = f"{params['atr_sl_multiple']}x ATR"
+        elif "stop_loss_pct" in params:
+            details["stop_loss"] = f"{params['stop_loss_pct']}%"
+        elif "max_risk_per_spread" in params:
+            details["stop_loss"] = f"Max Risk: ₹{params['max_risk_per_spread']}"
+        else:
+            details["stop_loss"] = "Not configured"
+        
+        # Target
+        if "profit_target_pct" in params:
+            details["target"] = f"{params['profit_target_pct']}% of max profit"
+        elif "target_pct" in params:
+            details["target"] = f"{params['target_pct']}%"
+        elif "be_trigger_points" in params:
+            details["target"] = f"BE after {params['be_trigger_points']} pts move"
+        else:
+            details["target"] = "Not configured"
+        
+        # Quantity
+        if "lot_size" in params and "lots" in params:
+            details["quantity"] = f"{params['lots']} lot(s) x {params['lot_size']} = {params['lots'] * params['lot_size']}"
+        elif "quantity" in params:
+            details["quantity"] = str(params["quantity"])
+        else:
+            details["quantity"] = "1"
+        
+        # Margin estimation
+        details["margin_required"] = self._estimate_margin(strategy.name, params)
+        
+        return details
+
+    def _estimate_margin(self, strategy_name: str, params: dict) -> str:
+        """Estimate margin required for a strategy based on its type and params.
+        
+        Uses simplified SPAN-like calculation:
+        - Credit spreads: (spread_width × lot_size × lots × 0.6) + exposure
+        - Naked options: notional × 15% + premium
+        - Equity: quantity × price × leverage_margin
+        """
+        lot_size = params.get("lot_size", 75)  # Default NIFTY lot size
+        lots = params.get("lots", 1)
+        total_qty = lot_size * lots
+        
+        # Determine underlying and use appropriate spot/spread defaults
+        underlying = params.get("underlying", params.get("tradingsymbol", "NIFTY"))
+        if underlying and "SENSEX" in underlying.upper():
+            estimated_spot = 80000
+            default_spread_width = 300  # SENSEX uses 300pt spreads
+        else:
+            estimated_spot = 24000
+            default_spread_width = 100  # NIFTY uses 100pt spreads
+        
+        if strategy_name in ("call_credit_spread_runner", "put_credit_spread_runner",
+                             "bull_put_spread", "bear_call_spread"):
+            # Credit spreads: max loss based margin
+            spread_width = params.get("spread_width", default_spread_width)
+            # Max loss = spread_width × lot_size × lots
+            max_loss = spread_width * total_qty
+            # SPAN margin ≈ 60% of max loss + exposure (3% of notional)
+            span_margin = max_loss * 0.6
+            exposure_margin = estimated_spot * total_qty * 0.03
+            total_margin = span_margin + exposure_margin
+            return f"₹{total_margin:,.0f}"
+        
+        elif strategy_name in ("bull_call_spread", "bear_put_spread"):
+            # Debit spreads: premium paid only
+            spread_width = params.get("spread_width", default_spread_width)
+            estimated_premium = spread_width * 0.5 * total_qty  # ~50% of spread width
+            return f"₹{estimated_premium:,.0f} (premium)"
+        
+        elif strategy_name in ("short_straddle", "short_strangle"):
+            # Naked short: higher margin
+            notional = estimated_spot * total_qty
+            margin = notional * 0.15  # ~15% of notional
+            return f"₹{margin:,.0f}"
+        
+        elif strategy_name in ("iron_condor", "iron_butterfly"):
+            # Iron structures: capped max loss
+            wing_width = params.get("wing_width", 100)
+            max_loss = wing_width * total_qty
+            span_margin = max_loss * 0.6
+            exposure_margin = estimated_spot * total_qty * 0.02
+            total_margin = span_margin + exposure_margin
+            return f"₹{total_margin:,.0f}"
+        
+        elif strategy_name in ("straddle_strangle",):
+            # Long straddle/strangle: premium only
+            estimated_premium = 200 * total_qty  # ~200 pts combined premium
+            return f"₹{estimated_premium:,.0f} (premium)"
+        
+        elif strategy_name in ("covered_call", "protective_put"):
+            # Covered/protective: stock + option premium
+            notional = estimated_spot * total_qty
+            margin = notional * 0.20  # ~20% VAR margin on stock
+            return f"₹{margin:,.0f}"
+        
+        else:
+            # Equity strategies: use quantity and position sizing
+            quantity = params.get("quantity", 1)
+            position_size = params.get("position_size", 100000)
+            if "max_risk_per_spread" in params:
+                return f"₹{params['max_risk_per_spread']:,.0f} (max risk)"
+            return f"₹{position_size:,.0f}"
+
+    def get_available_strategies(self) -> list[dict[str, Any]]:
+        """Return ALL available strategies (for Add Strategy modal)."""
         from src.strategy.analysis_strategies import ANALYSIS_STRATEGIES
         # Build full strategy map (equity/options)
         strategy_map = {
@@ -427,14 +986,20 @@ class TradingService:
             "bear_put_spread": BearPutSpreadStrategy,
             "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
             "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
+            "bull_put_spread": BullPutSpreadStrategy,
+            "bear_call_spread": BearCallSpreadStrategy,
+            "short_straddle": ShortStraddleStrategy,
+            "short_strangle": ShortStrangleStrategy,
+            "iron_butterfly": IronButterflyStrategy,
+            "covered_call": CoveredCallStrategy,
+            "protective_put": ProtectivePutStrategy,
+            "calendar_spread": CalendarSpreadStrategy,
         }
         strategy_map.update(ANALYSIS_STRATEGIES)
 
         # Active/running strategies
-        active_names = {s.name for s in self._strategies if getattr(s, 'is_live', True)}
-        active = {s.name: s for s in self._strategies if getattr(s, 'is_live', True)}
-
-        # Health report cache
+        active_names = {s.name for s in self._strategies}
+        active_map = {s.name: s for s in self._strategies}
         health = self.get_last_health_report() or {}
         tested = self._tested_strategies
 
@@ -443,8 +1008,8 @@ class TradingService:
         for name, cls in strategy_map.items():
             strat_info = {
                 "name": name,
-                "is_active": name in active_names,
-                "params": active[name].params if name in active else {},
+                "is_added": name in active_names,
+                "params": getattr(active_map.get(name), 'params', {}),
                 "type": "option" if issubclass(cls, OptionStrategyBase) else "equity",
                 "source": "builtin",
                 "tested": name in tested,
@@ -458,8 +1023,8 @@ class TradingService:
             name = cs["name"]
             strat_info = {
                 "name": name,
-                "is_active": name in active_names,
-                "params": active[name].params if name in active else {},
+                "is_added": name in active_names,
+                "params": getattr(active_map.get(name), 'params', {}),
                 "type": "custom",
                 "source": "custom_builder",
                 "description": cs.get("description", ""),
@@ -475,8 +1040,8 @@ class TradingService:
         for fname in self.FNO_STRATEGIES:
             strat_info = {
                 "name": fname,
-                "is_active": fname in active_names,
-                "params": active[fname].params if fname in active else {},
+                "is_added": fname in active_names,
+                "params": getattr(active_map.get(fname), 'params', {}),
                 "type": "fno",
                 "source": "fno_builtin",
                 "tested": fname in tested,
@@ -490,8 +1055,8 @@ class TradingService:
             name = fno_cs.get("name", "")
             strat_info = {
                 "name": name,
-                "is_active": name in active_names,
-                "params": active[name].params if name in active else {},
+                "is_added": name in active_names,
+                "params": getattr(active_map.get(name), 'params', {}),
                 "type": "fno",
                 "source": "fno_custom_builder",
                 "description": fno_cs.get("description", ""),
@@ -1001,15 +1566,16 @@ class TradingService:
                     "hint": "Run a backtest or paper trade for this strategy first, then add it for live trading.",
                     "tested_strategies": sorted(self._tested_strategies),
                 }
-            # Enforce health benchmark: must have execution_ready==True (score >= 60)
-            health = self.get_last_health_report()
-            if not health or not health.get("execution_ready", False):
-                score = health.get("overall_score") if health else None
+            # Enforce health benchmark: score >= 60 required
+            saved_health = self._data_store.get_strategy_health_score(name)
+            health_score = saved_health.get("health_score", 0) if saved_health else 0
+            if health_score < 60:
                 return {
                     "error": f"Strategy '{name}' does not meet the minimum health benchmark (score >= 60 required).",
-                    "score": score,
+                    "score": health_score,
                     "hint": "Improve backtest/paper-trade results until health score is at least 60.",
                 }
+            logger.info("strategy_health_validated", name=name, score=health_score, grade=saved_health.get("health_grade"))
 
         strategy_map = {
             "ema_crossover": EMACrossoverStrategy,
@@ -1024,6 +1590,14 @@ class TradingService:
             "bear_put_spread": BearPutSpreadStrategy,
             "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
             "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
+            "bull_put_spread": BullPutSpreadStrategy,
+            "bear_call_spread": BearCallSpreadStrategy,
+            "short_straddle": ShortStraddleStrategy,
+            "short_strangle": ShortStrangleStrategy,
+            "iron_butterfly": IronButterflyStrategy,
+            "covered_call": CoveredCallStrategy,
+            "protective_put": ProtectivePutStrategy,
+            "calendar_spread": CalendarSpreadStrategy,
         }
         # Merge all analysis strategies (cci_extreme, mfi_strategy, bollinger, etc.)
         strategy_map.update(ANALYSIS_STRATEGIES)
@@ -1042,10 +1616,24 @@ class TradingService:
         strategy.set_timeframe(timeframe)
         logger.info("strategy_timeframe_set", name=name, timeframe=timeframe)
 
+        # Check if strategy already exists - don't add duplicates
+        existing = [s for s in self._strategies if s.name == name]
+        if existing:
+            logger.info("strategy_already_exists", name=name, count=len(existing))
+            return {"success": True, "name": name, "timeframe": timeframe, "note": "Strategy already active"}
+
         # Mark as live strategy (for UI tracking/removal)
         setattr(strategy, "is_live", True)
         self._strategies.append(strategy)
-        logger.info("strategy_added", name=name, timeframe=timeframe)
+        logger.info("strategy_added", name=name, timeframe=timeframe, total_strategies=len(self._strategies))
+
+        # Persist to DB so it survives restarts
+        self._data_store.add_active_strategy(
+            name=name,
+            timeframe=timeframe,
+            params=params or {},
+            user_id=self._zerodha_id,
+        )
 
         # Push the current token→symbol map so signals use real symbols
         self._sync_tradingsymbol_map()
@@ -1066,7 +1654,20 @@ class TradingService:
         return {"success": True, "name": strategy.name, "timeframe": timeframe}
 
     def remove_strategy(self, name: str) -> dict[str, Any]:
+        before_count = len(self._strategies)
         self._strategies = [s for s in self._strategies if s.name != name]
+        after_count = len(self._strategies)
+
+        # Remove from persistence
+        self._data_store.remove_active_strategy(name, user_id=self._zerodha_id)
+
+        logger.info(
+            "strategy_removed",
+            name=name,
+            before_count=before_count,
+            after_count=after_count,
+            removed_count=before_count - after_count,
+        )
         return {"success": True, "removed": name}
 
     def toggle_strategy(self, name: str) -> dict[str, Any]:
@@ -1825,6 +2426,18 @@ class TradingService:
             "scanner_strategy": ScannerStrategy,
             "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
             "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
+            "iron_condor": IronCondorStrategy,
+            "straddle_strangle": StraddleStrangleStrategy,
+            "bull_call_spread": BullCallSpreadStrategy,
+            "bear_put_spread": BearPutSpreadStrategy,
+            "bull_put_spread": BullPutSpreadStrategy,
+            "bear_call_spread": BearCallSpreadStrategy,
+            "short_straddle": ShortStraddleStrategy,
+            "short_strangle": ShortStrangleStrategy,
+            "iron_butterfly": IronButterflyStrategy,
+            "covered_call": CoveredCallStrategy,
+            "protective_put": ProtectivePutStrategy,
+            "calendar_spread": CalendarSpreadStrategy,
         }
         # Merge analysis strategies into the map
         strategy_map.update(ANALYSIS_STRATEGIES)
@@ -2612,6 +3225,17 @@ class TradingService:
         # Cache
         self._last_health_report = report_dict
 
+        # Persist health score per strategy to database
+        try:
+            self._data_store.save_strategy_health_score(
+                strategy_name=strategy_name,
+                health_score=report.overall_score,
+                execution_ready=report.execution_ready,
+                health_grade=report_dict.get("grade", ""),
+            )
+        except Exception as e:
+            logger.error("health_score_save_error", error=str(e))
+
         # Record health score in journal metadata
         try:
             self._record_health_to_journal(report, result)
@@ -3073,7 +3697,7 @@ class TradingService:
                     if not all_instruments:
                         continue
 
-                    # Find nearest expiry
+                    # Find suitable expiry (skip same-day expiry as premiums are too low)
                     from datetime import date as _date
                     today = _date.today()
                     expiries: set[str] = set()
@@ -3082,13 +3706,31 @@ class TradingService:
                         if exp:
                             try:
                                 exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
-                                if exp_dt >= today:
+                                # Skip today's expiry - premiums are near-zero
+                                if exp_dt > today:
                                     expiries.add(exp)
                             except (ValueError, TypeError):
                                 pass
                     if not expiries:
+                        # Fallback: include today if no future expiries
+                        for inst in all_instruments:
+                            exp = inst.get("expiry", "")
+                            if exp:
+                                try:
+                                    exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
+                                    if exp_dt >= today:
+                                        expiries.add(exp)
+                                except (ValueError, TypeError):
+                                    pass
+                    if not expiries:
                         continue
                     nearest_expiry = min(expiries)
+                    logger.info(
+                        "option_chain_expiry_selected",
+                        underlying=underlying,
+                        expiry=nearest_expiry,
+                        available_expiries=sorted(list(expiries))[:3],
+                    )
 
                     expiry_instruments = [
                         i for i in all_instruments if i.get("expiry") == nearest_expiry
@@ -3116,6 +3758,13 @@ class TradingService:
                         if tsym:
                             quote_keys.append(f"{exch}:{tsym}")
 
+                    logger.info(
+                        "option_chain_fetching_quotes",
+                        underlying=underlying,
+                        num_keys=len(quote_keys),
+                        sample_keys=quote_keys[:3] if quote_keys else [],
+                    )
+
                     quotes: dict[str, dict[str, Any]] = {}
                     # Zerodha allows max ~500 instruments per quote call
                     for batch_start in range(0, len(quote_keys), 400):
@@ -3123,11 +3772,20 @@ class TradingService:
                         try:
                             raw = await self._client.get_quote(batch)
                             for k, q in raw.items():
+                                ltp = q.last_price if hasattr(q, "last_price") else 0
                                 quotes[k] = {
-                                    "last_price": q.last_price if hasattr(q, "last_price") else 0,
+                                    "last_price": ltp,
                                     "volume": q.volume if hasattr(q, "volume") else 0,
                                     "oi": q.oi if hasattr(q, "oi") else 0,
                                 }
+                            # Log sample of actual quotes received
+                            sample_quotes = {k: v["last_price"] for k, v in list(quotes.items())[:3]}
+                            logger.info(
+                                "option_chain_quotes_received",
+                                underlying=underlying,
+                                total_quotes=len(quotes),
+                                sample=sample_quotes,
+                            )
                         except Exception as e:
                             logger.warning("option_chain_quote_batch_error", underlying=underlying, error=str(e))
 
@@ -3141,17 +3799,43 @@ class TradingService:
                     )
 
                     # 5. Feed chain to all option strategies that trade this underlying
+                    #    and evaluate entry signals (in case WebSocket ticks aren't flowing)
                     for strat in option_strategies:
                         if strat.params.get("underlying", "NIFTY") == underlying:
                             strat.update_chain(chain)
+                            logger.info(
+                                "strategy_chain_updated",
+                                strategy=strat.name,
+                                entries=len(chain.entries),
+                                spot=round(spot, 2),
+                            )
+                            # Evaluate signals on chain refresh (doesn't require WS ticks)
+                            if strat.is_active:
+                                try:
+                                    signals = await strat.on_tick([])  # Empty ticks, relies on chain
+                                    for sig in signals:
+                                        await self._process_signal(sig)
+                                    if signals:
+                                        logger.info(
+                                            "option_chain_signals_generated",
+                                            strategy=strat.name,
+                                            count=len(signals),
+                                        )
+                                except Exception as e:
+                                    logger.error(
+                                        "option_chain_signal_error",
+                                        strategy=strat.name,
+                                        error=str(e),
+                                    )
 
-                    logger.debug(
+                    logger.info(
                         "option_chain_refreshed",
                         underlying=underlying,
                         expiry=nearest_expiry,
                         entries=len(chain.entries),
                         spot=round(spot, 2),
                         atm_iv=chain.atm_iv,
+                        quotes_count=len(quotes),
                     )
                 except Exception as e:
                     logger.error("option_chain_refresh_error", underlying=underlying, error=str(e))

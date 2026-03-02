@@ -17,6 +17,16 @@ class Settings(BaseSettings):
     kite_login_url: str = Field(default="https://kite.zerodha.com/connect/login", description="Kite login URL")
     kite_ws_url: str = Field(default="wss://ws.kite.trade", description="Kite WebSocket URL")
 
+    # OpenRouter API for AI-powered trade analysis
+    openrouter_api_key: str = Field(default="", description="OpenRouter API key for trade analysis")
+    openrouter_model: str = Field(default="qwen/qwen3-4b:free", description="OpenRouter model for analysis")
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", description="OpenRouter API base URL")
+    
+    # Hugging Face API as fallback for trade analysis
+    huggingface_api_key: str = Field(default="", description="Hugging Face API key (fallback for trade analysis)")
+    huggingface_model: str = Field(default="HuggingFaceH4/zephyr-7b-beta", description="Hugging Face model for analysis")
+    huggingface_base_url: str = Field(default="https://router.huggingface.co/hf", description="Hugging Face Router API base URL")
+
     max_daily_loss: float = Field(default=10000.0, description="Maximum daily loss in INR")
     max_position_size: int = Field(default=100, description="Maximum position size per instrument")
     max_exposure: float = Field(default=500000.0, description="Maximum total exposure in INR")

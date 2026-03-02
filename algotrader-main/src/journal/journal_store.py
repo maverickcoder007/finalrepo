@@ -376,7 +376,7 @@ class JournalStore:
             d["win_rate"] = round(d["wins"] / d["trades"], 4) if d["trades"] else 0
             tp = d.get("total_profit", 0) or 0
             tl = d.get("total_loss", 0) or 0
-            d["profit_factor"] = round(tp / tl, 4) if tl > 0 else 0
+            d["profit_factor"] = round(tp / tl, 4) if tl > 0 else (999 if tp > 0 else 0)
             result.append(d)
         return result
 
@@ -499,7 +499,7 @@ class JournalStore:
         total_loss = r.get("total_loss", 0) or 0
 
         r["win_rate"] = round(wins / total, 4) if total > 0 else 0
-        r["profit_factor"] = round(total_profit / total_loss, 4) if total_loss > 0 else 0
+        r["profit_factor"] = round(total_profit / total_loss, 4) if total_loss > 0 else (999 if total_profit > 0 else 0)
         r["expectancy"] = r.get("avg_pnl", 0) or 0
 
         # Open trades

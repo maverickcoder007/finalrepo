@@ -77,11 +77,16 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
             "be_trigger_points": 60,        # move to BE after 60 pts in favour
             "profit_target_pct": 80.0,      # close at 80% of max profit
             "short_call_delta": 0.30,       # ~30 delta short call
-            "max_risk_per_spread": 10000.0, # max loss cap per spread
+            "max_risk_pct": 0.02,           # 2% of capital per spread
+            "capital": 500000.0,            # default capital for risk calc
             "min_credit": 15.0,             # minimum net credit per lot
         }
         merged = {**defaults, **(params or {})}
+        # Calculate max_risk_per_spread from capital * max_risk_pct
+        if "max_risk_per_spread" not in (params or {}):
+            merged["max_risk_per_spread"] = merged["capital"] * merged["max_risk_pct"]
         super().__init__("call_credit_spread_runner", merged)
+        self._user_params = params  # Store to check user overrides later
 
         # ── Internal state ──
         self._state = SpreadState.IDLE
@@ -111,7 +116,11 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
         exit_signals = self._evaluate_exit(ticks)
         if exit_signals:
             return exit_signals
-        if self._state != SpreadState.IDLE or not self._option_chain:
+        if self._state != SpreadState.IDLE:
+            logger.info("ccs_runner_tick_skip_not_idle", state=self._state.value)
+            return []
+        if not self._option_chain:
+            logger.info("ccs_runner_tick_skip_no_chain")
             return []
         return self._evaluate_entry()
 
@@ -133,36 +142,95 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
 
     def _evaluate_entry(self) -> list[Signal]:
         if self._state != SpreadState.IDLE:
+            logger.info("ccs_runner_skip_not_idle", state=self._state.value)
             return []
 
         chain = self._option_chain
         if not chain or not chain.entries:
+            logger.info("ccs_runner_skip_no_chain", has_chain=bool(chain), entries=len(chain.entries) if chain else 0)
             return []
 
-        spread_width = self.params["spread_width"]
+        logger.info(
+            "ccs_runner_evaluating_entry",
+            spot=chain.spot_price,
+            entries=len(chain.entries),
+            atm_iv=chain.atm_iv,
+        )
 
-        # 1. Find the short call — use delta-based selection
+        # Dynamic spread width: 300 for SENSEX (~80k), 100 for NIFTY (~24k)
+        if "spread_width" in (self._user_params or {}):
+            spread_width = self.params["spread_width"]  # User override
+        elif chain.spot_price > 50000:
+            spread_width = 300  # SENSEX
+        else:
+            spread_width = 100  # NIFTY
+
+        # 1. Find the short call — use delta-based selection, with ATM fallback
         short_call = self._find_strike_by_delta(
             self.params["short_call_delta"], "CE", chain
         )
         if not short_call or short_call.last_price <= 0:
+            # Fallback: find OTM strike ~1-2 strikes above ATM with meaningful premium
+            spot = chain.spot_price
+            candidates = []
+            for entry in chain.entries:
+                if entry.ce and entry.ce.strike > spot and entry.ce.last_price > 1.0:
+                    candidates.append(entry.ce)
+            # Pick the one with highest premium (closest to ATM with liquidity)
+            if candidates:
+                short_call = max(candidates, key=lambda c: c.last_price)
+        if not short_call or short_call.last_price <= 1.0:
+            logger.info(
+                "ccs_runner_no_short_call",
+                target_delta=self.params["short_call_delta"],
+                found=bool(short_call),
+                price=short_call.last_price if short_call else 0,
+                spot=chain.spot_price,
+            )
             return []
+
+        logger.info(
+            "ccs_runner_short_selected",
+            strike=short_call.strike,
+            premium=round(short_call.last_price, 2),
+            delta=round(short_call.delta, 4) if short_call.delta else 0,
+        )
 
         # 2. Find long call — short_strike + spread_width
         target_long_strike = short_call.strike + spread_width
         long_call = self._find_strike_nearest(target_long_strike, "CE", chain)
         if not long_call or long_call.last_price <= 0:
+            logger.info(
+                "ccs_runner_no_long_call",
+                target_strike=target_long_strike,
+                found=bool(long_call),
+                price=long_call.last_price if long_call else 0,
+            )
             return []
 
         # Ensure correct ordering
         if long_call.strike <= short_call.strike:
-            logger.debug("ccs_runner_strikes_invalid", short=short_call.strike, long=long_call.strike)
+            logger.info("ccs_runner_strikes_invalid", short=short_call.strike, long=long_call.strike)
             return []
+
+        logger.info(
+            "ccs_runner_long_selected",
+            strike=long_call.strike,
+            premium=round(long_call.last_price, 2),
+        )
 
         # 3. Credit / risk validation
         net_credit = short_call.last_price - long_call.last_price
         if net_credit < self.params["min_credit"]:
-            logger.debug("ccs_runner_credit_insufficient", credit=net_credit)
+            logger.info(
+                "ccs_runner_credit_insufficient",
+                short_strike=short_call.strike,
+                long_strike=long_call.strike,
+                credit=round(net_credit, 2),
+                min_required=self.params["min_credit"],
+                short_premium=round(short_call.last_price, 2),
+                long_premium=round(long_call.last_price, 2),
+            )
             return []
 
         actual_width = long_call.strike - short_call.strike

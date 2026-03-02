@@ -25,6 +25,7 @@ import pandas as pd
 from src.derivatives.chain_builder import HistoricalChainBuilder, SyntheticChain
 from src.derivatives.contracts import (
     DerivativeContract,
+    InstrumentType,
     MultiLegPosition,
     OptionLeg,
     StructureType,
@@ -39,6 +40,10 @@ from src.derivatives.fno_simulator import (
 from src.derivatives.greeks_engine import GreeksEngine
 from src.derivatives.margin_engine import MarginEngine
 from src.derivatives.regime_engine import RegimeEngine
+from src.options.chain import OptionChainData, OptionChainEntry, OptionContract
+from src.options.call_credit_spread_runner import CallCreditSpreadRunnerStrategy
+from src.options.put_credit_spread_runner import PutCreditSpreadRunnerStrategy
+from src.data.models import Tick, TransactionType
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -170,11 +175,19 @@ class FnOPaperTradingEngine:
         "bear_put_spread": StructureType.BEAR_PUT_SPREAD,
         "bull_put_spread": StructureType.BULL_PUT_SPREAD,
         "bear_call_spread": StructureType.BEAR_CALL_SPREAD,
+        "call_credit_spread_runner": StructureType.BEAR_CALL_SPREAD,  # Sell call + buy higher call
+        "put_credit_spread_runner": StructureType.BULL_PUT_SPREAD,    # Sell put + buy lower put
         "straddle": StructureType.LONG_STRADDLE,
         "short_straddle": StructureType.SHORT_STRADDLE,
         "strangle": StructureType.LONG_STRANGLE,
         "short_strangle": StructureType.SHORT_STRANGLE,
         "iron_butterfly": StructureType.IRON_BUTTERFLY,
+    }
+
+    # Strategies that use actual strategy classes (strategy-driven mode)
+    STRATEGY_CLASSES: dict[str, type] = {
+        "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+        "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
     }
 
     def __init__(
@@ -255,6 +268,10 @@ class FnOPaperTradingEngine:
         missing = required - set(data.columns)
         if missing:
             raise ValueError(f"Missing columns: {missing}")
+
+        # Use strategy-driven mode for runner strategies (actual strategy class)
+        if self.strategy_name.lower() in self.STRATEGY_CLASSES:
+            return self._run_strategy_driven(data, tradingsymbol, timeframe)
 
         df = data.copy()
         # Preserve DatetimeIndex as 'timestamp' column if not already present
@@ -635,7 +652,8 @@ class FnOPaperTradingEngine:
         avg_loss = sum(losses) / len(losses) if losses else 0
         total_wins = sum(wins)
         total_losses = abs(sum(losses))
-        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+        # Profit factor: total_wins / total_losses (999 if no losses = perfect 100% WR)
+        profit_factor = total_wins / total_losses if total_losses > 0 else (999 if total_wins > 0 else 0)
 
         eq = np.array(self._equity_curve) if self._equity_curve else np.array([self.initial_capital])
         peak = np.maximum.accumulate(eq)
@@ -707,3 +725,346 @@ class FnOPaperTradingEngine:
             total_costs=0,
             positions_opened=0,
         )
+
+    # ────────────────────────────────────────────────────────────
+    # Strategy-Driven Mode (for runner strategies)
+    # ────────────────────────────────────────────────────────────
+
+    def _convert_synthetic_chain_to_option_chain_data(
+        self, chain: SyntheticChain
+    ) -> OptionChainData:
+        """Convert a SyntheticChain to OptionChainData for strategy use."""
+        entries: list[OptionChainEntry] = []
+        total_ce_oi = 0
+        total_pe_oi = 0
+
+        for strike, opts in sorted(chain.strikes.items()):
+            ce_quote = opts.get("CE")
+            pe_quote = opts.get("PE")
+
+            ce_contract = None
+            pe_contract = None
+
+            if ce_quote:
+                ce_contract = OptionContract(
+                    tradingsymbol=f"{chain.underlying}{str(chain.expiry).replace('-', '')}C{int(strike)}",
+                    strike=strike,
+                    option_type="CE",
+                    expiry=str(chain.expiry),
+                    underlying=chain.underlying,
+                    last_price=ce_quote.price,
+                    bid_price=ce_quote.bid,
+                    ask_price=ce_quote.ask,
+                    iv=ce_quote.iv * 100,
+                    delta=ce_quote.delta,
+                    gamma=ce_quote.gamma,
+                    theta=ce_quote.theta,
+                    vega=ce_quote.vega,
+                    oi=ce_quote.oi,
+                    volume=ce_quote.volume,
+                    lot_size=self._chain_builder.lot_size,
+                )
+                total_ce_oi += ce_quote.oi
+
+            if pe_quote:
+                pe_contract = OptionContract(
+                    tradingsymbol=f"{chain.underlying}{str(chain.expiry).replace('-', '')}P{int(strike)}",
+                    strike=strike,
+                    option_type="PE",
+                    expiry=str(chain.expiry),
+                    underlying=chain.underlying,
+                    last_price=pe_quote.price,
+                    bid_price=pe_quote.bid,
+                    ask_price=pe_quote.ask,
+                    iv=pe_quote.iv * 100,
+                    delta=pe_quote.delta,
+                    gamma=pe_quote.gamma,
+                    theta=pe_quote.theta,
+                    vega=pe_quote.vega,
+                    oi=pe_quote.oi,
+                    volume=pe_quote.volume,
+                    lot_size=self._chain_builder.lot_size,
+                )
+                total_pe_oi += pe_quote.oi
+
+            entries.append(OptionChainEntry(
+                strike=strike,
+                ce=ce_contract,
+                pe=pe_contract,
+            ))
+
+        return OptionChainData(
+            underlying=chain.underlying,
+            spot_price=chain.spot_price,
+            expiry=str(chain.expiry),
+            atm_strike=chain.atm_strike,
+            atm_iv=chain.atm_iv * 100,
+            total_ce_oi=total_ce_oi,
+            total_pe_oi=total_pe_oi,
+            pcr=total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0.0,
+            entries=entries,
+            updated_at=str(chain.timestamp),
+        )
+
+    def _run_strategy_driven(
+        self,
+        data: pd.DataFrame,
+        tradingsymbol: str = "NIFTY",
+        timeframe: str = "day",
+    ) -> FnOPaperTradeResult:
+        """Run paper trading using actual strategy class (strategy-driven mode).
+
+        This mode instantiates the real strategy class (e.g., PutCreditSpreadRunnerStrategy)
+        and feeds it synthetic option chains. The strategy generates signals which are
+        then executed via paper trading simulation.
+        """
+        df = data.copy()
+        if "timestamp" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+            df["timestamp"] = df.index
+        df = df.reset_index(drop=True)
+        closes = df["close"].values
+        self._equity_curve.append(self.initial_capital)
+
+        _has_ts = "timestamp" in df.columns
+        def _bar_ts(idx: int) -> str:
+            return str(df["timestamp"].iloc[idx]) if _has_ts else str(idx)
+
+        # Instantiate the actual strategy class
+        strategy_cls = self.STRATEGY_CLASSES[self.strategy_name.lower()]
+        strategy = strategy_cls({
+            "underlying": self.underlying,
+            "lot_size": self._chain_builder.lot_size,
+            "lots": 1,
+            "exchange": self._chain_builder.exchange,
+        })
+
+        # Position tracking for simulated execution
+        open_positions: dict[str, dict] = {}  # tradingsymbol -> position info
+        total_costs = 0.0
+        trades: list[dict] = []
+        trade_counter = 0
+
+        # Pre-compute expiry dates
+        start_date = self._parse_date(df, 0)
+        end_date = self._parse_date(df, len(df) - 1)
+        expiries = self._chain_builder.get_expiry_dates(
+            start_date, end_date + timedelta(days=60),
+            expiry_weekday=self._chain_builder.expiry_day,
+        )
+
+        logger.info(
+            f"[PAPER TRADE STRATEGY-DRIVEN] strategy={self.strategy_name} "
+            f"underlying={self.underlying} bars={len(df)} capital={self._capital}"
+        )
+
+        for i in range(max(5, min(21, len(df) // 10)), len(df)):
+            bar = df.iloc[i]
+            spot = float(bar["close"])
+            bar_date = self._parse_date(df, i)
+            bar_time = _bar_ts(i)
+
+            # Build synthetic option chain
+            regime = self._regime_engine.classify(closes[:i + 1])
+
+            target_exp = None
+            for exp in sorted(expiries):
+                if (exp - bar_date).days >= self.entry_dte_min:
+                    target_exp = exp
+                    break
+            if target_exp is None:
+                target_exp = self._chain_builder.nearest_expiry(bar_date, expiries)
+            if target_exp is None:
+                self._equity_curve.append(self._equity_curve[-1])
+                continue
+
+            synth_chain = self._chain_builder.build_chain(
+                spot=spot,
+                timestamp=datetime.combine(bar_date, datetime.min.time()),
+                expiry=target_exp,
+                hv=regime.hv_20 if regime.hv_20 > 0 else 0.20,
+            )
+            if synth_chain is None:
+                self._equity_curve.append(self._equity_curve[-1])
+                continue
+
+            # Convert to OptionChainData for strategy
+            option_chain_data = self._convert_synthetic_chain_to_option_chain_data(synth_chain)
+            strategy.update_chain(option_chain_data)
+
+            # Create synthetic tick for strategy
+            tick = Tick(
+                instrument_token=0,
+                last_price=spot,
+                timestamp=bar_time,
+                volume_traded=int(bar.get("volume", 0)),
+                change=0.0,
+            )
+
+            # Get signals from strategy
+            import asyncio
+            import nest_asyncio
+            nest_asyncio.apply()  # Allow nested event loops
+
+            on_tick_result = strategy.on_tick([tick])
+            if asyncio.iscoroutine(on_tick_result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                signals = loop.run_until_complete(on_tick_result)
+            else:
+                signals = on_tick_result
+
+            # Process signals
+            for signal in signals:
+                is_exit = signal.metadata.get("signal_type") == "exit"
+                sym = signal.tradingsymbol
+                qty = signal.quantity
+                lot_size = self._chain_builder.lot_size
+
+                # Find option price from chain
+                opt_price = self._find_option_price_from_chain(synth_chain, sym)
+                if opt_price is None:
+                    logger.warning(f"Could not find price for {sym}, skipping signal")
+                    continue
+
+                # Simulate fill with simple slippage model
+                slippage_pct = 0.002  # 0.2% slippage
+                if signal.transaction_type == TransactionType.BUY:
+                    fill_price = opt_price * (1 + slippage_pct)
+                else:
+                    fill_price = opt_price * (1 - slippage_pct)
+
+                fill_qty = qty if qty >= lot_size else lot_size
+                slippage_amount = abs(fill_price - opt_price) * fill_qty
+
+                # Calculate approximate costs (simplified for strategy-driven mode)
+                turnover = fill_price * fill_qty
+                cost_total = turnover * 0.0005  # 0.05% for brokerage + STT + charges
+
+                trade_counter += 1
+                order = FnOPaperOrder(
+                    order_id=f"SDM_{trade_counter:04d}",
+                    tradingsymbol=sym,
+                    instrument_type="CE" if "C" in sym else "PE",
+                    strike=self._extract_strike_from_symbol(sym),
+                    expiry=str(synth_chain.expiry),
+                    side=signal.transaction_type.value,
+                    lots=fill_qty // lot_size,
+                    lot_size=lot_size,
+                    price=opt_price,
+                    fill_price=fill_price,
+                    slippage=slippage_amount,
+                    cost=cost_total,
+                    status="COMPLETE",
+                    timestamp=bar_time,
+                    structure=self.strategy_name,
+                )
+                self._orders.append(order)
+
+                total_costs += cost_total
+
+                if is_exit:
+                    # Close position
+                    if sym in open_positions:
+                        pos = open_positions.pop(sym)
+                        entry_price = pos["entry_price"]
+                        entry_qty = pos["quantity"]
+                        entry_side = pos["side"]
+
+                        if entry_side == "SELL":
+                            pnl = (entry_price - fill_price) * entry_qty
+                        else:
+                            pnl = (fill_price - entry_price) * entry_qty
+
+                        self._capital += pnl - cost_total
+                        trades.append({
+                            "type": "EXIT",
+                            "tradingsymbol": sym,
+                            "pnl": round(pnl, 2),
+                            "reason": signal.metadata.get("reason", "exit"),
+                        })
+                else:
+                    # Open position
+                    open_positions[sym] = {
+                        "entry_price": fill_price,
+                        "quantity": fill_qty,
+                        "side": signal.transaction_type.value,
+                        "entry_bar": i,
+                        "entry_time": bar_time,
+                    }
+                    if signal.transaction_type == TransactionType.SELL:
+                        self._capital += fill_price * fill_qty
+                    else:
+                        self._capital -= fill_price * fill_qty
+                    self._capital -= cost_total
+
+            # Mark to market open positions
+            mtm = self._capital
+            for sym, pos in open_positions.items():
+                current_price = self._find_option_price_from_chain(synth_chain, sym)
+                if current_price is not None:
+                    if pos["side"] == "SELL":
+                        unrealised = (pos["entry_price"] - current_price) * pos["quantity"]
+                    else:
+                        unrealised = (current_price - pos["entry_price"]) * pos["quantity"]
+                    mtm += unrealised
+
+            self._equity_curve.append(mtm)
+
+        # Force close remaining positions at end
+        if open_positions:
+            for sym, pos in list(open_positions.items()):
+                final_price = max(pos["entry_price"] * 0.5, 1.0)
+                pnl = 0.0
+                if pos["side"] == "SELL":
+                    pnl = (pos["entry_price"] - final_price) * pos["quantity"]
+                else:
+                    pnl = (final_price - pos["entry_price"]) * pos["quantity"]
+                self._capital += pnl
+                trades.append({
+                    "type": "FINAL_EXIT",
+                    "tradingsymbol": sym,
+                    "pnl": round(pnl, 2),
+                    "reason": "session_end",
+                })
+
+        self._equity_curve.append(self._capital)
+
+        return self._build_result(df, timeframe, total_costs)
+
+    def _find_option_price_from_chain(
+        self, chain: SyntheticChain, tradingsymbol: str
+    ) -> float | None:
+        """Find option price from synthetic chain by tradingsymbol."""
+        try:
+            if "C" in tradingsymbol:
+                opt_type = "CE"
+                strike_str = tradingsymbol.split("C")[-1]
+            elif "P" in tradingsymbol:
+                opt_type = "PE"
+                strike_str = tradingsymbol.split("P")[-1]
+            else:
+                return None
+
+            strike = float(strike_str)
+
+            if strike in chain.strikes:
+                quote = chain.strikes[strike].get(opt_type)
+                if quote:
+                    return quote.price
+        except (ValueError, IndexError):
+            pass
+        return None
+
+    def _extract_strike_from_symbol(self, tradingsymbol: str) -> float:
+        """Extract strike price from tradingsymbol."""
+        try:
+            if "C" in tradingsymbol:
+                return float(tradingsymbol.split("C")[-1])
+            elif "P" in tradingsymbol:
+                return float(tradingsymbol.split("P")[-1])
+        except (ValueError, IndexError):
+            pass
+        return 0.0

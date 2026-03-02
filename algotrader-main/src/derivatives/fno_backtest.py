@@ -7,6 +7,8 @@ Event flow:
 
 Unlike the equity BacktestEngine, this engine:
   • Builds synthetic option chains per bar (via HistoricalChainBuilder)
+  • Supports stored option chain data from local SQLite database
+  • Falls back to synthetic chains if no stored data available
   • Supports multi-leg structures (spreads, condors, straddles)
   • Tracks portfolio Greeks over time
   • Runs SPAN-like margin calculations per bar
@@ -18,7 +20,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, date, timedelta
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -38,9 +40,21 @@ from src.derivatives.fno_simulator import FnOExecutionSimulator, OrderSide
 from src.derivatives.greeks_engine import GreeksEngine
 from src.derivatives.margin_engine import MarginEngine
 from src.derivatives.regime_engine import RegimeEngine
+from src.options.chain import OptionChainData, OptionChainEntry, OptionContract
+from src.options.call_credit_spread_runner import CallCreditSpreadRunnerStrategy
+from src.options.put_credit_spread_runner import PutCreditSpreadRunnerStrategy
+from src.data.models import Tick, TransactionType
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# Try to import FnO data store (may not exist yet)
+try:
+    from src.data.fno_data_store import FnODataStore, get_fno_data_store
+    HAS_FNO_STORE = True
+except ImportError:
+    HAS_FNO_STORE = False
 
 
 class FnOBacktestEngine:
@@ -64,6 +78,8 @@ class FnOBacktestEngine:
         "bear_put_spread": StructureType.BEAR_PUT_SPREAD,
         "bull_put_spread": StructureType.BULL_PUT_SPREAD,
         "bear_call_spread": StructureType.BEAR_CALL_SPREAD,
+        "call_credit_spread_runner": StructureType.BEAR_CALL_SPREAD,  # Sell call + buy higher call
+        "put_credit_spread_runner": StructureType.BULL_PUT_SPREAD,    # Sell put + buy lower put
         "straddle": StructureType.LONG_STRADDLE,
         "short_straddle": StructureType.SHORT_STRADDLE,
         "strangle": StructureType.LONG_STRANGLE,
@@ -72,6 +88,12 @@ class FnOBacktestEngine:
         "protective_put": StructureType.PROTECTIVE_PUT,
         "iron_butterfly": StructureType.IRON_BUTTERFLY,
         "calendar_spread": StructureType.CALENDAR_SPREAD,
+    }
+
+    # Strategies that use actual strategy classes (strategy-driven mode)
+    STRATEGY_CLASSES: dict[str, type] = {
+        "call_credit_spread_runner": CallCreditSpreadRunnerStrategy,
+        "put_credit_spread_runner": PutCreditSpreadRunnerStrategy,
     }
 
     def __init__(
@@ -87,6 +109,7 @@ class FnOBacktestEngine:
         delta_target: float = 0.16,        # for strike selection
         slippage_model: str = "realistic",
         use_regime_filter: bool = True,
+        use_stored_data: bool = True,      # Prefer stored data over synthetic
     ) -> None:
         self.strategy_name = strategy_name
         self.underlying = underlying.upper()
@@ -99,6 +122,7 @@ class FnOBacktestEngine:
         self.delta_target = delta_target
         self.slippage_model = slippage_model
         self.use_regime_filter = use_regime_filter
+        self.use_stored_data = use_stored_data
 
         self.structure_type = self.STRATEGY_MAP.get(
             strategy_name.lower(), StructureType.IRON_CONDOR
@@ -112,6 +136,136 @@ class FnOBacktestEngine:
         self._greeks_engine = GreeksEngine()
         self._expiry_engine = ExpiryEngine()
         self._regime_engine = RegimeEngine()
+        
+        # FnO data store (for stored option chain data)
+        self._fno_store: Optional["FnODataStore"] = None
+        self._stored_data_cache: dict[str, list[dict]] = {}  # ts -> option chain data
+        
+        if self.use_stored_data and HAS_FNO_STORE:
+            try:
+                self._fno_store = get_fno_data_store()
+                logger.info("FnO data store available for backtest")
+            except Exception as e:
+                logger.warning("FnO data store not available: %s", e)
+
+    def _load_stored_option_chains(
+        self,
+        from_date: str,
+        to_date: str,
+        expiry: str = "",
+    ) -> bool:
+        """Load stored option chain data into cache."""
+        if not self._fno_store:
+            return False
+        
+        try:
+            snapshots = self._fno_store.get_option_chain_snapshots(
+                underlying=self.underlying,
+                from_date=from_date,
+                to_date=to_date,
+                expiry=expiry,
+            )
+            
+            if not snapshots:
+                logger.info("No stored option chain data for %s %s-%s", self.underlying, from_date, to_date)
+                return False
+            
+            # Group by timestamp
+            self._stored_data_cache.clear()
+            for snap in snapshots:
+                ts = snap.get("ts", "")
+                if ts not in self._stored_data_cache:
+                    self._stored_data_cache[ts] = []
+                self._stored_data_cache[ts].append(snap)
+            
+            logger.info("Loaded %d option chain snapshots (%d timestamps) from stored data",
+                       len(snapshots), len(self._stored_data_cache))
+            return True
+            
+        except Exception as e:
+            logger.error("Error loading stored option chains: %s", e)
+            return False
+    
+    def _get_stored_chain_at_time(self, bar_time: str) -> Optional[OptionChainData]:
+        """Get stored option chain data at or near a specific time."""
+        if not self._stored_data_cache:
+            return None
+        
+        # Find closest timestamp
+        timestamps = sorted(self._stored_data_cache.keys())
+        closest_ts = None
+        min_diff = float("inf")
+        
+        for ts in timestamps:
+            try:
+                bar_dt = datetime.fromisoformat(bar_time.replace("Z", ""))
+                ts_dt = datetime.fromisoformat(ts.replace("Z", ""))
+                diff = abs((ts_dt - bar_dt).total_seconds())
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_ts = ts
+            except Exception:
+                continue
+        
+        if closest_ts is None or min_diff > 3600:  # Max 1 hour difference
+            return None
+        
+        options = self._stored_data_cache[closest_ts]
+        if not options:
+            return None
+        
+        # Convert to OptionChainData
+        return self._convert_stored_to_option_chain_data(options)
+    
+    def _convert_stored_to_option_chain_data(
+        self,
+        options: list[dict],
+    ) -> OptionChainData:
+        """Convert stored option chain rows to OptionChainData."""
+        if not options:
+            return OptionChainData(underlying=self.underlying, expiry="", spot=0, entries=[])
+        
+        first = options[0]
+        spot_price = first.get("spot_price", 0)
+        expiry = first.get("expiry", "")
+        
+        # Group by strike
+        strike_map: dict[float, dict] = {}
+        for opt in options:
+            strike = opt.get("strike", 0)
+            opt_type = opt.get("option_type", "")
+            if strike not in strike_map:
+                strike_map[strike] = {"strike": strike, "CE": None, "PE": None}
+            
+            contract = OptionContract(
+                instrument_token=opt.get("instrument_token", 0),
+                tradingsymbol=opt.get("tradingsymbol", ""),
+                strike=strike,
+                option_type=opt_type,
+                expiry=expiry,
+                ltp=opt.get("last_price", 0),
+                oi=opt.get("oi", 0),
+                volume=opt.get("volume", 0),
+                iv=opt.get("iv", 0),
+                bid=opt.get("bid_price", 0),
+                ask=opt.get("ask_price", 0),
+            )
+            strike_map[strike][opt_type] = contract
+        
+        entries = []
+        for strike_val, data in sorted(strike_map.items()):
+            entries.append(OptionChainEntry(
+                strike=strike_val,
+                CE=data.get("CE"),
+                PE=data.get("PE"),
+            ))
+        
+        return OptionChainData(
+            underlying=self.underlying,
+            expiry=expiry,
+            spot=spot_price,
+            entries=entries,
+        )
 
     def run(
         self,
@@ -135,6 +289,10 @@ class FnOBacktestEngine:
         missing = required - set(data.columns)
         if missing:
             return {"error": f"Missing columns: {missing}"}
+
+        # Use strategy-driven mode for runner strategies (actual strategy class)
+        if self.strategy_name.lower() in self.STRATEGY_CLASSES:
+            return self._run_strategy_driven(data, tradingsymbol)
 
         df = data.copy()
         # Preserve DatetimeIndex as 'timestamp' column if not already present
@@ -855,9 +1013,15 @@ class FnOBacktestEngine:
         if len(returns) > 1 and np.std(returns) > 0:
             sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252))
 
-        # Trade-level stats
-        entry_trades = [t for t in trades if t.get("type") == "ENTRY"]
-        exit_trades = [t for t in trades if t.get("type") in ("PROFIT_TARGET", "STOP_LOSS", "FINAL_EXIT", "EXPIRY")]
+        # Trade-level stats - support both legacy format and strategy-driven format
+        # Legacy format: "type": "ENTRY" / "PROFIT_TARGET" / "STOP_LOSS" / "FINAL_EXIT" / "EXPIRY"
+        # Strategy-driven format: "reason": "entry" for entries, "exit_reason" or "pnl" for exits
+        exit_trades = [
+            t for t in trades 
+            if t.get("type") in ("PROFIT_TARGET", "STOP_LOSS", "FINAL_EXIT", "EXPIRY")
+            or t.get("exit_reason") is not None
+            or ("pnl" in t and t.get("reason") != "entry")
+        ]
         pnls = [t.get("pnl", 0) for t in exit_trades]
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
@@ -868,7 +1032,8 @@ class FnOBacktestEngine:
         avg_loss = sum(losses) / len(losses) if losses else 0
         total_wins = sum(wins)
         total_losses = abs(sum(losses))
-        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+        # Profit factor: total_wins / total_losses (999 if no losses = perfect 100% WR)
+        profit_factor = total_wins / total_losses if total_losses > 0 else (999 if total_wins > 0 else 0)
 
         # Sortino ratio
         neg_returns = returns[returns < 0]
@@ -906,6 +1071,472 @@ class FnOBacktestEngine:
             "sortino_ratio": round(sortino, 4),
             "backtest_warnings": warnings,
         }
+
+    # ────────────────────────────────────────────────────────────
+    # Strategy-Driven Mode (for runner strategies)
+    # ────────────────────────────────────────────────────────────
+
+    def _convert_synthetic_chain_to_option_chain_data(
+        self, chain: SyntheticChain
+    ) -> OptionChainData:
+        """Convert a SyntheticChain to OptionChainData for strategy use."""
+        entries: list[OptionChainEntry] = []
+        total_ce_oi = 0
+        total_pe_oi = 0
+
+        for strike, opts in sorted(chain.strikes.items()):
+            ce_quote = opts.get("CE")
+            pe_quote = opts.get("PE")
+
+            ce_contract = None
+            pe_contract = None
+
+            if ce_quote:
+                ce_contract = OptionContract(
+                    tradingsymbol=f"{chain.underlying}{str(chain.expiry).replace('-', '')}C{int(strike)}",
+                    strike=strike,
+                    option_type="CE",
+                    expiry=str(chain.expiry),
+                    underlying=chain.underlying,
+                    last_price=ce_quote.price,
+                    bid_price=ce_quote.bid,
+                    ask_price=ce_quote.ask,
+                    iv=ce_quote.iv * 100,  # Convert decimal to %
+                    delta=ce_quote.delta,
+                    gamma=ce_quote.gamma,
+                    theta=ce_quote.theta,
+                    vega=ce_quote.vega,
+                    oi=ce_quote.oi,
+                    volume=ce_quote.volume,
+                    lot_size=self._chain_builder.lot_size,
+                )
+                total_ce_oi += ce_quote.oi
+
+            if pe_quote:
+                pe_contract = OptionContract(
+                    tradingsymbol=f"{chain.underlying}{str(chain.expiry).replace('-', '')}P{int(strike)}",
+                    strike=strike,
+                    option_type="PE",
+                    expiry=str(chain.expiry),
+                    underlying=chain.underlying,
+                    last_price=pe_quote.price,
+                    bid_price=pe_quote.bid,
+                    ask_price=pe_quote.ask,
+                    iv=pe_quote.iv * 100,
+                    delta=pe_quote.delta,
+                    gamma=pe_quote.gamma,
+                    theta=pe_quote.theta,
+                    vega=pe_quote.vega,
+                    oi=pe_quote.oi,
+                    volume=pe_quote.volume,
+                    lot_size=self._chain_builder.lot_size,
+                )
+                total_pe_oi += pe_quote.oi
+
+            entries.append(OptionChainEntry(
+                strike=strike,
+                ce=ce_contract,
+                pe=pe_contract,
+            ))
+
+        return OptionChainData(
+            underlying=chain.underlying,
+            spot_price=chain.spot_price,
+            expiry=str(chain.expiry),
+            atm_strike=chain.atm_strike,
+            atm_iv=chain.atm_iv * 100,  # Convert decimal to %
+            total_ce_oi=total_ce_oi,
+            total_pe_oi=total_pe_oi,
+            pcr=total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0.0,
+            entries=entries,
+            updated_at=str(chain.timestamp),
+        )
+
+    def _run_strategy_driven(
+        self,
+        data: pd.DataFrame,
+        tradingsymbol: str = "NIFTY",
+    ) -> dict[str, Any]:
+        """Run backtest using actual strategy class (strategy-driven mode).
+
+        This mode instantiates the real strategy class (e.g., CallCreditSpreadRunnerStrategy)
+        and feeds it option chains. Uses stored data when available, falls back to synthetic.
+        """
+        df = data.copy()
+        if "timestamp" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+            df["timestamp"] = df.index
+        df = df.reset_index(drop=True)
+        closes = df["close"].values
+
+        _has_ts = "timestamp" in df.columns
+        def _bar_ts(idx: int) -> str:
+            return str(df["timestamp"].iloc[idx]) if _has_ts else str(idx)
+
+        # Instantiate the actual strategy class
+        strategy_cls = self.STRATEGY_CLASSES[self.strategy_name.lower()]
+        strategy = strategy_cls({
+            "underlying": self.underlying,
+            "lot_size": self._chain_builder.lot_size,
+            "lots": 1,
+            "exchange": self._chain_builder.exchange,
+        })
+
+        # State tracking
+        capital = self.initial_capital
+        equity_curve: list[float] = [capital]
+        bar_dates: list[str] = [_bar_ts(0)]
+        trades: list[dict] = []
+        total_costs = 0.0
+        trade_counter = 0
+
+        # Position tracking for simulated execution
+        open_positions: dict[str, dict] = {}  # tradingsymbol -> position info
+
+        # Pre-compute expiry dates
+        start_date = self._parse_bar_date(df, 0)
+        end_date = self._parse_bar_date(df, len(df) - 1)
+        expiries = self._chain_builder.get_expiry_dates(
+            start_date, end_date + timedelta(days=60),
+            expiry_weekday=self._chain_builder.expiry_day,
+        )
+
+        # Try to load stored option chain data
+        use_stored = False
+        if self.use_stored_data and self._fno_store:
+            use_stored = self._load_stored_option_chains(
+                from_date=start_date.isoformat(),
+                to_date=end_date.isoformat(),
+            )
+            if use_stored:
+                logger.info("[FNO BACKTEST] Using STORED option chain data")
+            else:
+                logger.info("[FNO BACKTEST] No stored data, using SYNTHETIC chains")
+
+        logger.info(
+            f"[FNO BACKTEST STRATEGY-DRIVEN] strategy={self.strategy_name} "
+            f"underlying={self.underlying} bars={len(df)} capital={capital} "
+            f"data_source={'stored' if use_stored else 'synthetic'}"
+        )
+
+        for i in range(max(5, min(21, len(df) // 10)), len(df)):
+            bar = df.iloc[i]
+            spot = float(bar["close"])
+            bar_date = self._parse_bar_date(df, i)
+            bar_time = _bar_ts(i)
+            bar_dates.append(bar_time)
+
+            # Get option chain (stored or synthetic)
+            option_chain_data = None
+            synth_chain = None
+            
+            if use_stored:
+                # Try stored data first
+                option_chain_data = self._get_stored_chain_at_time(bar_time)
+                if option_chain_data:
+                    # Create a minimal synth_chain for price lookups
+                    synth_chain = None
+            
+            if option_chain_data is None:
+                # Fall back to synthetic chain
+                price_history = closes[:i + 1]
+                regime = self._regime_engine.classify(price_history, timestamp=datetime.now())
+
+                target_exp = None
+                for exp in sorted(expiries):
+                    if (exp - bar_date).days >= self.entry_dte_min:
+                        target_exp = exp
+                        break
+                if target_exp is None:
+                    target_exp = self._chain_builder.nearest_expiry(bar_date, expiries)
+                if target_exp is None:
+                    equity_curve.append(equity_curve[-1])
+                    continue
+
+                synth_chain = self._chain_builder.build_chain(
+                    spot=spot,
+                    timestamp=datetime.combine(bar_date, datetime.min.time()),
+                    expiry=target_exp,
+                    hv=regime.hv_20 if regime.hv_20 > 0 else 0.20,
+                )
+                if synth_chain is None:
+                    equity_curve.append(equity_curve[-1])
+                    continue
+
+                # Convert to OptionChainData for strategy
+                option_chain_data = self._convert_synthetic_chain_to_option_chain_data(synth_chain)
+            
+            strategy.update_chain(option_chain_data)
+
+            # Create synthetic tick for strategy
+            tick = Tick(
+                instrument_token=0,
+                last_price=spot,
+                timestamp=bar_time,
+                volume_traded=int(bar.get("volume", 0)),
+                change=0.0,
+            )
+
+            # Get signals from strategy
+            import asyncio
+            import nest_asyncio
+            nest_asyncio.apply()  # Allow nested event loops
+
+            # Call on_tick (may be async)
+            on_tick_result = strategy.on_tick([tick])
+            if asyncio.iscoroutine(on_tick_result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                signals = loop.run_until_complete(on_tick_result)
+            else:
+                signals = on_tick_result
+
+            # Process signals
+            for signal in signals:
+                is_exit = signal.metadata.get("signal_type") == "exit"
+                sym = signal.tradingsymbol
+                qty = signal.quantity
+                lot_size = self._chain_builder.lot_size
+
+                # Find option price from chain (works with both stored and synthetic)
+                opt_price = self._find_option_price_unified(synth_chain, option_chain_data, sym)
+                if opt_price is None:
+                    logger.warning(f"Could not find price for {sym}, skipping signal")
+                    continue
+
+                # Simulate fill with simple slippage model
+                # (We don't have full DerivativeContract, so use simplified approach)
+                slippage_pct = 0.002  # 0.2% slippage
+                if signal.transaction_type == TransactionType.BUY:
+                    fill_price = opt_price * (1 + slippage_pct)
+                else:
+                    fill_price = opt_price * (1 - slippage_pct)
+
+                fill_qty = qty if qty >= lot_size else lot_size
+                slippage_amount = abs(fill_price - opt_price) * fill_qty
+
+                # Calculate approximate costs (simplified for strategy-driven mode)
+                # F&O transaction costs are roughly 0.05% of turnover
+                turnover = fill_price * fill_qty
+                cost_total = turnover * 0.0005  # 0.05% for brokerage + STT + charges
+
+                trade_counter += 1
+                trade_entry = {
+                    "trade_id": trade_counter,
+                    "bar": i,
+                    "date": bar_time,
+                    "tradingsymbol": sym,
+                    "transaction_type": signal.transaction_type.value,
+                    "quantity": fill_qty,
+                    "price": round(fill_price, 2),
+                    "slippage": round(slippage_amount, 2),
+                    "costs": round(cost_total, 2),
+                    "leg": signal.metadata.get("leg", ""),
+                    "reason": signal.metadata.get("reason", "entry"),
+                    "strategy_state": strategy.get_status().get("state", ""),
+                }
+
+                total_costs += cost_total
+
+                if is_exit:
+                    # Close position
+                    if sym in open_positions:
+                        pos = open_positions.pop(sym)
+                        entry_price = pos["entry_price"]
+                        entry_qty = pos["quantity"]
+                        entry_side = pos["side"]  # BUY or SELL
+
+                        if entry_side == "SELL":
+                            # We sold first, now buying back
+                            pnl = (entry_price - fill_price) * entry_qty
+                        else:
+                            # We bought first, now selling
+                            pnl = (fill_price - entry_price) * entry_qty
+
+                        capital += pnl - cost_total
+                        trade_entry["pnl"] = round(pnl, 2)
+                        trade_entry["exit_reason"] = signal.metadata.get("reason", "exit")
+                else:
+                    # Open position
+                    open_positions[sym] = {
+                        "entry_price": fill_price,
+                        "quantity": fill_qty,
+                        "side": signal.transaction_type.value,
+                        "entry_bar": i,
+                        "entry_time": bar_time,
+                    }
+                    # For sell (credit) positions, add premium to capital
+                    if signal.transaction_type == TransactionType.SELL:
+                        capital += fill_price * fill_qty
+                    else:
+                        capital -= fill_price * fill_qty
+                    capital -= cost_total
+
+                trades.append(trade_entry)
+
+            # Mark to market open positions
+            mtm = capital
+            for sym, pos in open_positions.items():
+                current_price = self._find_option_price_unified(synth_chain, option_chain_data, sym)
+                if current_price is not None:
+                    if pos["side"] == "SELL":
+                        unrealised = (pos["entry_price"] - current_price) * pos["quantity"]
+                    else:
+                        unrealised = (current_price - pos["entry_price"]) * pos["quantity"]
+                    mtm += unrealised
+
+            equity_curve.append(mtm)
+
+        # Force close remaining positions at end
+        if open_positions:
+            final_spot = float(df.iloc[-1]["close"])
+            final_time = _bar_ts(len(df) - 1)
+            for sym, pos in list(open_positions.items()):
+                # Estimate final price (ATM-ish)
+                final_price = max(pos["entry_price"] * 0.5, 1.0)  # rough estimate
+                pnl = 0.0
+                if pos["side"] == "SELL":
+                    pnl = (pos["entry_price"] - final_price) * pos["quantity"]
+                else:
+                    pnl = (final_price - pos["entry_price"]) * pos["quantity"]
+                capital += pnl
+                trades.append({
+                    "trade_id": trade_counter + 1,
+                    "bar": len(df) - 1,
+                    "date": final_time,
+                    "tradingsymbol": sym,
+                    "transaction_type": "BUY" if pos["side"] == "SELL" else "SELL",
+                    "quantity": pos["quantity"],
+                    "price": round(final_price, 2),
+                    "pnl": round(pnl, 2),
+                    "exit_reason": "session_end",
+                })
+                trade_counter += 1
+
+        equity_curve.append(capital)
+
+        # Compute metrics
+        equity = np.array(equity_curve)
+        metrics = self._compute_metrics(equity, [], trades)
+
+        return self._sanitize({
+            "engine": "fno_backtest_strategy_driven",
+            "strategy_name": self.strategy_name,
+            "structure": self.structure_type.value,
+            "underlying": self.underlying,
+            "tradingsymbol": tradingsymbol,
+            "total_bars": len(df),
+            "start_date": str(self._parse_bar_date(df, 0)),
+            "end_date": str(self._parse_bar_date(df, len(df) - 1)),
+            "initial_capital": self.initial_capital,
+            "final_capital": round(capital, 2),
+            "total_return_pct": round(
+                (capital - self.initial_capital) / self.initial_capital * 100, 2
+            ),
+            "total_return_abs": round(capital - self.initial_capital, 2),
+            "total_costs": round(total_costs, 2),
+            **metrics,
+            "trades": trades[-500:],
+            "equity_curve": [round(e, 2) for e in equity_curve],
+            "bar_dates": bar_dates[:len(equity_curve)],
+            "strategy_final_state": strategy.get_status(),
+            "settings": {
+                "max_positions": self.max_positions,
+                "profit_target_pct": self.profit_target_pct,
+                "stop_loss_pct": self.stop_loss_pct,
+                "entry_dte_min": self.entry_dte_min,
+                "entry_dte_max": self.entry_dte_max,
+                "delta_target": self.delta_target,
+                "slippage_model": self.slippage_model,
+                "use_regime_filter": self.use_regime_filter,
+            },
+        })
+
+    def _find_option_price_from_chain(
+        self, chain: SyntheticChain, tradingsymbol: str
+    ) -> float | None:
+        """Find option price from synthetic chain by tradingsymbol."""
+        # Parse tradingsymbol to get strike and option type
+        # Format: NIFTY2024-06-27C25000 or similar
+        try:
+            if "C" in tradingsymbol:
+                opt_type = "CE"
+                strike_str = tradingsymbol.split("C")[-1]
+            elif "P" in tradingsymbol:
+                opt_type = "PE"
+                strike_str = tradingsymbol.split("P")[-1]
+            else:
+                return None
+
+            strike = float(strike_str)
+
+            if strike in chain.strikes:
+                quote = chain.strikes[strike].get(opt_type)
+                if quote:
+                    return quote.price
+        except (ValueError, IndexError):
+            pass
+        return None
+    
+    def _find_option_price_from_chain_data(
+        self, chain_data: OptionChainData, tradingsymbol: str
+    ) -> float | None:
+        """Find option price from OptionChainData by tradingsymbol."""
+        try:
+            if "C" in tradingsymbol:
+                opt_type = "CE"
+                strike_str = tradingsymbol.split("C")[-1]
+            elif "P" in tradingsymbol:
+                opt_type = "PE"
+                strike_str = tradingsymbol.split("P")[-1]
+            else:
+                return None
+            
+            strike = float(strike_str)
+            
+            for entry in chain_data.entries:
+                if abs(entry.strike - strike) < 0.01:
+                    contract = entry.CE if opt_type == "CE" else entry.PE
+                    if contract:
+                        return contract.ltp
+            
+        except (ValueError, IndexError):
+            pass
+        return None
+    
+    def _find_option_price_unified(
+        self,
+        synth_chain: Optional[SyntheticChain],
+        chain_data: Optional[OptionChainData],
+        tradingsymbol: str,
+    ) -> float | None:
+        """Find option price from either synthetic chain or stored OptionChainData."""
+        # Try synthetic chain first
+        if synth_chain is not None:
+            price = self._find_option_price_from_chain(synth_chain, tradingsymbol)
+            if price is not None:
+                return price
+        
+        # Try OptionChainData
+        if chain_data is not None:
+            price = self._find_option_price_from_chain_data(chain_data, tradingsymbol)
+            if price is not None:
+                return price
+        
+        return None
+
+    def _extract_strike_from_symbol(self, tradingsymbol: str) -> float:
+        """Extract strike price from tradingsymbol."""
+        try:
+            if "C" in tradingsymbol:
+                return float(tradingsymbol.split("C")[-1])
+            elif "P" in tradingsymbol:
+                return float(tradingsymbol.split("P")[-1])
+        except (ValueError, IndexError):
+            pass
+        return 0.0
 
     @staticmethod
     def _sanitize(obj: Any) -> Any:

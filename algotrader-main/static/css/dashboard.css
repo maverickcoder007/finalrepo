@@ -643,3 +643,8 @@ tr:hover td { background: var(--bg-hover); }
 .oi-bar-ce { right: 0; background: #ff5252; }
 .oi-bar-pe { left: 0; background: #00d4aa; }
 
+/* F&O Segment Tabs */
+.live-seg-tab:hover { filter: brightness(1.15); }
+.live-seg-tab.active { box-shadow: 0 2px 0 currentColor inset; }
+.fno-type-tab:hover { filter: brightness(1.15); }
+.fno-result-item:hover { background: var(--bg-hover); }

@@ -383,6 +383,52 @@ async def search_instruments(request: Request, q: str = "", exchange: str = "NSE
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/instruments/fno/search")
+async def search_fno_instruments(
+    request: Request,
+    q: str = "",
+    exchange: str = "NFO",
+    underlying: str = "",
+    expiry: str = "",
+    instrument_type: str = "",  # FUT, CE, PE
+    option_type: str = "",  # CE, PE (for options)
+    strike_range: str = "atm",  # atm, all, itm, otm
+    spot_price: float = 0,  # for ATM calculation
+) -> list[dict[str, Any]]:
+    """Search F&O instruments with filters for futures/options."""
+    svc = get_user_service(request)
+    try:
+        instruments = await svc.search_fno_instruments(
+            query=q,
+            exchange=exchange,
+            underlying=underlying,
+            expiry=expiry,
+            instrument_type=instrument_type,
+            option_type=option_type,
+            strike_range=strike_range,
+            spot_price=spot_price,
+        )
+        return instruments
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/instruments/fno/expiries")
+async def get_fno_expiries(
+    request: Request,
+    exchange: str = "NFO",
+    underlying: str = "NIFTY",
+    instrument_type: str = "FUT",  # FUT or OPT
+) -> dict[str, Any]:
+    """Get available expiry dates for F&O instruments."""
+    svc = get_user_service(request)
+    try:
+        expiries = await svc.get_fno_expiries(exchange, underlying, instrument_type)
+        return {"expiries": expiries, "underlying": underlying, "exchange": exchange}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/api/live/start")
 async def start_live(request: Request) -> dict[str, Any]:
     body = await request.json()
@@ -1576,6 +1622,273 @@ async def export_journal(request: Request) -> dict[str, Any]:
     except Exception as e:
         logger.error("pro_journal_export_error", error=str(e))
         return {"entries": [], "error": str(e)}
+
+
+# ─── AI Trade Execution Analysis ─────────────────────────────────
+
+@app.post("/api/trade-analysis/analyze")
+async def analyze_trade_execution(request: Request) -> dict[str, Any]:
+    """
+    AI-powered trade execution analysis using OpenRouter.
+    
+    Analyzes trades for execution quality, slippage, timing issues,
+    and provides critical recommendations for improvement.
+    
+    Request body:
+    {
+        "trade_ids": ["id1", "id2"],  // Optional: specific trades
+        "strategy": "short_straddle",  // Optional: filter by strategy
+        "instrument": "NIFTY",         // Optional: filter by instrument
+        "from_date": "2026-01-01",     // Optional: start date
+        "to_date": "2026-03-02",       // Optional: end date
+        "limit": 20,                   // Optional: max trades (default 20)
+        "use_analysis_context": true,  // Optional: include Analysis tab data
+        "filter_by_analysis": false    // Optional: only analyze symbols from Analysis
+    }
+    """
+    try:
+        from src.analysis.trade_execution_analyzer import get_analyzer
+        
+        body = await request.json()
+        analyzer = get_analyzer()
+        
+        # Optionally fetch analysis context from scanner
+        analysis_context = None
+        if body.get("use_analysis_context", False):
+            try:
+                svc = get_user_service(request)
+                analysis_context = svc.get_analysis_results()
+            except Exception as e:
+                logger.warning("analysis_context_fetch_failed", error=str(e))
+                analysis_context = None
+        
+        result = await analyzer.analyze_trades(
+            trade_ids=body.get("trade_ids"),
+            strategy=body.get("strategy", ""),
+            instrument=body.get("instrument", ""),
+            from_date=body.get("from_date", ""),
+            to_date=body.get("to_date", ""),
+            limit=body.get("limit", 20),
+            analysis_context=analysis_context,
+            filter_by_analysis=body.get("filter_by_analysis", False),
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("trade_analysis_error", error=str(e))
+        return {"success": False, "error": str(e), "analysis": None}
+
+
+@app.post("/api/trade-analysis/analyze-order")
+async def analyze_single_order(request: Request) -> dict[str, Any]:
+    """
+    Analyze a single order's execution quality.
+    
+    Request body:
+    {
+        "order_id": "23030200001234",
+        "order_data": { ... order details ... },
+        "underlying_candles": [ ... 1-min OHLCV data ... ]
+    }
+    """
+    try:
+        from src.analysis.trade_execution_analyzer import get_analyzer
+        
+        body = await request.json()
+        analyzer = get_analyzer()
+        
+        result = await analyzer.analyze_single_order(
+            order_id=body.get("order_id", ""),
+            order_data=body.get("order_data", {}),
+            underlying_candles=body.get("underlying_candles", []),
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("order_analysis_error", error=str(e))
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/trade-analysis/status")
+async def get_analysis_status(request: Request) -> dict[str, Any]:
+    """Check if AI trade analysis is configured and available."""
+    try:
+        from src.utils.config import get_settings
+        settings = get_settings()
+        
+        api_key_configured = bool(settings.openrouter_api_key)
+        
+        return {
+            "available": api_key_configured,
+            "model": settings.openrouter_model if api_key_configured else None,
+            "message": "Trade analysis ready" if api_key_configured else "OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.",
+        }
+        
+    except Exception as e:
+        logger.error("analysis_status_error", error=str(e))
+        return {"available": False, "error": str(e)}
+
+
+# ─── F&O Data Store Endpoints ───────────────────────────────────
+
+@app.get("/api/fno-data/coverage")
+async def fno_data_coverage(request: Request, underlying: str = "") -> dict[str, Any]:
+    """Get F&O data coverage summary."""
+    try:
+        from src.data.fno_data_fetcher import get_fno_data_fetcher
+        fetcher = get_fno_data_fetcher()
+        return fetcher.get_coverage(underlying.upper() if underlying else "")
+    except Exception as e:
+        logger.error("fno_data_coverage_error", error=str(e))
+        return {"error": str(e)}
+
+
+@app.get("/api/fno-data/stats")
+async def fno_data_stats(request: Request) -> dict[str, Any]:
+    """Get F&O data store statistics."""
+    try:
+        from src.data.fno_data_store import get_fno_data_store
+        store = get_fno_data_store()
+        return store.get_stats()
+    except Exception as e:
+        logger.error("fno_data_stats_error", error=str(e))
+        return {"error": str(e)}
+
+
+@app.get("/api/fno-data/sync-history")
+async def fno_sync_history(request: Request, underlying: str = "", limit: int = 50) -> dict[str, Any]:
+    """Get F&O data sync history."""
+    try:
+        from src.data.fno_data_store import get_fno_data_store
+        store = get_fno_data_store()
+        return {"history": store.get_sync_history(underlying.upper() if underlying else "", limit)}
+    except Exception as e:
+        logger.error("fno_sync_history_error", error=str(e))
+        return {"error": str(e), "history": []}
+
+
+@app.get("/api/fno-data/expiries/{underlying}")
+async def fno_data_expiries(request: Request, underlying: str) -> dict[str, Any]:
+    """Get available expiries in stored F&O data."""
+    try:
+        from src.data.fno_data_store import get_fno_data_store
+        store = get_fno_data_store()
+        return {"expiries": store.get_available_expiries(underlying.upper())}
+    except Exception as e:
+        logger.error("fno_data_expiries_error", error=str(e))
+        return {"error": str(e), "expiries": []}
+
+
+@app.post("/api/fno-data/fetch")
+async def fno_data_fetch(request: Request) -> dict[str, Any]:
+    """Fetch F&O data from Kite API and store locally.
+    
+    Body params:
+        underlying: str (e.g., "NIFTY", "BANKNIFTY")
+        from_date: str (YYYY-MM-DD)
+        to_date: str (YYYY-MM-DD)
+        interval: str (default "minute")
+        include_options: bool (default true)
+        expiry: str (optional, specific expiry to fetch)
+    """
+    try:
+        from datetime import datetime
+        from src.data.fno_data_fetcher import get_fno_data_fetcher
+        
+        svc = get_user_service(request)
+        body = await request.json()
+        
+        underlying = body.get("underlying", "").upper()
+        if not underlying:
+            return {"success": False, "error": "underlying is required"}
+        
+        from_date = body.get("from_date", "")
+        to_date = body.get("to_date", "")
+        if not from_date or not to_date:
+            return {"success": False, "error": "from_date and to_date are required"}
+        
+        try:
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d").date()
+            to_dt = datetime.strptime(to_date, "%Y-%m-%d").date()
+        except ValueError:
+            return {"success": False, "error": "Invalid date format, use YYYY-MM-DD"}
+        
+        fetcher = get_fno_data_fetcher()
+        
+        # Set Kite client from service
+        if hasattr(svc, "_client") and svc._client:
+            fetcher.set_kite_client(svc._client)
+        
+        if not fetcher.is_available:
+            return {"success": False, "error": "Kite client not available, please authenticate first"}
+        
+        result = await fetcher.download_fno_data(
+            underlying=underlying,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=body.get("interval", "minute"),
+            include_options=body.get("include_options", True),
+            expiry=body.get("expiry", ""),
+        )
+        
+        return {"success": True, "result": result}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("fno_data_fetch_error", error=str(e))
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/fno-data/snapshot")
+async def fno_data_snapshot(request: Request) -> dict[str, Any]:
+    """Take a snapshot of current option chain and store it."""
+    try:
+        from src.data.fno_data_fetcher import get_fno_data_fetcher, INDEX_TOKENS
+        
+        svc = get_user_service(request)
+        body = await request.json()
+        
+        underlying = body.get("underlying", "").upper()
+        expiry = body.get("expiry", "")
+        
+        if not underlying or not expiry:
+            return {"success": False, "error": "underlying and expiry are required"}
+        
+        fetcher = get_fno_data_fetcher()
+        
+        if hasattr(svc, "_client") and svc._client:
+            fetcher.set_kite_client(svc._client)
+        
+        if not fetcher.is_available:
+            return {"success": False, "error": "Kite client not available"}
+        
+        # Get spot price
+        import asyncio
+        token = INDEX_TOKENS.get(underlying)
+        if token:
+            ltp = await asyncio.to_thread(
+                svc._kite.kite.ltp, [f"NSE:{underlying}"]
+            )
+            spot = ltp.get(f"NSE:{underlying}", {}).get("last_price", 0)
+        else:
+            spot = body.get("spot_price", 0)
+        
+        count = await fetcher.fetch_option_chain_with_quotes(underlying, expiry, spot)
+        
+        return {"success": True, "rows_stored": count}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("fno_data_snapshot_error", error=str(e))
+        return {"success": False, "error": str(e)}
 
 
 @app.websocket("/ws/live")

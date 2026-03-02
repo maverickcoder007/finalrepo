@@ -306,25 +306,79 @@ function updateStrategiesList(strategies) {
 
     let html = '';
 
-    // Active / running strategies
+    // Active / running strategies with detailed info
     if (activeStrats.length > 0) {
-        html += activeStrats.map(s => `
-            <div class="strategy-card">
-                <div class="strategy-info">
-                    <h4>${s.name}</h4>
-                    <span class="type-tag type-${s.type}">${s.type}</span>
-                    <span style="margin-left:8px;color:${s.is_active ? 'var(--accent-green)' : 'var(--accent-red)'}">
-                        ${s.is_active ? 'Active' : 'Paused'}
-                    </span>
+        html += activeStrats.map(s => {
+            const d = s.details || {};
+            const entryRules = (d.entry_rules || []).join(' • ') || 'Default';
+            const stateClass = d.state && d.state.includes('OPEN') ? 'positive' : (d.state && d.state.includes('IDLE') ? 'muted' : '');
+            
+            let legsHtml = '';
+            if (d.short_leg) {
+                legsHtml += `<div style="font-size:11px;color:var(--text-muted)">Short: ${d.short_leg.strike} @ ₹${d.short_leg.premium} (SL: ₹${d.short_leg.sl_premium})</div>`;
+            }
+            if (d.long_leg) {
+                legsHtml += `<div style="font-size:11px;color:var(--text-muted)">Long: ${d.long_leg.strike} @ ₹${d.long_leg.premium}</div>`;
+            }
+            if (d.entry_credit > 0) {
+                legsHtml += `<div style="font-size:11px;color:var(--accent-green)">Credit: ₹${d.entry_credit.toFixed(2)}</div>`;
+            }
+
+            return `
+            <div class="strategy-card" style="padding:12px;margin-bottom:10px">
+                <div class="strategy-info" style="margin-bottom:8px">
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                        <h4 style="margin:0;font-size:14px">${s.name}</h4>
+                        <span class="type-tag type-${s.type}" style="font-size:10px">${s.type}</span>
+                        <span style="font-size:11px;padding:2px 6px;border-radius:4px;background:${s.is_active ? 'rgba(0,212,170,0.15)' : 'rgba(255,82,82,0.15)'};color:${s.is_active ? 'var(--accent-green)' : 'var(--accent-red)'}">
+                            ${s.is_active ? '● Active' : '○ Paused'}
+                        </span>
+                        ${d.state ? `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(255,255,255,0.05);color:var(--text-muted)" class="${stateClass}">${d.state.replace('SpreadState.', '')}</span>` : ''}
+                    </div>
                 </div>
-                <div class="strategy-actions">
+                
+                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));gap:8px;font-size:11px;margin-bottom:8px">
+                    <div style="background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:4px">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Underlying</div>
+                        <div style="font-weight:600">${d.underlying || 'N/A'}</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:4px">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Timeframe</div>
+                        <div style="font-weight:600">${s.timeframe || 'day'}</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:4px">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Stop Loss</div>
+                        <div style="font-weight:600;color:var(--accent-red)">${d.stop_loss || 'N/A'}</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:4px">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Target</div>
+                        <div style="font-weight:600;color:var(--accent-green)">${d.target || 'N/A'}</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:4px">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Quantity</div>
+                        <div style="font-weight:600">${d.quantity || '1'}</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:4px">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase">Margin Required</div>
+                        <div style="font-weight:600;color:var(--accent-blue)">${d.margin_required || 'N/A'}</div>
+                    </div>
+                </div>
+                
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">
+                    <span style="font-weight:600">Entry:</span> ${entryRules}
+                </div>
+                
+                ${legsHtml ? `<div style="margin-bottom:8px">${legsHtml}</div>` : ''}
+                
+                <div class="strategy-actions" style="display:flex;gap:6px">
                     <button class="btn btn-sm btn-outline" onclick="toggleStrategy('${s.name}')">
                         ${s.is_active ? 'Pause' : 'Resume'}
                     </button>
                     <button class="btn btn-sm btn-danger" onclick="removeStrategy('${s.name}')">Remove</button>
                 </div>
             </div>
-        `).join('');
+        `;
+        }).join('');
     }
 
     // Custom strategies from builder (available but not added for live)
@@ -530,6 +584,7 @@ async function toggleStrategy(name) {
 }
 
 async function removeStrategy(name) {
+    if (!confirm(`Are you sure you want to remove strategy "${name}"?`)) return;
     try {
         await API.post('/api/strategies/remove', { name });
         showToast(`Strategy ${name} removed`, 'success');
@@ -541,6 +596,10 @@ function showModal(id) {
     document.getElementById(id).classList.add('show');
     // Load tested strategies when opening the add-strategy modal
     if (id === 'modal-add-strategy') loadTestedStrategies();
+    // Reset Start Live modal to equity tab
+    if (id === 'modal-start-live') {
+        switchLiveSegment('equity');
+    }
 }
 
 function hideModal(id) {
@@ -694,7 +753,300 @@ async function searchInstruments() {
 
 document.addEventListener('keydown', function(e) {
     if (e.target.id === 'search-inst-query' && e.key === 'Enter') searchInstruments();
+    if (e.target.id === 'fno-search-query' && e.key === 'Enter') searchFnoInstruments();
 });
+
+// ─── F&O Instrument Search ────────────────────────────────────
+
+let currentFnoType = 'FUT';  // FUT or OPT
+
+function switchLiveSegment(segment) {
+    console.log('[F&O] switchLiveSegment:', segment);
+    const equityTab = document.getElementById('live-seg-equity');
+    const fnoTab = document.getElementById('live-seg-fno');
+    const equityPanel = document.getElementById('live-equity-panel');
+    const fnoPanel = document.getElementById('live-fno-panel');
+
+    if (!equityTab || !fnoTab || !equityPanel || !fnoPanel) {
+        console.error('[F&O] Missing DOM elements:', { equityTab, fnoTab, equityPanel, fnoPanel });
+        showToast('Error: Modal elements not found', 'error');
+        return;
+    }
+
+    if (segment === 'equity') {
+        equityTab.style.background = '#1a2332';
+        equityTab.style.color = '#00d4aa';
+        fnoTab.style.background = '#0d1821';
+        fnoTab.style.color = '#8899aa';
+        equityPanel.style.display = 'block';
+        fnoPanel.style.display = 'none';
+    } else {
+        equityTab.style.background = '#0d1821';
+        equityTab.style.color = '#8899aa';
+        fnoTab.style.background = '#1a2332';
+        fnoTab.style.color = '#ff9100';
+        equityPanel.style.display = 'none';
+        fnoPanel.style.display = 'block';
+        // Initialize F&O panel: fetch spot price and load expiries
+        fetchFnoSpotPrice();
+        loadFnoExpiries().catch(e => {
+            console.error('[F&O] loadFnoExpiries failed:', e);
+            showToast('Failed to load F&O data: ' + e.message, 'error');
+        });
+    }
+}
+
+// ─── F&O Strategy and Underlying Management ─────────────────────
+
+let currentFnoSpot = null;
+let currentFnoAtmStrike = null;
+
+function onFnoStrategyChange() {
+    const strategySelect = document.getElementById('fno-strategy');
+    const underlyingSelect = document.getElementById('fno-underlying');
+    const exchangeSelect = document.getElementById('fno-exchange');
+    
+    if (!strategySelect) return;
+    
+    const selectedOption = strategySelect.options[strategySelect.selectedIndex];
+    const underlying = selectedOption.getAttribute('data-underlying');
+    
+    console.log('[F&O] Strategy changed:', strategySelect.value, 'underlying:', underlying);
+    
+    // Set underlying based on strategy
+    if (underlying && underlyingSelect) {
+        underlyingSelect.value = underlying;
+    }
+    
+    // Set exchange based on underlying
+    if (exchangeSelect) {
+        if (underlying === 'SENSEX') {
+            exchangeSelect.value = 'BFO';
+        } else {
+            exchangeSelect.value = 'NFO';
+        }
+    }
+    
+    // Fetch spot price and load expiries
+    fetchFnoSpotPrice();
+    loadFnoExpiries().catch(e => console.error('[F&O] loadFnoExpiries failed:', e));
+}
+
+function onFnoUnderlyingChange() {
+    const underlyingSelect = document.getElementById('fno-underlying');
+    const exchangeSelect = document.getElementById('fno-exchange');
+    
+    if (!underlyingSelect || !exchangeSelect) return;
+    
+    const underlying = underlyingSelect.value;
+    
+    // Auto-set exchange based on underlying
+    if (underlying === 'SENSEX') {
+        exchangeSelect.value = 'BFO';
+    } else {
+        exchangeSelect.value = 'NFO';
+    }
+    
+    fetchFnoSpotPrice();
+    loadFnoExpiries().catch(e => console.error('[F&O] loadFnoExpiries failed:', e));
+}
+
+function onFnoExpiryChange() {
+    // Auto-search instruments when expiry changes
+    searchFnoInstruments();
+}
+
+async function fetchFnoSpotPrice() {
+    const underlyingSelect = document.getElementById('fno-underlying');
+    const spotDisplay = document.getElementById('fno-spot-display');
+    const spotPriceEl = document.getElementById('fno-spot-price');
+    const atmStrikeEl = document.getElementById('fno-atm-strike');
+    
+    if (!underlyingSelect || !spotDisplay) return;
+    
+    const underlying = underlyingSelect.value;
+    console.log('[F&O] Fetching spot price for:', underlying);
+    
+    try {
+        // Map underlying to exchange:symbol format
+        const indexMap = {
+            'NIFTY': 'NSE:NIFTY 50',
+            'SENSEX': 'BSE:SENSEX'
+        };
+        
+        const instrument = indexMap[underlying];
+        if (!instrument) {
+            spotDisplay.style.display = 'none';
+            return;
+        }
+        
+        // Fetch LTP from API
+        const response = await API.get(`/api/market/ltp?instruments=${encodeURIComponent(instrument)}`);
+        
+        let ltp = null;
+        if (response && typeof response === 'object') {
+            const key = Object.keys(response)[0];
+            if (key && response[key]) {
+                ltp = response[key].last_price || response[key].ltp;
+            }
+        }
+        
+        if (ltp) {
+            currentFnoSpot = ltp;
+            // Calculate ATM strike (round to nearest strike interval)
+            const strikeInterval = underlying === 'NIFTY' ? 50 : 100;
+            currentFnoAtmStrike = Math.round(ltp / strikeInterval) * strikeInterval;
+            
+            spotPriceEl.textContent = '₹' + ltp.toLocaleString('en-IN', {maximumFractionDigits: 2});
+            atmStrikeEl.textContent = '₹' + currentFnoAtmStrike.toLocaleString('en-IN');
+            spotDisplay.style.display = 'block';
+            
+            console.log('[F&O] Spot:', ltp, 'ATM Strike:', currentFnoAtmStrike);
+        } else {
+            spotDisplay.style.display = 'none';
+        }
+    } catch (e) {
+        console.warn('[F&O] Failed to fetch spot price:', e);
+        spotDisplay.style.display = 'none';
+    }
+}
+
+function switchFnoType(type) {
+    console.log('[F&O] switchFnoType:', type);
+    currentFnoType = type;
+    const futBtn = document.getElementById('fno-type-futures');
+    const optBtn = document.getElementById('fno-type-options');
+    const optFilters = document.getElementById('fno-options-filters');
+
+    if (!futBtn || !optBtn || !optFilters) {
+        console.error('[F&O] Missing type buttons:', { futBtn, optBtn, optFilters });
+        return;
+    }
+
+    if (type === 'FUT') {
+        futBtn.style.background = '#1a2332';
+        futBtn.style.color = '#ff9100';
+        optBtn.style.background = '#0d1821';
+        optBtn.style.color = '#8899aa';
+        optFilters.style.display = 'none';
+    } else {
+        futBtn.style.background = '#0d1821';
+        futBtn.style.color = '#8899aa';
+        optBtn.style.background = '#1a2332';
+        optBtn.style.color = '#ff9100';
+        optFilters.style.display = 'block';
+    }
+    // Reload expiries for the new type
+    loadFnoExpiries().catch(e => console.error('[F&O] loadFnoExpiries failed:', e));
+}
+
+async function loadFnoExpiries() {
+    console.log('[F&O] loadFnoExpiries called, type:', currentFnoType);
+    const exchangeEl = document.getElementById('fno-exchange');
+    const underlyingEl = document.getElementById('fno-underlying');
+    const expirySelect = document.getElementById('fno-expiry');
+
+    if (!exchangeEl || !underlyingEl || !expirySelect) {
+        console.error('[F&O] Missing form elements:', { exchangeEl, underlyingEl, expirySelect });
+        return;
+    }
+
+    const exchange = exchangeEl.value;
+    const underlying = underlyingEl.value;
+    console.log('[F&O] Loading expiries for:', { exchange, underlying, type: currentFnoType });
+
+    try {
+        const url = `/api/instruments/fno/expiries?exchange=${exchange}&underlying=${encodeURIComponent(underlying)}&instrument_type=${currentFnoType === 'FUT' ? 'FUT' : 'OPT'}`;
+        console.log('[F&O] Fetching:', url);
+        const data = await API.get(url);
+        console.log('[F&O] Got expiries:', data);
+        const expiries = data.expiries || [];
+
+        expirySelect.innerHTML = '<option value="">Nearest</option>';
+        expiries.forEach((exp, idx) => {
+            const d = new Date(exp);
+            const label = d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+            const selected = idx === 0 ? 'selected' : '';
+            expirySelect.innerHTML += `<option value="${exp}" ${selected}>${label}</option>`;
+        });
+        console.log('[F&O] Populated', expiries.length, 'expiries');
+    } catch (e) {
+        console.error('[F&O] Failed to load expiries:', e);
+        expirySelect.innerHTML = '<option value="">Error loading</option>';
+        showToast('Failed to load F&O expiries: ' + e.message, 'error');
+    }
+}
+
+async function searchFnoInstruments() {
+    console.log('[F&O] searchFnoInstruments called');
+    const q = document.getElementById('fno-search-query').value.trim();
+    const exchange = document.getElementById('fno-exchange').value;
+    const underlying = document.getElementById('fno-underlying').value;
+    const expiry = document.getElementById('fno-expiry').value;
+    const resultsDiv = document.getElementById('fno-search-results');
+
+    if (!resultsDiv) {
+        console.error('[F&O] Missing fno-search-results div');
+        return;
+    }
+
+    // Get options filters if in options mode
+    let optionType = '';
+    let strikeRange = 'atm';
+    if (currentFnoType === 'OPT') {
+        optionType = document.getElementById('fno-option-type')?.value || '';
+        strikeRange = document.getElementById('fno-strike-range')?.value || 'atm';
+    }
+
+    console.log('[F&O] Search params:', { q, exchange, underlying, expiry, optionType, strikeRange, type: currentFnoType });
+
+    resultsDiv.style.display = 'block';
+    resultsDiv.innerHTML = '<div style="padding:12px;color:#8899aa;font-size:12px;text-align:center">Searching...</div>';
+
+    try {
+        let url = `/api/instruments/fno/search?exchange=${exchange}&instrument_type=${currentFnoType === 'FUT' ? 'FUT' : 'OPT'}`;
+        if (q) url += `&q=${encodeURIComponent(q)}`;
+        if (underlying) url += `&underlying=${encodeURIComponent(underlying)}`;
+        if (expiry) url += `&expiry=${encodeURIComponent(expiry)}`;
+        if (optionType) url += `&option_type=${optionType}`;
+        if (strikeRange) url += `&strike_range=${strikeRange}`;
+
+        console.log('[F&O] Fetching:', url);
+        const results = await API.get(url);
+        console.log('[F&O] Got', results.length, 'results');
+
+        if (!results.length) {
+            resultsDiv.innerHTML = '<div style="padding:12px;color:#8899aa;font-size:12px;text-align:center">No instruments found. Try adjusting filters.</div>';
+            return;
+        }
+
+        resultsDiv.innerHTML = results.map(r => {
+            const safeSymbol = r.symbol.replace(/'/g, "\\'");
+            const safeName = (r.name || '').replace(/'/g, "\\'");
+            const checked = selectedInstruments.has(r.token) ? 'checked' : '';
+            const typeColor = r.type === 'CE' ? '#00d4aa' : r.type === 'PE' ? '#ff5252' : '#ff9100';
+            const typeLabel = r.type || 'FUT';
+            const expiryLabel = r.expiry ? `<span style="color:#ff9100;font-size:10px;margin-left:4px">${r.expiry}</span>` : '';
+            const strikeLabel = r.strike ? `<span style="color:#5c9eff;font-size:10px;margin-left:4px">₹${r.strike}</span>` : '';
+            const lotLabel = r.lot_size ? `<span style="color:#667788;font-size:9px;margin-left:4px">Lot: ${r.lot_size}</span>` : '';
+
+            return `
+            <div class="fno-result-item" onclick="toggleSearchInstrument(${r.token},'${safeSymbol}','${safeName}');this.querySelector('input').checked=!this.querySelector('input').checked;" style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #1a2332;cursor:pointer;transition:background 0.15s" onmouseover="this.style.background='#1a2332'" onmouseout="this.style.background='transparent'">
+                <input type="checkbox" ${checked} style="accent-color:#ff9100;pointer-events:none;flex-shrink:0">
+                <span style="background:${typeColor};color:#0d1821;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;flex-shrink:0">${typeLabel}</span>
+                <strong style="color:#e0e6ed;font-size:12px;white-space:nowrap">${r.symbol}</strong>
+                ${expiryLabel}
+                ${strikeLabel}
+                ${lotLabel}
+                <span style="margin-left:auto;color:#5c6e7e;font-size:10px;flex-shrink:0">${r.exchange}</span>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        console.error('[F&O] Search failed:', e);
+        resultsDiv.innerHTML = `<div style="padding:12px;color:var(--accent-red);font-size:12px;text-align:center">Error: ${e.message}</div>`;
+        showToast('Failed to search F&O instruments: ' + e.message, 'error');
+    }
+}
 
 // ─── Symbol Autocomplete ──────────────────────────────────────
 // Shared typeahead for chart-symbol, bt-symbol, paper-symbol
@@ -827,6 +1179,56 @@ async function startLive() {
     // Build token→name map for server-side name resolution
     const names = {};
     selectedInstruments.forEach((name, token) => { names[token] = name; });
+    
+    // Check if F&O panel is active - if so, auto-add the selected F&O strategy
+    const fnoPanel = document.getElementById('live-fno-panel');
+    const fnoStrategySelect = document.getElementById('fno-strategy');
+    let fnoStrategy = null;
+    
+    if (fnoPanel && fnoPanel.style.display !== 'none' && fnoStrategySelect) {
+        const selectedStrategy = fnoStrategySelect.value;
+        if (selectedStrategy) {
+            // Map UI strategy names to backend strategy names
+            const strategyMap = {
+                'nifty_call_credit_spread': 'call_credit_spread_runner',
+                'nifty_put_credit_spread': 'put_credit_spread_runner',
+                'nifty_iron_condor': 'iron_condor',
+                'nifty_straddle': 'straddle_strangle',
+                'nifty_strangle': 'short_strangle',
+                'sensex_call_credit_spread': 'call_credit_spread_runner',
+                'sensex_put_credit_spread': 'put_credit_spread_runner',
+                'sensex_iron_condor': 'iron_condor',
+                'sensex_straddle': 'straddle_strangle',
+                'sensex_strangle': 'short_strangle',
+            };
+            fnoStrategy = strategyMap[selectedStrategy] || selectedStrategy;
+            
+            // Get underlying from strategy selection
+            const selectedOption = fnoStrategySelect.options[fnoStrategySelect.selectedIndex];
+            const underlying = selectedOption.getAttribute('data-underlying') || 'NIFTY';
+            
+            // Add strategy before starting live
+            try {
+                showToast(`Adding F&O strategy: ${fnoStrategy}...`, 'info');
+                const addRes = await API.post('/api/strategies/add', { 
+                    name: fnoStrategy,
+                    require_tested: false,  // Allow adding without backtest for F&O
+                    timeframe: '5minute',
+                    params: { underlying: underlying }
+                });
+                if (addRes.error) {
+                    showToast(addRes.error, 'error');
+                    if (addRes.hint) showToast(addRes.hint, 'info');
+                    return;
+                }
+                showToast(`F&O strategy ${fnoStrategy} added`, 'success');
+            } catch (e) {
+                showToast(`Failed to add F&O strategy: ${e.message}`, 'error');
+                return;
+            }
+        }
+    }
+    
     try {
         const res = await API.post('/api/live/start', { tokens, mode, names });
         if (res.error) {
@@ -2520,14 +2922,37 @@ async function resolveToken(prefix) {
     const exchangeEl = document.getElementById(prefix + '-exchange');
     const tokenEl = document.getElementById(prefix + '-token');
     const statusEl = document.getElementById(prefix + '-token-status');
-    const symbol = (symbolEl?.value || '').trim().toUpperCase();
-    const exchange = exchangeEl?.value || 'NSE';
+    let symbol = (symbolEl?.value || '').trim().toUpperCase();
+    let exchange = exchangeEl?.value || 'NSE';
+    
+    // For F&O exchanges, map to actual index instruments on their source exchanges
+    if (exchange === 'NFO') {
+        if (!symbol || !['NIFTY', 'NIFTY50', 'NIFTY 50'].includes(symbol.replace(' ', ''))) {
+            symbol = 'NIFTY 50';
+            if (symbolEl) symbolEl.value = 'NIFTY';
+        } else {
+            symbol = 'NIFTY 50';  // Actual tradingsymbol on NSE
+        }
+        exchange = 'NSE';  // Index is on NSE, not NFO
+        if (statusEl) { statusEl.textContent = 'NFO → NSE:NIFTY 50'; statusEl.style.color = '#ffb74d'; }
+    } else if (exchange === 'BFO') {
+        if (!symbol || symbol !== 'SENSEX') {
+            symbol = 'SENSEX';
+            if (symbolEl) symbolEl.value = 'SENSEX';
+        }
+        exchange = 'BSE';  // Index is on BSE, not BFO
+        if (statusEl) { statusEl.textContent = 'BFO → BSE:SENSEX'; statusEl.style.color = '#ffb74d'; }
+    }
+    
     if (!symbol) {
         if (tokenEl) tokenEl.value = '';
         if (statusEl) { statusEl.textContent = '⚠ enter a symbol'; statusEl.style.color = '#ffb74d'; }
         return;
     }
-    if (statusEl) { statusEl.textContent = 'resolving...'; statusEl.style.color = '#607d8b'; }
+    if (statusEl && !statusEl.textContent.startsWith('NFO') && !statusEl.textContent.startsWith('BFO')) { 
+        statusEl.textContent = 'resolving...'; 
+        statusEl.style.color = '#607d8b'; 
+    }
     try {
         const resp = await API.get('/api/market/resolve-token?symbol=' + encodeURIComponent(symbol) + '&exchange=' + exchange);
         if (tokenEl) tokenEl.value = resp.instrument_token;
@@ -2586,16 +3011,27 @@ async function runPaperTrade() {
             }
             displayFnOPaperResult(result);
         } else {
-            const symbol = document.getElementById('paper-symbol').value.trim().toUpperCase();
+            let symbol = document.getElementById('paper-symbol').value.trim().toUpperCase();
             if (!symbol) {
                 loading.textContent = 'Error: Please enter a symbol (e.g. RELIANCE)';
                 loading.style.color = '#ff5252';
                 return;
             }
+            let exchange = document.getElementById('paper-exchange').value;
+            
+            // Map F&O exchanges to their actual index exchanges
+            if (exchange === 'NFO') {
+                symbol = 'NIFTY 50';
+                exchange = 'NSE';
+            } else if (exchange === 'BFO') {
+                symbol = 'SENSEX';
+                exchange = 'BSE';
+            }
+            
             result = await API.post('/api/paper-trade/run', {
                 strategy: strategy,
                 tradingsymbol: symbol,
-                exchange: document.getElementById('paper-exchange').value,
+                exchange: exchange,
                 interval: document.getElementById('paper-interval').value,
                 days: parseInt(document.getElementById('paper-days').value) || 60,
                 capital: parseFloat(document.getElementById('paper-capital').value) || 100000,
@@ -3818,6 +4254,25 @@ function isFnOCustomStrategy(val) { return val && val.startsWith('fno_custom_');
 function stripFnOPrefix(val) { return val.replace(/^fno_/, ''); }
 function stripFnOCustomPrefix(val) { return val.replace(/^fno_custom_/, ''); }
 
+function onBtExchangeChange() {
+    const exchange = document.getElementById('bt-exchange').value;
+    const symbolEl = document.getElementById('bt-symbol');
+    // Auto-set appropriate symbols for F&O exchanges
+    if (exchange === 'NFO') {
+        symbolEl.value = 'NIFTY';
+        symbolEl.placeholder = 'NIFTY (resolved to NSE:NIFTY 50)';
+    } else if (exchange === 'BFO') {
+        symbolEl.value = 'SENSEX';
+        symbolEl.placeholder = 'SENSEX (resolved to BSE:SENSEX)';
+    } else {
+        // Equity exchange - use default
+        if (symbolEl.value === 'NIFTY' || symbolEl.value === 'SENSEX') {
+            symbolEl.value = 'RELIANCE';
+        }
+        symbolEl.placeholder = 'e.g. RELIANCE';
+    }
+}
+
 function toggleBTMode() {
     const strategy = document.getElementById('bt-strategy').value;
     const isFnO = isFnOStrategy(strategy);
@@ -3879,12 +4334,22 @@ async function runBacktest() {
         } else if (src === 'sample') {
             data = await runBacktestSampleInner();
         } else {
-            const symbol = document.getElementById('bt-symbol').value.trim().toUpperCase();
+            let symbol = document.getElementById('bt-symbol').value.trim().toUpperCase();
             if (!symbol) {
                 document.getElementById('bt-summary').innerHTML = '<span style="color:#ff5252">Please enter a symbol (e.g. RELIANCE)</span>';
                 return;
             }
-            const exchange = document.getElementById('bt-exchange').value;
+            let exchange = document.getElementById('bt-exchange').value;
+            
+            // Map F&O exchanges to their actual index exchanges
+            if (exchange === 'NFO') {
+                symbol = 'NIFTY 50';
+                exchange = 'NSE';
+            } else if (exchange === 'BFO') {
+                symbol = 'SENSEX';
+                exchange = 'BSE';
+            }
+            
             const body = {
                 strategy: strategy,
                 tradingsymbol: symbol,
@@ -5644,6 +6109,267 @@ function _getKeyMetricsForPillar(key, metrics) {
     return m;
 }
 
+// ─── F&O Data Management Functions ─────────────────────────────────
+
+async function fetchFnOData() {
+    const underlying = document.getElementById('fno-data-underlying').value;
+    const interval = document.getElementById('fno-data-interval').value;
+    const fromDate = document.getElementById('fno-data-from').value;
+    const toDate = document.getElementById('fno-data-to').value;
+    const includeOptions = document.getElementById('fno-data-options').checked;
+    
+    if (!fromDate || !toDate) {
+        showToast('Please select from/to dates', 'error');
+        return;
+    }
+    
+    const btn = document.getElementById('btn-fetch-fno');
+    const origText = btn.textContent;
+    btn.textContent = 'Downloading...';
+    btn.disabled = true;
+    
+    try {
+        const res = await fetch('/api/fno-data/fetch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                underlying,
+                from_date: fromDate,
+                to_date: toDate,
+                interval,
+                include_options: includeOptions
+            })
+        }).then(r => r.json());
+        
+        if (res.success) {
+            const r = res.result || {};
+            showToast(`Downloaded: ${r.underlying_candles || 0} candles, ${r.option_chains || 0} options`, 'success');
+            loadFnODataStats();
+        } else {
+            showToast('Download failed: ' + (res.error || 'Unknown error'), 'error');
+        }
+    } catch (e) {
+        showToast('Download error: ' + e.message, 'error');
+    } finally {
+        btn.textContent = origText;
+        btn.disabled = false;
+    }
+}
+
+async function takeFnOSnapshot() {
+    const underlying = document.getElementById('fno-data-underlying').value;
+    
+    // Get nearest expiry from API
+    try {
+        const expiryRes = await fetch(`/api/instruments/fno/expiries?underlying=${underlying}`).then(r => r.json());
+        const expiries = expiryRes.expiries || [];
+        if (!expiries.length) {
+            showToast('No expiries found. Please authenticate first.', 'error');
+            return;
+        }
+        const nearestExpiry = expiries[0];
+        
+        showToast(`Taking snapshot for ${underlying} ${nearestExpiry}...`, 'info');
+        
+        const res = await fetch('/api/fno-data/snapshot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ underlying, expiry: nearestExpiry })
+        }).then(r => r.json());
+        
+        if (res.success) {
+            showToast(`Snapshot saved: ${res.rows_stored} options`, 'success');
+            loadFnODataStats();
+        } else {
+            showToast('Snapshot failed: ' + (res.error || 'Unknown'), 'error');
+        }
+    } catch (e) {
+        showToast('Snapshot error: ' + e.message, 'error');
+    }
+}
+
+async function loadFnODataStats() {
+    try {
+        const stats = await fetch('/api/fno-data/stats').then(r => r.json());
+        const underlying = document.getElementById('fno-data-underlying')?.value || 'NIFTY';
+        const coverage = await fetch(`/api/fno-data/coverage?underlying=${underlying}`).then(r => r.json());
+        
+        const statusEl = document.getElementById('fno-data-status');
+        const coverageEl = document.getElementById('fno-data-coverage');
+        
+        if (statusEl) {
+            statusEl.textContent = `DB: ${stats.db_size_mb || 0} MB | ${stats.option_chain_rows || 0} options | ${stats.underlying_candle_bars || 0} candles`;
+        }
+        
+        if (coverageEl && coverage) {
+            const oc = coverage.option_chains || {};
+            const ul = coverage.underlying_candles || {};
+            let html = '';
+            if (ul.from && ul.to) {
+                html += `<b>Underlying:</b> ${ul.from} to ${ul.to} (${ul.bars} bars) | `;
+            }
+            if (oc.from && oc.to) {
+                html += `<b>Options:</b> ${oc.from} to ${oc.to} (${oc.days} days)`;
+            }
+            if (!html) html = 'No data stored yet. Download data to enable offline backtesting.';
+            coverageEl.innerHTML = html;
+        }
+    } catch (e) {
+        console.error('loadFnODataStats error:', e);
+    }
+}
+
+// Initialize F&O data date fields with defaults
+function initFnODataDates() {
+    const today = new Date();
+    const fromDate = new Date(today);
+    fromDate.setMonth(fromDate.getMonth() - 3); // 3 months ago
+    
+    const fromEl = document.getElementById('fno-data-from');
+    const toEl = document.getElementById('fno-data-to');
+    
+    if (fromEl && !fromEl.value) {
+        fromEl.value = fromDate.toISOString().split('T')[0];
+    }
+    if (toEl && !toEl.value) {
+        toEl.value = today.toISOString().split('T')[0];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Trade Execution Analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function openAITradeAnalysis() {
+    showModal('modal-ai-analysis');
+    
+    // Check if AI analysis is available
+    const statusEl = document.getElementById('ai-status-text');
+    const runBtn = document.getElementById('ai-run-btn');
+    
+    try {
+        const status = await API.get('/api/trade-analysis/status');
+        if (status.available) {
+            statusEl.innerHTML = `<span style="color:#00d4aa">✓ AI Analysis Ready</span> — Using ${status.model}`;
+            runBtn.disabled = false;
+        } else {
+            statusEl.innerHTML = `<span style="color:#ffd93d">⚠ ${status.message}</span>`;
+            runBtn.disabled = true;
+        }
+    } catch (e) {
+        statusEl.innerHTML = `<span style="color:#ff5252">✗ Error checking status: ${e.message}</span>`;
+        runBtn.disabled = true;
+    }
+    
+    // Populate strategy dropdown from journal filters
+    const strategySelect = document.getElementById('ai-strategy-select');
+    const journalStrategy = document.getElementById('j-filter-strategy');
+    if (journalStrategy && strategySelect) {
+        strategySelect.innerHTML = journalStrategy.innerHTML;
+    }
+    
+    // Reset UI state
+    document.getElementById('ai-analysis-loading').style.display = 'none';
+    document.getElementById('ai-analysis-result').style.display = 'none';
+    document.getElementById('ai-analysis-error').style.display = 'none';
+}
+
+function toggleAIAnalysisMode() {
+    const mode = document.getElementById('ai-analysis-mode').value;
+    document.getElementById('ai-filter-strategy').style.display = mode === 'strategy' ? 'block' : 'none';
+    document.getElementById('ai-filter-instrument').style.display = mode === 'instrument' ? 'block' : 'none';
+}
+
+async function runAIAnalysis() {
+    const mode = document.getElementById('ai-analysis-mode').value;
+    const limit = parseInt(document.getElementById('ai-limit').value) || 20;
+    const useAnalysisContext = document.getElementById('ai-use-analysis')?.checked || false;
+    const filterByAnalysis = document.getElementById('ai-filter-analysis')?.checked || false;
+    
+    const loadingEl = document.getElementById('ai-analysis-loading');
+    const resultEl = document.getElementById('ai-analysis-result');
+    const errorEl = document.getElementById('ai-analysis-error');
+    const runBtn = document.getElementById('ai-run-btn');
+    
+    // Show loading state
+    loadingEl.style.display = 'block';
+    resultEl.style.display = 'none';
+    errorEl.style.display = 'none';
+    runBtn.disabled = true;
+    
+    // Build request payload
+    const payload = { 
+        limit,
+        use_analysis_context: useAnalysisContext,
+        filter_by_analysis: filterByAnalysis
+    };
+    
+    if (mode === 'filters') {
+        // Use current journal filters
+        payload.strategy = document.getElementById('j-filter-strategy')?.value || '';
+        payload.instrument = document.getElementById('j-filter-instrument')?.value || '';
+    } else if (mode === 'strategy') {
+        payload.strategy = document.getElementById('ai-strategy-select')?.value || '';
+    } else if (mode === 'instrument') {
+        payload.instrument = document.getElementById('ai-instrument-input')?.value || '';
+    }
+    // For 'recent' mode, just use limit with no filters
+    
+    try {
+        const result = await API.post('/api/trade-analysis/analyze', payload);
+        
+        loadingEl.style.display = 'none';
+        
+        if (!result.success) {
+            errorEl.style.display = 'block';
+            errorEl.textContent = result.error || 'Analysis failed';
+            runBtn.disabled = false;
+            return;
+        }
+        
+        // Display results
+        resultEl.style.display = 'block';
+        
+        // Summary stats
+        const summary = result.summary || {};
+        document.getElementById('ai-trades-count').textContent = result.trades_analyzed || 0;
+        document.getElementById('ai-win-rate').textContent = summary.win_rate ? summary.win_rate.toFixed(1) + '%' : '—';
+        document.getElementById('ai-avg-slippage').textContent = summary.avg_slippage_pct ? summary.avg_slippage_pct.toFixed(3) + '%' : '—';
+        document.getElementById('ai-edge-ratio').textContent = summary.avg_edge_ratio ? summary.avg_edge_ratio.toFixed(2) : '—';
+        
+        // Show analysis symbols count if using analysis context
+        const symbolsContainer = document.getElementById('ai-analysis-symbols-container');
+        const symbolsEl = document.getElementById('ai-analysis-symbols');
+        if (result.analysis_symbols && result.analysis_symbols.length > 0) {
+            if (symbolsContainer) symbolsContainer.style.display = 'block';
+            if (symbolsEl) symbolsEl.textContent = result.analysis_symbols.length;
+        } else {
+            if (symbolsContainer) symbolsContainer.style.display = 'none';
+        }
+        
+        // AI analysis content
+        const contentEl = document.getElementById('ai-analysis-content');
+        contentEl.textContent = result.analysis || 'No analysis generated';
+        
+        // Format markdown headers for better readability
+        let html = (result.analysis || '').replace(/\*\*(.*?)\*\*/g, '<strong style="color:#00d4aa">$1</strong>');
+        html = html.replace(/#{1,3}\s*(.*?)$/gm, '<div style="color:#6366f1;font-weight:700;margin-top:12px">$1</div>');
+        html = html.replace(/- (.*?)$/gm, '<div style="padding-left:12px">• $1</div>');
+        // Highlight missed opportunities and incorrect trades
+        html = html.replace(/⚠️/g, '<span style="color:#ffd93d">⚠️</span>');
+        html = html.replace(/✅/g, '<span style="color:#00d4aa">✅</span>');
+        html = html.replace(/❌/g, '<span style="color:#ff5252">❌</span>');
+        contentEl.innerHTML = html;
+        
+    } catch (e) {
+        loadingEl.style.display = 'none';
+        errorEl.style.display = 'block';
+        errorEl.textContent = 'Analysis failed: ' + e.message;
+    }
+    
+    runBtn.disabled = false;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     loadFullStatus();
     loadSignals();
@@ -5654,4 +6380,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Load custom strategies into all dropdowns early
     loadCustomStrategiesDropdowns();
     loadFnOCustomStrategiesDropdowns();
+    // Initialize F&O data management
+    initFnODataDates();
+    loadFnODataStats();
 });

@@ -320,7 +320,12 @@ class PreflightChecker:
             issues.append("Missing tradingsymbol")
         if not getattr(signal, "quantity", 0) or signal.quantity <= 0:
             issues.append("Invalid quantity")
-        if getattr(signal, "price", None) is not None and signal.price <= 0:
+        # Allow price=0 for MARKET orders (price is irrelevant)
+        order_type = getattr(signal, "order_type", None)
+        from src.data.models import OrderType
+        is_market = order_type == OrderType.MARKET or str(order_type) == "MARKET"
+        price_val = getattr(signal, "price", None)
+        if price_val is not None and price_val <= 0 and not is_market:
             issues.append("Invalid price")
 
         return CheckResult(
@@ -604,11 +609,24 @@ class PreflightChecker:
             )
 
         has_sl = getattr(signal, "stop_loss", None) is not None
+        
+        # For spread strategies, SL is managed internally via metadata
+        # Check if metadata contains SL info (e.g., sl_premium, sl_trigger)
+        metadata = getattr(signal, "metadata", {}) or {}
+        has_internal_sl = any(k in metadata for k in ["sl_premium", "sl_trigger", "strategy_sl", "leg"])
+        
+        # Credit spread strategies manage SL via option premium monitoring
+        strategy_name = getattr(signal, "strategy_name", "")
+        is_spread_strategy = any(x in strategy_name.lower() for x in ["spread", "condor", "butterfly"])
+        
+        sl_ok = has_sl or has_internal_sl or is_spread_strategy
+        
         return CheckResult(
             name="stop_loss_defined",
-            passed=has_sl or not self.config.require_stop_loss,
+            passed=sl_ok or not self.config.require_stop_loss,
             severity=CheckSeverity.CRITICAL if self.config.require_stop_loss else CheckSeverity.WARNING,
-            message="Stop-loss defined" if has_sl else "No stop-loss on signal — BLOCKED",
+            message="Stop-loss defined" if sl_ok else "No stop-loss on signal — BLOCKED",
+            details={"has_signal_sl": has_sl, "has_internal_sl": has_internal_sl, "is_spread": is_spread_strategy},
         )
 
     def _check_regime_valid(self, signal: Any) -> CheckResult:

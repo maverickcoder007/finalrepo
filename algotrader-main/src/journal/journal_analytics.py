@@ -242,7 +242,7 @@ class JournalAnalytics:
                 "pnl": round(total, 2),
                 "win_rate": round(wins / len(pnls), 4) if pnls else 0,
                 "expectancy": round(total / len(pnls), 2) if pnls else 0,
-                "profit_factor": round(profit / loss, 4) if loss > 0 else 0,
+                "profit_factor": round(profit / loss, 4) if loss > 0 else (999 if profit > 0 else 0),
             })
 
         weekly_stats = []
