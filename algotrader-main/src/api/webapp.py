@@ -11,11 +11,31 @@ from fastapi.templating import Jinja2Templates
 from src.api.service import TradingService, TradingServiceManager
 from src.auth.otp_auth import otp_auth
 from src.auth.user_config import UserConfigService
+from src.mcp_server.client import mcp_client
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-app = FastAPI(title="Kite Trading Agent", version="2.0")
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """Start MCP StockResearch server on startup, stop on shutdown."""
+    try:
+        await mcp_client.start()
+        logger.info("mcp_server_started_via_lifespan")
+    except Exception as e:
+        logger.warning("mcp_server_start_failed", error=str(e),
+                       hint="Stock research endpoints will fall back to direct calls")
+    yield
+    try:
+        await mcp_client.stop()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="Kite Trading Agent", version="2.0", lifespan=lifespan)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
@@ -574,6 +594,59 @@ async def straddle_history(request: Request, underlying: str = "NIFTY") -> list[
     return get_user_service(request).get_straddle_history(underlying)
 
 
+# ── OI Intraday Snapshot & Flow Analysis ───────────────────────
+
+@app.post("/api/oi/snapshots/start")
+async def start_oi_snapshots(request: Request) -> dict[str, Any]:
+    """Start the 15-minute OI snapshot scheduler for NIFTY & SENSEX."""
+    svc = get_user_service(request)
+    return await svc.start_oi_snapshots()
+
+
+@app.post("/api/oi/snapshots/stop")
+async def stop_oi_snapshots(request: Request) -> dict[str, Any]:
+    """Stop the 15-minute OI snapshot scheduler."""
+    svc = get_user_service(request)
+    return await svc.stop_oi_snapshots()
+
+
+@app.get("/api/oi/snapshots/status")
+async def oi_snapshot_status(request: Request) -> dict[str, Any]:
+    """Get the current status of the OI snapshot scheduler."""
+    return get_user_service(request).get_oi_snapshot_status()
+
+
+@app.post("/api/oi/snapshots/trigger")
+async def trigger_oi_snapshot(request: Request) -> dict[str, Any]:
+    """Manually trigger an immediate OI option chain snapshot."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    force = body.get("force", False) if body else False
+    svc = get_user_service(request)
+    return await svc.take_oi_snapshot(force=force)
+
+
+@app.get("/api/oi/snapshots/today")
+async def todays_oi_snapshots(request: Request, underlying: str = "NIFTY") -> dict[str, Any]:
+    """Get all snapshot timestamps captured today."""
+    timestamps = get_user_service(request).get_todays_oi_snapshots(underlying)
+    return {"underlying": underlying, "snapshots": timestamps, "count": len(timestamps)}
+
+
+@app.get("/api/oi/intraday/analysis")
+async def intraday_oi_analysis(request: Request, underlying: str = "NIFTY", date: str = "") -> dict[str, Any]:
+    """Run full intraday OI flow analysis — PCR trends, OI walls, smart money, direction."""
+    return get_user_service(request).get_intraday_oi_analysis(underlying, date or None)
+
+
+@app.get("/api/oi/intraday/direction")
+async def market_direction(request: Request, underlying: str = "NIFTY") -> dict[str, Any]:
+    """Get current market direction from intraday OI flow analysis."""
+    return get_user_service(request).get_market_direction(underlying)
+
+
 # ── OI Strategy Routes ─────────────────────────────────────────
 
 @app.post("/api/oi/strategy/scan")
@@ -647,6 +720,298 @@ async def oi_strategy_update_config(request: Request) -> dict[str, Any]:
     except Exception:
         return {"error": "Invalid request body"}
     return get_user_service(request).oi_strategy_update_config(body)
+
+
+# ── OI → FNO Bridge Endpoints ──────────────────────────────────
+
+@app.post("/api/oi/bridge/scan")
+async def oi_fno_bridge_scan(request: Request) -> dict[str, Any]:
+    """Scan OI signals and map each to best FNO strategy."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    underlying = body.get("underlying", "NIFTY") if body else "NIFTY"
+    return await get_user_service(request).oi_fno_bridge_scan_and_map(underlying)
+
+
+@app.post("/api/oi/bridge/backtest")
+async def oi_fno_bridge_backtest(request: Request) -> dict[str, Any]:
+    """Run backtest for a specific OI signal's mapped FNO strategy."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid request body"}
+    signal_id = body.get("signal_id", "")
+    force_refresh = body.get("force_refresh", False)
+    if not signal_id:
+        return {"error": "signal_id is required"}
+    return await get_user_service(request).oi_fno_bridge_backtest_signal(
+        signal_id, force_refresh=force_refresh
+    )
+
+
+@app.post("/api/oi/bridge/execute")
+async def oi_fno_bridge_execute(request: Request) -> dict[str, Any]:
+    """Execute OI signal via mapped FNO strategy (backtest-gated)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid request body"}
+    signal_id = body.get("signal_id", "")
+    skip_backtest = body.get("skip_backtest", False)
+    if not signal_id:
+        return {"error": "signal_id is required"}
+    return await get_user_service(request).oi_fno_bridge_execute_signal(
+        signal_id, skip_backtest=skip_backtest
+    )
+
+
+@app.post("/api/oi/bridge/process-all")
+async def oi_fno_bridge_process_all(request: Request) -> dict[str, Any]:
+    """Full pipeline: scan → map → backtest → approve/reject all."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    underlying = body.get("underlying", "NIFTY") if body else "NIFTY"
+    return await get_user_service(request).oi_fno_bridge_process_all(underlying)
+
+
+@app.get("/api/oi/bridge/plans")
+async def oi_fno_bridge_plans(request: Request, limit: int = 50) -> list[dict[str, Any]]:
+    """Get recent execution plans."""
+    return get_user_service(request).oi_fno_bridge_get_plans(limit)
+
+
+@app.get("/api/oi/bridge/thresholds")
+async def oi_fno_bridge_thresholds(request: Request) -> dict[str, Any]:
+    """Get current backtest quality thresholds."""
+    return get_user_service(request).oi_fno_bridge_get_thresholds()
+
+
+@app.post("/api/oi/bridge/thresholds")
+async def oi_fno_bridge_update_thresholds(request: Request) -> dict[str, Any]:
+    """Update backtest quality thresholds."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid request body"}
+    return get_user_service(request).oi_fno_bridge_update_thresholds(body)
+
+
+@app.get("/api/oi/bridge/mapping-info")
+async def oi_fno_bridge_mapping_info(request: Request) -> dict[str, Any]:
+    """Get signal-to-strategy mapping reference."""
+    return get_user_service(request).oi_fno_bridge_get_mapping_info()
+
+
+@app.post("/api/oi/bridge/clear-cache")
+async def oi_fno_bridge_clear_cache(request: Request) -> dict[str, Any]:
+    """Clear backtest result cache."""
+    return get_user_service(request).oi_fno_bridge_clear_cache()
+
+
+# ════════════════════════════════════════════════════════════════
+# Capital Allocation
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/api/capital/allocation")
+async def capital_allocation(request: Request) -> dict[str, Any]:
+    """Compute current capital allocation report."""
+    return await get_user_service(request).get_capital_allocation()
+
+
+@app.get("/api/capital/limits")
+async def capital_limits(request: Request) -> dict[str, Any]:
+    """Get current allocation limits."""
+    return get_user_service(request).get_capital_limits()
+
+
+@app.post("/api/capital/limits")
+async def update_capital_limits(request: Request) -> dict[str, Any]:
+    """Update allocation limits."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid request body"}
+    return get_user_service(request).update_capital_limits(body)
+
+
+@app.post("/api/capital/pre-trade-check")
+async def capital_pre_trade_check(request: Request) -> dict[str, Any]:
+    """Check if proposed trade passes capital allocation rules."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid request body"}
+    proposed_value = body.get("proposed_value", 0)
+    strategy = body.get("strategy", "")
+    underlying = body.get("underlying", "")
+    capital = body.get("capital", 0)
+    if not proposed_value or not strategy:
+        return {"error": "proposed_value and strategy are required"}
+    return get_user_service(request).check_pre_trade_capital(
+        proposed_value=proposed_value, strategy=strategy,
+        underlying=underlying, capital=capital,
+    )
+
+
+# ════════════════════════════════════════════════════════════════
+# Execution Quality Scoring
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/api/execution-quality/scores")
+async def execution_quality_scores(request: Request, limit: int = 50) -> list[dict[str, Any]]:
+    """Get recent execution quality scores."""
+    return get_user_service(request).get_execution_quality_scores(limit)
+
+
+@app.get("/api/execution-quality/summary")
+async def execution_quality_summary(request: Request) -> dict[str, Any]:
+    """Get execution quality summary statistics."""
+    return get_user_service(request).get_execution_quality_summary()
+
+
+# ════════════════════════════════════════════════════════════════
+# Strategy Decay Monitor
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/api/strategy/decay/evaluate")
+async def evaluate_strategy_decay(request: Request) -> dict[str, Any]:
+    """Evaluate strategy decay (single or all strategies)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    strategy_name = body.get("strategy_name", "") if body else ""
+    return get_user_service(request).evaluate_strategy_decay(strategy_name)
+
+
+@app.get("/api/strategy/decay/history")
+async def strategy_decay_history(request: Request, limit: int = 50) -> list[dict[str, Any]]:
+    """Get strategy decay evaluation history."""
+    return get_user_service(request).get_decay_history(limit)
+
+
+@app.get("/api/strategy/decay/thresholds")
+async def strategy_decay_thresholds(request: Request) -> dict[str, Any]:
+    """Get current strategy decay detection thresholds."""
+    return get_user_service(request).get_decay_thresholds()
+
+
+@app.post("/api/strategy/decay/thresholds")
+async def update_strategy_decay_thresholds(request: Request) -> dict[str, Any]:
+    """Update strategy decay detection thresholds."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"error": "Invalid request body"}
+    return get_user_service(request).update_decay_thresholds(body)
+
+
+# ════════════════════════════════════════════════════════════════
+# Portfolio Greeks (F&O)
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/api/portfolio/greeks")
+async def portfolio_greeks(request: Request) -> dict[str, Any]:
+    """Compute portfolio-level Greeks for all F&O positions."""
+    return await get_user_service(request).get_portfolio_greeks()
+
+
+@app.get("/api/portfolio/greeks/last")
+async def portfolio_greeks_last(request: Request) -> dict[str, Any]:
+    """Get last computed portfolio Greeks report."""
+    return get_user_service(request).get_last_portfolio_greeks()
+
+
+# ════════════════════════════════════════════════════════════════
+# Regime-Aware Strategy Switching
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/api/regime/evaluate")
+async def regime_evaluate(request: Request) -> dict[str, Any]:
+    """Evaluate current market regime and recommend optimal F&O strategy."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    underlying = body.get("underlying", "NIFTY") if body else "NIFTY"
+    return await get_user_service(request).evaluate_regime(underlying)
+
+
+@app.get("/api/regime/current")
+async def regime_current(request: Request, underlying: str = "NIFTY") -> dict[str, Any]:
+    """Get the most recent regime assessment."""
+    return get_user_service(request).get_current_regime(underlying)
+
+
+@app.get("/api/regime/history")
+async def regime_history(request: Request, underlying: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    """Get regime assessment history."""
+    return get_user_service(request).get_regime_history(underlying, limit)
+
+
+# ────────────────────────────────────────────────────────────────
+# Trade Data Capture & Daily Analysis
+# ────────────────────────────────────────────────────────────────
+
+@app.get("/api/trade-data/replay/{trade_id}")
+async def trade_replay(request: Request, trade_id: str) -> dict[str, Any]:
+    """Full trade replay with OHLCV candles and analysis (MFE/MAE, bar PnL)."""
+    return get_user_service(request).get_trade_replay(trade_id)
+
+
+@app.get("/api/trade-data/daily")
+async def trade_daily_analysis(request: Request, date: str = "") -> dict[str, Any]:
+    """Daily analysis of all trades — instrument-wise, strategy-wise, symbol-wise."""
+    return get_user_service(request).get_daily_trade_analysis(date)
+
+
+@app.get("/api/trade-data/daily/range")
+async def trade_daily_range(
+    request: Request, from_date: str = "", to_date: str = "", days: int = 7,
+) -> list[dict[str, Any]]:
+    """Daily analysis for a date range."""
+    return get_user_service(request).get_daily_trade_analysis_range(from_date, to_date, days)
+
+
+@app.get("/api/trade-data/trades")
+async def trade_data_trades(
+    request: Request, date: str = "", instrument: str = "", limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Get tracked trades — filter by date or instrument."""
+    svc = get_user_service(request)
+    if instrument:
+        return svc.get_trades_by_instrument(instrument, limit)
+    if date:
+        return svc.get_trades_for_date(date)
+    return svc.get_recent_trade_data(limit)
+
+
+@app.get("/api/trade-data/open")
+async def trade_data_open(request: Request) -> list[dict[str, Any]]:
+    """Get currently open tracked trades."""
+    return get_user_service(request).get_open_trade_data()
+
+
+@app.get("/api/trade-data/stats")
+async def trade_data_stats(request: Request) -> dict[str, Any]:
+    """Trade data store statistics."""
+    return get_user_service(request).get_trade_data_stats()
+
+
+@app.post("/api/trade-data/fetch-candles")
+async def trade_data_fetch_candles(request: Request) -> dict[str, Any]:
+    """Trigger OHLCV candle fetch for closed trades missing data."""
+    return await get_user_service(request).fetch_pending_trade_candles()
+
+
+@app.get("/api/trade-data/instrument/{symbol}")
+async def trade_data_by_instrument(request: Request, symbol: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Get all trades for a specific instrument/tradingsymbol."""
+    return get_user_service(request).get_trades_by_instrument(symbol, limit)
 
 
 @app.get("/api/analysis/status")
@@ -1889,6 +2254,104 @@ async def fno_data_snapshot(request: Request) -> dict[str, Any]:
     except Exception as e:
         logger.error("fno_data_snapshot_error", error=str(e))
         return {"success": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════
+# Stock Research API — all calls go through the MCP server
+# ══════════════════════════════════════════════════════════════
+
+
+@app.get("/api/research/mcp/status")
+async def mcp_status() -> dict[str, Any]:
+    """Check whether the MCP StockResearch server is connected."""
+    return {"connected": mcp_client.is_connected}
+
+
+@app.get("/api/research/mcp/tools")
+async def mcp_tools() -> dict[str, Any]:
+    """List all available tools on the MCP StockResearch server."""
+    if not mcp_client.is_connected:
+        raise HTTPException(503, "MCP server not connected")
+    tools = await mcp_client.list_tools()
+    return {"tools": tools}
+
+
+@app.post("/api/research/mcp/call")
+async def mcp_call_tool(request: Request) -> dict[str, Any]:
+    """
+    Generic endpoint to call any MCP tool by name.
+
+    Body JSON: {"tool": "fetch_stock_news", "args": {"symbol": "RELIANCE", "limit": 5}}
+    """
+    if not mcp_client.is_connected:
+        raise HTTPException(503, "MCP server not connected")
+    body = await request.json()
+    tool_name = body.get("tool", "")
+    tool_args = body.get("args", {})
+    if not tool_name:
+        raise HTTPException(400, "Missing 'tool' in request body")
+    result = await mcp_client.call_tool(tool_name, **tool_args)
+    if "error" in result and "MCP tool call failed" in str(result.get("error", "")):
+        raise HTTPException(500, result["error"])
+    return result
+
+
+@app.get("/api/research/news/{symbol}")
+async def stock_news(request: Request, symbol: str, limit: int = 15) -> dict[str, Any]:
+    """Fetch latest news via MCP tool `fetch_stock_news`."""
+    if not mcp_client.is_connected:
+        # Fallback: direct call if MCP server is down
+        from src.mcp_server.news_fetcher import fetch_latest_news
+        return await fetch_latest_news(symbol, limit=limit)
+    return await mcp_client.call_tool("fetch_stock_news", symbol=symbol, limit=limit)
+
+
+@app.get("/api/research/annual-reports/{symbol}")
+async def stock_annual_reports(request: Request, symbol: str, limit: int = 10) -> dict[str, Any]:
+    """Fetch annual reports via MCP tool `fetch_stock_annual_reports`."""
+    if not mcp_client.is_connected:
+        from src.mcp_server.annual_report_fetcher import fetch_annual_reports
+        return await fetch_annual_reports(symbol, limit=limit)
+    return await mcp_client.call_tool("fetch_stock_annual_reports", symbol=symbol, limit=limit)
+
+
+@app.get("/api/research/best-stocks")
+async def best_stocks(request: Request, top_n: int = 5, enrich: bool = True) -> dict[str, Any]:
+    """Get top analytical picks via MCP tool `get_best_stocks`."""
+    if not mcp_client.is_connected:
+        from src.mcp_server.best_stocks import get_best_analytical_stocks
+        return await get_best_analytical_stocks(top_n=top_n, enrich=enrich)
+    return await mcp_client.call_tool("get_best_stocks", top_n=top_n, enrich=enrich)
+
+
+@app.get("/api/research/full/{symbol}")
+async def full_stock_research(request: Request, symbol: str) -> dict[str, Any]:
+    """Full research report via MCP tool `get_stock_research`."""
+    if not mcp_client.is_connected:
+        from src.mcp_server.news_fetcher import fetch_latest_news
+        from src.mcp_server.annual_report_fetcher import fetch_annual_reports
+        import asyncio as _asyncio
+        symbol = symbol.upper().strip()
+        news, reports = await _asyncio.gather(
+            fetch_latest_news(symbol, limit=10),
+            fetch_annual_reports(symbol, limit=5),
+            return_exceptions=True,
+        )
+        return {
+            "symbol": symbol,
+            "latest_news": news if isinstance(news, dict) else {"error": str(news)},
+            "annual_reports": reports if isinstance(reports, dict) else {"error": str(reports)},
+            "scanner_analysis": None,
+        }
+    return await mcp_client.call_tool("get_stock_research", symbol=symbol)
+
+
+@app.get("/api/research/search-news")
+async def search_news_by_topic(request: Request, topic: str, limit: int = 10) -> dict[str, Any]:
+    """Search market news by topic via MCP tool `search_stock_news_by_topic`."""
+    if not mcp_client.is_connected:
+        raise HTTPException(503, "MCP server not connected — topic search requires MCP")
+    return await mcp_client.call_tool("search_stock_news_by_topic", topic=topic, limit=limit)
 
 
 @app.websocket("/ws/live")

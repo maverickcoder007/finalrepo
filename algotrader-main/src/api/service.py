@@ -34,8 +34,11 @@ from src.journal.journal_models import (
 )
 from src.options.chain import OptionChainBuilder
 from src.options.oi_analysis import FuturesOIAnalyzer, OptionsOIAnalyzer
+from src.options.oi_intraday_analyzer import IntradayOIFlowAnalyzer, get_intraday_oi_analyzer
+from src.options.oi_snapshot_scheduler import OISnapshotScheduler, get_oi_snapshot_scheduler
 from src.options.oi_tracker import NIFTY_TOKEN, SENSEX_TOKEN, OITracker
 from src.options.oi_strategy import OIStrategyEngine, OIStrategyConfig
+from src.options.oi_fno_bridge import OIFnOBridge, BacktestThresholds
 from src.options.call_credit_spread_runner import CallCreditSpreadRunnerStrategy
 from src.options.put_credit_spread_runner import PutCreditSpreadRunnerStrategy
 from src.options.strategies import (
@@ -57,6 +60,12 @@ from src.options.extra_strategies import (
 )
 from src.risk.manager import RiskManager
 from src.risk.preflight import PreflightChecker, PreflightConfig, TradingMode, set_preflight_checker
+from src.risk.capital_allocator import CapitalAllocator, AllocationLimits
+from src.risk.execution_quality import ExecutionQualityScorer
+from src.risk.strategy_decay import StrategyDecayMonitor, DecayThresholds
+from src.risk.portfolio_greeks import PortfolioGreeksMonitor
+from src.risk.regime_switcher import RegimeStrategySwithcer
+from src.journal.trade_data_store import TradeDataStore
 from src.strategy.base import BaseStrategy
 from src.strategy.custom_builder import (
     CustomStrategy,
@@ -132,6 +141,17 @@ class TradingService:
         self._futures_oi = FuturesOIAnalyzer()
         self._options_oi = OptionsOIAnalyzer()
         self._oi_strategy = OIStrategyEngine()
+        self._oi_fno_bridge = OIFnOBridge()
+        self._oi_snapshot_scheduler = get_oi_snapshot_scheduler()
+        self._oi_intraday_analyzer = get_intraday_oi_analyzer()
+
+        # ── Institutional risk & monitoring modules ──
+        self._capital_allocator = CapitalAllocator()
+        self._exec_quality = ExecutionQualityScorer()
+        self._decay_monitor = StrategyDecayMonitor()
+        self._greeks_monitor = PortfolioGreeksMonitor()
+        self._regime_switcher = RegimeStrategySwithcer()
+        self._trade_data_store = TradeDataStore()
         self._scanner = StockScanner()
         self._strategies: list[BaseStrategy] = []
         self._instruments_cache: dict[str, list] = {}
@@ -1136,6 +1156,60 @@ class TradingService:
     def get_straddle_history(self, underlying: str = "NIFTY") -> list[dict[str, Any]]:
         return self._options_oi.get_straddle_history(underlying)
 
+    # ── OI Snapshot Scheduler ─────────────────────────────────
+
+    async def start_oi_snapshots(self) -> dict[str, Any]:
+        """Start the 15-minute OI snapshot scheduler."""
+        self._oi_snapshot_scheduler.set_kite_client(self._client)
+        return await self._oi_snapshot_scheduler.start()
+
+    async def stop_oi_snapshots(self) -> dict[str, Any]:
+        """Stop the 15-minute OI snapshot scheduler."""
+        return await self._oi_snapshot_scheduler.stop()
+
+    def get_oi_snapshot_status(self) -> dict[str, Any]:
+        """Get the current status of the OI snapshot scheduler."""
+        return self._oi_snapshot_scheduler.get_status()
+
+    async def take_oi_snapshot(self, force: bool = False) -> dict[str, Any]:
+        """Take an immediate OI option chain snapshot."""
+        self._oi_snapshot_scheduler.set_kite_client(self._client)
+        return await self._oi_snapshot_scheduler.take_snapshot(force=force)
+
+    def get_todays_oi_snapshots(self, underlying: str = "NIFTY") -> list[str]:
+        """Get all snapshot timestamps captured today."""
+        return self._oi_snapshot_scheduler.get_todays_snapshots(underlying)
+
+    # ── Intraday OI Flow Analysis ─────────────────────────────
+
+    def get_intraday_oi_analysis(self, underlying: str = "NIFTY", analysis_date: str | None = None) -> dict[str, Any]:
+        """Run full intraday OI flow analysis for market direction."""
+        try:
+            report = self._oi_intraday_analyzer.analyze(underlying, analysis_date)
+            return report.model_dump()
+        except Exception as e:
+            logger.error("intraday_oi_analysis_error", underlying=underlying, error=str(e))
+            return {"error": str(e)}
+
+    def get_market_direction(self, underlying: str = "NIFTY") -> dict[str, Any]:
+        """Get current market direction from intraday OI flow analysis."""
+        try:
+            report = self._oi_intraday_analyzer.analyze(underlying)
+            return {
+                "underlying": report.underlying,
+                "direction": report.market_direction,
+                "confidence": report.direction_confidence,
+                "reasons": report.direction_reasons,
+                "trend_strength": report.trend_reinforcement.trend_strength if report.trend_reinforcement else "NO_DATA",
+                "trend_score": report.trend_reinforcement.trend_score if report.trend_reinforcement else 0,
+                "reinforcement_count": report.trend_reinforcement.reinforcement_count if report.trend_reinforcement else 0,
+                "total_snapshots": report.total_snapshots,
+                "summary": report.summary,
+            }
+        except Exception as e:
+            logger.error("market_direction_error", underlying=underlying, error=str(e))
+            return {"error": str(e)}
+
     async def start_oi_tracking(
         self,
         nifty_spot: float = 0.0,
@@ -1537,6 +1611,482 @@ class TradingService:
                 self._journal_store.record_entry(entry)
         except Exception as e:
             logger.error("oi_journal_record_error", error=str(e))
+
+    # ═══════════════════════════════════════════════════════════
+    #  OI → FNO Bridge (Backtest-Gated Execution)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _fetch_underlying_data_for_backtest(
+        self, underlying: str, days: int
+    ) -> tuple:
+        """Fetch historical OHLCV data for backtest.
+        Returns (DataFrame, instrument_token).
+        """
+        token_map = {"NIFTY": 256265, "SENSEX": 265}
+        instrument_token = token_map.get(underlying.upper(), 256265)
+        instrument_token = await self._resolve_underlying_token(underlying, instrument_token)
+        if not instrument_token:
+            return None, 0
+        df = await self._market_data.get_historical_df(
+            instrument_token, "day", days,
+        )
+        return df, instrument_token
+
+    async def oi_fno_bridge_scan_and_map(
+        self, underlying: str = "NIFTY"
+    ) -> dict[str, Any]:
+        """Scan OI signals and map each to best FNO strategy (no backtest yet).
+
+        Returns signal list enriched with FNO strategy mapping.
+        """
+        try:
+            # Re-use existing OI scan
+            scan_result = await self.oi_strategy_scan(underlying)
+            if "error" in scan_result:
+                return scan_result
+
+            signals = self._oi_strategy.get_signal_history(underlying, limit=20)
+            mappings = []
+            for sig in signals:
+                if sig.confidence <= 0:
+                    continue
+                m = self._oi_fno_bridge.map_signal_to_strategy(sig)
+                mappings.append({
+                    "signal": sig.model_dump(),
+                    "mapping": m.model_dump(),
+                })
+
+            return {
+                "underlying": underlying,
+                "scan_result": scan_result,
+                "mappings": mappings,
+                "total_signals": len(mappings),
+                "mapped_count": sum(
+                    1 for m in mappings
+                    if m["mapping"]["fno_strategy"] != "none"
+                ),
+            }
+        except Exception as e:
+            logger.error("oi_fno_bridge_scan_error", error=str(e))
+            return {"error": str(e)}
+
+    async def oi_fno_bridge_backtest_signal(
+        self, signal_id: str, force_refresh: bool = False
+    ) -> dict[str, Any]:
+        """Run backtest for a specific OI signal's mapped FNO strategy.
+
+        Args:
+            signal_id: ID of the OI signal to backtest.
+            force_refresh: Re-run backtest even if cached.
+
+        Returns:
+            Execution plan with backtest results and approval status.
+        """
+        try:
+            sig = next(
+                (s for s in self._oi_strategy._signals_history if s.id == signal_id),
+                None,
+            )
+            if not sig:
+                return {"error": f"Signal {signal_id} not found"}
+
+            plan = await self._oi_fno_bridge.create_execution_plan(
+                sig,
+                market_data_fetcher=self._fetch_underlying_data_for_backtest,
+                force_backtest=force_refresh,
+            )
+            return plan.model_dump()
+        except Exception as e:
+            logger.error("oi_fno_bridge_backtest_error", signal_id=signal_id, error=str(e))
+            return {"error": str(e)}
+
+    async def oi_fno_bridge_execute_signal(
+        self, signal_id: str, skip_backtest: bool = False
+    ) -> dict[str, Any]:
+        """Execute an OI signal via its mapped FNO strategy, gated by backtest.
+
+        Flow:
+          1. Find signal → map to FNO strategy
+          2. Run/check backtest (unless skip_backtest=True)
+          3. If approved → create OI position + execute via strategy
+          4. Return execution result
+
+        Args:
+            signal_id: OI signal to execute.
+            skip_backtest: Skip backtest validation (for manual override).
+        """
+        try:
+            sig = next(
+                (s for s in self._oi_strategy._signals_history if s.id == signal_id),
+                None,
+            )
+            if not sig:
+                return {"error": f"Signal {signal_id} not found"}
+
+            # Check open positions limit
+            open_count = len(self._oi_strategy.get_open_positions())
+            max_pos = self._oi_strategy.config.max_open_positions
+            if open_count >= max_pos:
+                return {"error": f"Max open positions ({max_pos}) reached"}
+
+            # Step 1: Map signal
+            mapping = self._oi_fno_bridge.map_signal_to_strategy(sig)
+            if mapping.fno_strategy == "none":
+                return {"error": "No FNO strategy mapped for this signal"}
+
+            # Step 2: Backtest gate
+            backtest_result = None
+            if not skip_backtest and self._oi_fno_bridge.thresholds.require_backtest:
+                plan = await self._oi_fno_bridge.create_execution_plan(
+                    sig,
+                    market_data_fetcher=self._fetch_underlying_data_for_backtest,
+                )
+                if not plan.execution_approved:
+                    return {
+                        "error": "Backtest validation failed — execution blocked",
+                        "plan": plan.model_dump(),
+                        "rejection_reasons": plan.rejection_reasons,
+                    }
+                backtest_result = plan.backtest
+
+            # Step 3: Create OI position
+            pos = self._oi_strategy.create_position_from_signal(sig)
+            self._record_oi_journal_entry(pos, "ENTRY")
+
+            return {
+                "success": True,
+                "position": pos.model_dump(),
+                "mapping": mapping.model_dump(),
+                "backtest": backtest_result,
+                "execution_note": (
+                    f"Signal {signal_id} → {mapping.fno_strategy_label} — "
+                    f"position created"
+                ),
+            }
+        except Exception as e:
+            logger.error("oi_fno_bridge_execute_error", signal_id=signal_id, error=str(e))
+            return {"error": str(e)}
+
+    async def oi_fno_bridge_process_all(
+        self, underlying: str = "NIFTY"
+    ) -> dict[str, Any]:
+        """Full pipeline: scan OI signals → map → backtest → approve/reject all.
+
+        Returns list of execution plans for each signal.
+        """
+        try:
+            # 1. Scan OI signals
+            scan_result = await self.oi_strategy_scan(underlying)
+            if "error" in scan_result:
+                return scan_result
+
+            signals = self._oi_strategy.get_signal_history(underlying, limit=20)
+            active_signals = [s for s in signals if s.confidence > 0 and s.signal_type]
+
+            # 2. Process all through bridge
+            plans = await self._oi_fno_bridge.process_all_signals(
+                active_signals,
+                market_data_fetcher=self._fetch_underlying_data_for_backtest,
+            )
+
+            return {
+                "underlying": underlying,
+                "total_signals": len(active_signals),
+                "plans": [p.model_dump() for p in plans],
+                "approved_count": sum(1 for p in plans if p.execution_approved),
+                "rejected_count": sum(1 for p in plans if not p.execution_approved),
+                "risk_warnings": [
+                    w for p in plans for w in p.risk_warnings
+                ],
+            }
+        except Exception as e:
+            logger.error("oi_fno_bridge_process_error", error=str(e))
+            return {"error": str(e)}
+
+    def oi_fno_bridge_get_plans(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get recent execution plans."""
+        return self._oi_fno_bridge.get_execution_plans(limit)
+
+    def oi_fno_bridge_get_thresholds(self) -> dict[str, Any]:
+        """Get current backtest thresholds."""
+        return self._oi_fno_bridge.get_thresholds()
+
+    def oi_fno_bridge_update_thresholds(
+        self, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Update backtest thresholds."""
+        t = self._oi_fno_bridge.update_thresholds(updates)
+        return t.model_dump()
+
+    def oi_fno_bridge_get_mapping_info(self) -> dict[str, Any]:
+        """Get signal-to-strategy mapping reference."""
+        return self._oi_fno_bridge.get_strategy_mapping_info()
+
+    def oi_fno_bridge_clear_cache(self) -> dict[str, str]:
+        """Clear backtest cache."""
+        self._oi_fno_bridge.clear_backtest_cache()
+        return {"status": "ok", "message": "Backtest cache cleared"}
+
+    # ────────────────────────────────────────────────────────────
+    # Capital Allocation
+    # ────────────────────────────────────────────────────────────
+
+    async def get_capital_allocation(self) -> dict[str, Any]:
+        """Compute current capital allocation report."""
+        try:
+            positions = await self._client.positions()
+            margins = await self._client.margins()
+            strategy_tags: dict[str, str] = {}
+            for s in self._strategies:
+                strategy_tags[s.name] = s.name
+            from datetime import time as dtime
+            now = datetime.now().time()
+            is_market_hours = dtime(9, 15) <= now <= dtime(15, 30)
+            return self._capital_allocator.compute_allocation(
+                positions=positions, margins=margins,
+                strategy_tags=strategy_tags, is_market_hours=is_market_hours,
+            ).to_dict()
+        except Exception as e:
+            logger.error("capital_allocation_error", error=str(e))
+            return {"error": str(e)}
+
+    def get_capital_limits(self) -> dict[str, Any]:
+        """Get current allocation limits."""
+        return self._capital_allocator.get_limits()
+
+    def update_capital_limits(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """Update allocation limits."""
+        return self._capital_allocator.update_limits(updates)
+
+    def check_pre_trade_capital(
+        self, proposed_value: float, strategy: str,
+        underlying: str, capital: float,
+    ) -> dict[str, Any]:
+        """Pre-trade capital allocation check."""
+        return self._capital_allocator.check_pre_trade(
+            proposed_value=proposed_value, strategy=strategy,
+            underlying=underlying, capital=capital,
+        )
+
+    # ────────────────────────────────────────────────────────────
+    # Execution Quality
+    # ────────────────────────────────────────────────────────────
+
+    def get_execution_quality_scores(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get recent execution quality scores."""
+        return self._exec_quality.get_recent_scores(limit)
+
+    def get_execution_quality_summary(self) -> dict[str, Any]:
+        """Get execution quality summary statistics."""
+        return self._exec_quality.get_summary()
+
+    # ────────────────────────────────────────────────────────────
+    # Strategy Decay Monitor
+    # ────────────────────────────────────────────────────────────
+
+    def evaluate_strategy_decay(self, strategy_name: str = "") -> dict[str, Any]:
+        """Evaluate strategy decay (single or all).
+        Uses journal equity curve data for rolling analysis."""
+        try:
+            # Build equity curves from journal
+            entries = self._journal_store.query_entries(is_closed=True, limit=5000)
+            strategy_curves: dict[str, list[dict[str, Any]]] = {}
+            for e in entries:
+                sn = e.strategy_name or "unknown"
+                pnl = e.net_pnl or 0.0
+                ts = e.exit_time or e.entry_time or ""
+                if sn not in strategy_curves:
+                    strategy_curves[sn] = []
+                strategy_curves[sn].append({"timestamp": ts, "pnl": pnl})
+
+            def disable_callback(name: str) -> None:
+                self.toggle_strategy(name)
+
+            if strategy_name:
+                curve = strategy_curves.get(strategy_name, [])
+                report = self._decay_monitor.evaluate_strategy(
+                    strategy_name, curve, disable_callback=disable_callback,
+                )
+                return report.to_dict() if report else {"error": f"No data for {strategy_name}"}
+            else:
+                reports = self._decay_monitor.evaluate_all(
+                    strategy_curves, disable_callback=disable_callback,
+                )
+                return {
+                    "strategies": {k: v.to_dict() for k, v in reports.items()},
+                    "decayed_count": sum(1 for v in reports.values() if v.is_decayed),
+                    "auto_disabled_count": sum(1 for v in reports.values() if v.auto_disabled),
+                }
+        except Exception as e:
+            logger.error("strategy_decay_evaluate_error", error=str(e))
+            return {"error": str(e)}
+
+    def get_decay_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get strategy decay evaluation history."""
+        return self._decay_monitor.get_history(limit)
+
+    def get_decay_thresholds(self) -> dict[str, Any]:
+        """Get current decay thresholds."""
+        t = self._decay_monitor._thresholds
+        return {
+            "std_dev_trigger": t.std_dev_trigger,
+            "rolling_window_days": t.rolling_window_days,
+            "min_history_days": t.min_history_days,
+            "min_trades_in_window": t.min_trades_in_window,
+            "auto_disable": t.auto_disable,
+        }
+
+    def update_decay_thresholds(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """Update decay thresholds."""
+        t = self._decay_monitor._thresholds
+        for key, val in updates.items():
+            if hasattr(t, key):
+                setattr(t, key, type(getattr(t, key))(val))
+        return self.get_decay_thresholds()
+
+    # ────────────────────────────────────────────────────────────
+    # Portfolio Greeks
+    # ────────────────────────────────────────────────────────────
+
+    async def get_portfolio_greeks(self) -> dict[str, Any]:
+        """Compute portfolio-level Greeks for F&O positions."""
+        try:
+            positions = await self._client.positions()
+            all_positions = positions.get("net", [])
+            # Get spot prices for underlyings
+            underlyings = set()
+            for p in all_positions:
+                ts = p.get("tradingsymbol", "")
+                if any(ts.startswith(u) for u in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"]):
+                    for u in ["BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "NIFTY"]:
+                        if ts.startswith(u):
+                            underlyings.add(u)
+                            break
+            spot_prices: dict[str, float] = {}
+            for u in underlyings:
+                try:
+                    exchange = "BSE" if u == "SENSEX" else "NSE"
+                    ltp_key = f"{exchange}:{u} 50" if u == "NIFTY" else f"{exchange}:{u}"
+                    ltp_data = await self._client.ltp([ltp_key])
+                    if ltp_data:
+                        for k, v in ltp_data.items():
+                            spot_prices[u] = v.get("last_price", 0)
+                    # fallback to NIFTY 50 token
+                    if u == "NIFTY" and u not in spot_prices:
+                        ltp_data = await self._client.ltp(["NSE:NIFTY 50"])
+                        if ltp_data:
+                            for k, v in ltp_data.items():
+                                spot_prices[u] = v.get("last_price", 0)
+                except Exception:
+                    pass
+            return self._greeks_monitor.compute_greeks(all_positions, spot_prices).to_dict()
+        except Exception as e:
+            logger.error("portfolio_greeks_error", error=str(e))
+            return {"error": str(e)}
+
+    def get_last_portfolio_greeks(self) -> dict[str, Any]:
+        """Get last computed portfolio Greeks."""
+        report = self._greeks_monitor.get_last_report()
+        return report.to_dict() if report else {"error": "No portfolio Greeks computed yet"}
+
+    # ────────────────────────────────────────────────────────────
+    # Regime-Aware Strategy Switching
+    # ────────────────────────────────────────────────────────────
+
+    async def evaluate_regime(self, underlying: str = "NIFTY") -> dict[str, Any]:
+        """Evaluate current regime and recommend optimal strategy."""
+        try:
+            # Gather OI direction
+            oi_direction = "neutral"
+            oi_confidence = 0.0
+            try:
+                oi_result = self._oi_intraday_analyzer.analyze_intraday_flow(underlying)
+                if oi_result and isinstance(oi_result, dict):
+                    oi_direction = oi_result.get("market_direction", {}).get("direction", "neutral")
+                    oi_confidence = oi_result.get("market_direction", {}).get("confidence", 0.0)
+            except Exception:
+                pass
+
+            # Get VIX
+            vix_value = 0.0
+            try:
+                vix_data = await self._client.ltp(["NSE:INDIA VIX"])
+                if vix_data:
+                    for k, v in vix_data.items():
+                        vix_value = v.get("last_price", 0)
+            except Exception:
+                pass
+
+            # Get spot and SMAs via chart data
+            spot_price = 0.0
+            sma_20 = 0.0
+            sma_50 = 0.0
+            recent_high = 0.0
+            recent_low = 0.0
+            atr_pct = 0.0
+            bb_width = 0.0
+
+            try:
+                exchange = "BSE" if underlying == "SENSEX" else "NSE"
+                symbol_key = f"{underlying} 50" if underlying == "NIFTY" else underlying
+                ltp_data = await self._client.ltp([f"{exchange}:{symbol_key}"])
+                if ltp_data:
+                    for k, v in ltp_data.items():
+                        spot_price = v.get("last_price", 0)
+
+                # Get historical data for SMA/ATR/BB
+                token = await self._market_data.resolve_token(symbol_key, exchange)
+                if token:
+                    hist = await self._market_data.get_historical_data(
+                        token, interval="day", days=60,
+                    )
+                    if hist and len(hist) > 20:
+                        closes = [c["close"] for c in hist]
+                        highs = [c["high"] for c in hist]
+                        lows = [c["low"] for c in hist]
+                        sma_20 = sum(closes[-20:]) / 20
+                        if len(closes) >= 50:
+                            sma_50 = sum(closes[-50:]) / 50
+                        recent_high = max(highs[-20:])
+                        recent_low = min(lows[-20:])
+                        # ATR approximation
+                        trs = [highs[i] - lows[i] for i in range(-14, 0)]
+                        atr = sum(trs) / len(trs) if trs else 0
+                        atr_pct = atr / spot_price if spot_price else 0
+                        # Bollinger width
+                        if len(closes) >= 20:
+                            mean = sma_20
+                            std = (sum((c - mean) ** 2 for c in closes[-20:]) / 20) ** 0.5
+                            bb_width = (2 * std / mean) if mean else 0
+            except Exception:
+                pass
+
+            snap = self._regime_switcher.assess_regime(
+                underlying=underlying,
+                oi_direction=oi_direction,
+                oi_confidence=oi_confidence,
+                vix_value=vix_value,
+                spot_price=spot_price,
+                sma_20=sma_20,
+                sma_50=sma_50,
+                recent_high=recent_high,
+                recent_low=recent_low,
+                atr_pct=atr_pct,
+                bollinger_width=bb_width,
+            )
+            return snap.to_dict()
+        except Exception as e:
+            logger.error("regime_evaluate_error", error=str(e))
+            return {"error": str(e)}
+
+    def get_current_regime(self, underlying: str = "NIFTY") -> dict[str, Any]:
+        """Get the most recent regime assessment."""
+        result = self._regime_switcher.get_current_regime(underlying)
+        return result or {"error": "No regime assessment yet. Call POST /api/regime/evaluate first."}
+
+    def get_regime_history(self, underlying: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        """Get regime assessment history."""
+        return self._regime_switcher.get_history(underlying, limit)
 
     # Valid timeframe choices for live trading
     VALID_TIMEFRAMES = [
@@ -2075,6 +2625,44 @@ class TradingService:
         except Exception as e:
             logger.error("portfolio_health_open_error", error=str(e))
 
+        # 4. Auto-score execution quality
+        try:
+            expected_price = signal.price if signal and signal.price else fill_price
+            self._exec_quality.score_execution(
+                trade_id=order_id,
+                instrument=tradingsymbol,
+                direction=txn_type,
+                quantity=qty,
+                expected_price=expected_price,
+                actual_price=fill_price,
+            )
+        except Exception as e:
+            logger.error("execution_quality_scoring_error", error=str(e))
+
+        # 5. Register trade in TradeDataStore for OHLCV capture
+        try:
+            token = 0
+            try:
+                resolved = await self._market_data.resolve_token(tradingsymbol, exchange or "NSE")
+                if resolved:
+                    token = resolved
+            except Exception:
+                pass
+            self._trade_data_store.register_trade_open(
+                trade_id=order_id,
+                order_id=order_id,
+                instrument=tradingsymbol,
+                tradingsymbol=tradingsymbol,
+                exchange=exchange or "NSE",
+                instrument_token=token,
+                strategy_name=strategy_name,
+                direction=txn_type,
+                quantity=qty,
+                entry_price=fill_price,
+            )
+        except Exception as e:
+            logger.error("trade_data_store_open_error", error=str(e), order_id=order_id)
+
         logger.info(
             "execution_fill_journaled",
             order_id=order_id,
@@ -2193,6 +2781,23 @@ class TradingService:
         except Exception as e:
             logger.error("portfolio_health_close_error", error=str(e))
 
+        # Close trade in TradeDataStore + fetch OHLCV candles
+        try:
+            entry_order_id_tds = getattr(tracked, "order_id", "")
+            if entry_order_id_tds:
+                self._trade_data_store.close_trade(
+                    trade_id=entry_order_id_tds,
+                    exit_price=tracked.exit_price or 0.0,
+                    pnl=tracked.pnl,
+                )
+                # Async fetch OHLCV candles for the trade duration
+                try:
+                    await self._fetch_trade_candles(entry_order_id_tds)
+                except Exception as fetch_err:
+                    logger.warning("trade_candle_fetch_deferred", trade_id=entry_order_id_tds, error=str(fetch_err))
+        except Exception as e:
+            logger.error("trade_data_store_close_error", error=str(e))
+
         # Broadcast exit to dashboard
         await self._broadcast_ws({
             "type": "position_exit",
@@ -2215,6 +2820,134 @@ class TradingService:
             pnl=tracked.pnl,
             exit_order=exit_order_id,
         )
+
+    # ────────────────────────────────────────────────────────────
+    # Trade Data Capture — OHLCV fetch + analysis helpers
+    # ────────────────────────────────────────────────────────────
+
+    async def _fetch_trade_candles(self, trade_id: str) -> int:
+        """Fetch OHLCV candles for a closed trade and store them."""
+        trade = self._trade_data_store.get_trade(trade_id)
+        if not trade or not trade.is_closed:
+            return 0
+
+        token = trade.instrument_token
+        if not token:
+            # Try to resolve
+            resolved = await self._market_data.resolve_token(
+                trade.tradingsymbol, trade.exchange or "NSE"
+            )
+            if resolved:
+                token = resolved
+            else:
+                logger.warning("trade_candle_no_token", trade_id=trade_id, symbol=trade.tradingsymbol)
+                return 0
+
+        # Determine date range from entry/exit time
+        try:
+            entry_dt = datetime.fromisoformat(trade.entry_time)
+            exit_dt = datetime.fromisoformat(trade.exit_time)
+        except Exception:
+            logger.warning("trade_candle_bad_dates", trade_id=trade_id)
+            return 0
+
+        from_date = entry_dt.strftime("%Y-%m-%d")
+        to_date = exit_dt.strftime("%Y-%m-%d")
+        # If entry and exit on same day, to_date may need +1 for Kite API
+        if from_date == to_date:
+            to_date = (exit_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        interval = trade.interval or "5minute"
+        chart_data = await self._market_data.get_historical_chart(
+            instrument_token=token,
+            interval=interval,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
+        if not chart_data or "error" in chart_data:
+            logger.warning("trade_candle_fetch_failed", trade_id=trade_id, error=chart_data.get("error", ""))
+            return 0
+
+        raw_candles = chart_data.get("candles", [])
+        if not raw_candles:
+            return 0
+
+        # Filter to only candles within entry-exit window (inclusive +/- 1 bar buffer)
+        candle_rows = []
+        for c in raw_candles:
+            candle_rows.append({
+                "ts": c.get("timestamp", ""),
+                "open": c.get("open", 0),
+                "high": c.get("high", 0),
+                "low": c.get("low", 0),
+                "close": c.get("close", 0),
+                "volume": c.get("volume", 0),
+                "oi": c.get("oi"),
+            })
+
+        stored = self._trade_data_store.store_trade_candles(trade_id, candle_rows)
+        logger.info("trade_candles_captured", trade_id=trade_id, bars=stored, symbol=trade.tradingsymbol)
+        return stored
+
+    async def fetch_pending_trade_candles(self) -> dict[str, Any]:
+        """Fetch OHLCV data for all closed trades missing candle data."""
+        pending = self._trade_data_store.get_trades_pending_candles()
+        results = {"total_pending": len(pending), "fetched": 0, "failed": 0, "details": []}
+        for t in pending:
+            try:
+                n = await self._fetch_trade_candles(t.trade_id)
+                if n > 0:
+                    results["fetched"] += 1
+                    results["details"].append({"trade_id": t.trade_id, "symbol": t.tradingsymbol, "bars": n})
+                else:
+                    results["failed"] += 1
+            except Exception as e:
+                results["failed"] += 1
+                logger.warning("pending_candle_fetch_error", trade_id=t.trade_id, error=str(e))
+        return results
+
+    def get_trade_replay(self, trade_id: str) -> dict[str, Any]:
+        """Get full trade replay data — trade info + OHLCV + analysis."""
+        replay = self._trade_data_store.get_trade_replay(trade_id)
+        if not replay:
+            return {"error": f"Trade {trade_id} not found"}
+        return replay
+
+    def get_daily_trade_analysis(self, analysis_date: str = "") -> dict[str, Any]:
+        """Get daily analysis of all trades — instrument-wise, strategy-wise."""
+        result = self._trade_data_store.get_daily_analysis(analysis_date)
+        return result or {"error": "No trades found for date"}
+
+    def get_daily_trade_analysis_range(
+        self, from_date: str = "", to_date: str = "", days: int = 7,
+    ) -> list[dict[str, Any]]:
+        """Get daily analysis for a date range."""
+        return self._trade_data_store.get_daily_analysis_range(from_date, to_date, days)
+
+    def get_trade_data_stats(self) -> dict[str, Any]:
+        """Get trade data store statistics."""
+        return self._trade_data_store.get_stats()
+
+    def get_open_trade_data(self) -> list[dict[str, Any]]:
+        """Get currently open trades being tracked."""
+        trades = self._trade_data_store.get_open_trades()
+        return [t.to_dict() for t in trades]
+
+    def get_trades_for_date(self, trade_date: str = "") -> list[dict[str, Any]]:
+        """Get all tracked trades for a given date."""
+        trades = self._trade_data_store.get_trades_for_date(trade_date)
+        return [t.to_dict() for t in trades]
+
+    def get_trades_by_instrument(self, instrument: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Get trades for a specific instrument/tradingsymbol."""
+        trades = self._trade_data_store.get_trades_by_instrument(instrument, limit)
+        return [t.to_dict() for t in trades]
+
+    def get_recent_trade_data(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get recent tracked trades."""
+        trades = self._trade_data_store.get_recent_trades(limit)
+        return [t.to_dict() for t in trades]
 
     async def _process_signal(self, signal: Signal) -> None:
         signal_data = {

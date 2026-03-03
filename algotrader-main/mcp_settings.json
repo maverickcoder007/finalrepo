@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "stock-research": {
+      "command": "python",
+      "args": ["-m", "src.mcp_server"],
+      "cwd": ".",
+      "env": {},
+      "description": "Stock Research MCP Server — news, annual reports, best analytical picks for NSE/BSE stocks"
+    }
+  }
+}
