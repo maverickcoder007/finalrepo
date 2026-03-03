@@ -2873,11 +2873,32 @@ class TradingService:
         if not raw_candles:
             return 0
 
-        # Filter to only candles within entry-exit window (inclusive +/- 1 bar buffer)
+        # Filter candles to entry-exit window (keep 1-bar buffer on each side)
+        entry_iso = entry_dt.isoformat()
+        exit_iso = exit_dt.isoformat()
         candle_rows = []
-        for c in raw_candles:
+        for i, c in enumerate(raw_candles):
+            ts = c.get("timestamp", "")
+            # Keep bars between entry and exit, plus immediate neighbours
+            if ts and (entry_iso <= ts <= exit_iso
+                       or (i > 0 and i < len(raw_candles) - 1)):
+                pass  # include
+            elif ts and ts < entry_iso and i < len(raw_candles) - 1:
+                next_ts = raw_candles[i + 1].get("timestamp", "")
+                if next_ts >= entry_iso:
+                    pass  # 1-bar buffer before entry
+                else:
+                    continue
+            elif ts and ts > exit_iso and i > 0:
+                prev_ts = raw_candles[i - 1].get("timestamp", "")
+                if prev_ts <= exit_iso:
+                    pass  # 1-bar buffer after exit
+                else:
+                    continue
+            else:
+                continue
             candle_rows.append({
-                "ts": c.get("timestamp", ""),
+                "ts": ts,
                 "open": c.get("open", 0),
                 "high": c.get("high", 0),
                 "low": c.get("low", 0),

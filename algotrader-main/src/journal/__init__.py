@@ -37,6 +37,7 @@ from src.journal.journal_models import (
 from src.journal.journal_store import JournalStore
 from src.journal.journal_analytics import JournalAnalytics
 from src.journal.portfolio_health import PortfolioHealthTracker
+from src.journal.trade_data_store import TradeDataStore
 
 __all__ = [
     # Models
@@ -47,4 +48,5 @@ __all__ = [
     "JournalEntry",
     # Engines
     "JournalStore", "JournalAnalytics", "PortfolioHealthTracker",
+    "TradeDataStore",
 ]

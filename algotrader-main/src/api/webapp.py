@@ -184,6 +184,7 @@ async def api_status(request: Request, full: bool = False) -> dict[str, Any]:
         "execution": svc.get_execution_summary(),
         "ticks": svc.get_live_ticks(),
         "signals": svc.get_recent_signals(20),
+        "trade_data": svc.get_trade_data_stats(),
     }
     if svc.is_authenticated and full:
         try:

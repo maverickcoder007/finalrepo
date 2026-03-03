@@ -735,6 +735,29 @@ GET /api/pro-journal/portfolio-health
 GET /api/pro-journal/equity-curve?days=365
 ```
 
+### 6.6  Post-Trade Analysis Pipeline
+
+```
+Step 1: Check trade data store health
+  GET /api/trade-data/stats
+
+Step 2: Review today's trading performance
+  GET /api/trade-data/daily
+  → by_instrument, by_strategy, by_tradingsymbol breakdowns + pnl_curve
+
+Step 3: Drill into multi-day trends
+  GET /api/trade-data/daily/range?days=7
+
+Step 4: Replay individual trades (MFE/MAE/edge ratio)
+  GET /api/trade-data/replay/{trade_id}
+
+Step 5: Backfill candles for any trades missing OHLCV data
+  POST /api/trade-data/fetch-candles
+
+Step 6: Inspect all trades for a specific instrument
+  GET /api/trade-data/instrument/{symbol}?limit=50
+```
+
 ---
 
 ## 7  Common Patterns

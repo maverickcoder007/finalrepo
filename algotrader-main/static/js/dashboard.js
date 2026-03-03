@@ -4900,7 +4900,8 @@ function switchReportTab(tab) {
     // Load data
     const loaders = {
         pnl: loadPnLReport, holdings: loadHoldingsReport, positions: loadPositionsReport,
-        trades: loadTradesReport, orders: loadOrdersReport, margins: loadMarginsReport
+        trades: loadTradesReport, orders: loadOrdersReport, margins: loadMarginsReport,
+        'trade-analysis': loadTradeAnalysisReport
     };
     if (loaders[tab]) loaders[tab]();
 }
@@ -5077,6 +5078,103 @@ async function loadMarginsReport() {
         cards.innerHTML = html || '<div class="card" style="padding:20px;color:var(--text-muted)">No margin data</div>';
     } catch (e) {
         document.getElementById('margins-cards').innerHTML = '<div style="color:#ff5252">' + e.message + '</div>';
+    }
+}
+
+async function loadTradeAnalysisReport() {
+    try {
+        const data = await API.get('/api/trade-data/daily');
+        const cards = document.getElementById('ta-summary-cards');
+        const totalPnl = data.total_pnl || 0;
+        const pnlColor = totalPnl >= 0 ? '#00d4aa' : '#ff5252';
+        cards.innerHTML =
+            metricCard('Total Trades', data.total_trades || 0) +
+            metricCard('Day P&L', '₹' + formatNum(totalPnl), pnlColor) +
+            metricCard('Win Rate', (data.win_rate || 0).toFixed(1) + '%', (data.win_rate||0) >= 50 ? '#00d4aa' : '#ff5252') +
+            metricCard('Avg Duration', (data.avg_duration_minutes || 0).toFixed(0) + ' min');
+
+        // By Instrument
+        const instBody = document.getElementById('ta-by-instrument-body');
+        const byInst = data.by_instrument || {};
+        if (Object.keys(byInst).length > 0) {
+            instBody.innerHTML = Object.entries(byInst).map(([k, v]) =>
+                '<tr><td>' + k + '</td><td>' + (v.total_trades||0) + '</td>' +
+                '<td style="color:' + ((v.total_pnl||0) >= 0 ? '#00d4aa' : '#ff5252') + '">₹' + formatNum(v.total_pnl||0) + '</td>' +
+                '<td>' + (v.win_rate||0).toFixed(1) + '%</td>' +
+                '<td style="font-size:11px;color:var(--text-muted)">' + (v.symbols||[]).join(', ') + '</td></tr>'
+            ).join('');
+        } else {
+            instBody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center">No data</td></tr>';
+        }
+
+        // By Strategy
+        const stratBody = document.getElementById('ta-by-strategy-body');
+        const byStrat = data.by_strategy || {};
+        if (Object.keys(byStrat).length > 0) {
+            stratBody.innerHTML = Object.entries(byStrat).map(([k, v]) =>
+                '<tr><td>' + k + '</td><td>' + (v.total_trades||0) + '</td>' +
+                '<td style="color:' + ((v.total_pnl||0) >= 0 ? '#00d4aa' : '#ff5252') + '">₹' + formatNum(v.total_pnl||0) + '</td>' +
+                '<td>' + (v.win_rate||0).toFixed(1) + '%</td>' +
+                '<td style="font-size:11px;color:var(--text-muted)">' + (v.instruments||[]).join(', ') + '</td></tr>'
+            ).join('');
+        } else {
+            stratBody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);text-align:center">No data</td></tr>';
+        }
+
+        // Trade list
+        const tradesBody = document.getElementById('ta-trades-body');
+        const trades = data.trades || [];
+        if (trades.length > 0) {
+            tradesBody.innerHTML = trades.map(t => {
+                const pnl = t.pnl || 0;
+                const pColor = pnl >= 0 ? '#00d4aa' : '#ff5252';
+                const replayBtn = t.candle_count > 0
+                    ? '<button class="btn btn-sm btn-outline" onclick="showTradeReplay(\'' + t.trade_id + '\')">📊</button>'
+                    : '<span style="color:var(--text-muted);font-size:11px">—</span>';
+                return '<tr><td style="font-size:11px">' + (t.trade_id||'').substring(0,10) + '</td>' +
+                    '<td>' + (t.symbol||'') + '</td>' +
+                    '<td>' + (t.strategy||'') + '</td>' +
+                    '<td>' + (t.direction||'') + '</td>' +
+                    '<td>' + (t.quantity||0) + '</td>' +
+                    '<td>₹' + formatNum(t.entry_price||0) + '</td>' +
+                    '<td>' + (t.is_closed ? '₹' + formatNum(t.exit_price||0) : '<span style="color:#ffa726">Open</span>') + '</td>' +
+                    '<td style="color:' + pColor + '">₹' + formatNum(pnl) + '</td>' +
+                    '<td>' + replayBtn + '</td></tr>';
+            }).join('');
+        } else {
+            tradesBody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted);text-align:center">No trades today</td></tr>';
+        }
+    } catch (e) {
+        document.getElementById('ta-summary-cards').innerHTML = '<div style="color:#ff5252">' + e.message + '</div>';
+    }
+}
+
+async function showTradeReplay(tradeId) {
+    try {
+        const data = await API.get('/api/trade-data/replay/' + tradeId);
+        if (data.error) { alert(data.error); return; }
+        const trade = data.trade || {};
+        const analysis = data.analysis || {};
+        const bars = data.candle_count || 0;
+        let html = '<div style="padding:16px">';
+        html += '<h3 style="color:var(--accent-green);margin-bottom:12px">' + (trade.tradingsymbol||'') + ' — Trade Replay (' + bars + ' bars)</h3>';
+        html += '<div class="grid grid-4" style="margin-bottom:12px">';
+        html += metricCard('MFE', '₹' + formatNum(analysis.mfe||0) + ' (' + (analysis.mfe_pct||0).toFixed(2) + '%)', '#00d4aa');
+        html += metricCard('MAE', '₹' + formatNum(analysis.mae||0) + ' (' + (analysis.mae_pct||0).toFixed(2) + '%)', '#ff5252');
+        html += metricCard('Edge Ratio', (analysis.edge_ratio||0) === Infinity ? '∞' : (analysis.edge_ratio||0).toFixed(2));
+        html += metricCard('Volatility', (analysis.volatility||0).toFixed(4) + '%');
+        html += '</div>';
+        html += '<div class="grid grid-3" style="margin-bottom:12px">';
+        html += metricCard('Entry', '₹' + formatNum(trade.entry_price||0));
+        html += metricCard('Exit', '₹' + formatNum(trade.exit_price||0));
+        html += metricCard('P&L', '₹' + formatNum(trade.pnl||0), (trade.pnl||0) >= 0 ? '#00d4aa' : '#ff5252');
+        html += '</div>';
+        html += '<p style="color:var(--text-muted);font-size:12px">Direction: ' + (trade.direction||'') + ' | Strategy: ' + (trade.strategy_name||'') + ' | Qty: ' + (trade.quantity||0) + '</p>';
+        html += '<p style="color:var(--text-muted);font-size:12px">Bar range: ' + (analysis.price_low||0) + ' — ' + (analysis.price_high||0) + ' | Avg Vol: ' + formatNum(analysis.avg_volume||0) + '</p>';
+        html += '</div>';
+        showAlert(html, 'info');
+    } catch (e) {
+        alert('Failed to load replay: ' + e.message);
     }
 }
 

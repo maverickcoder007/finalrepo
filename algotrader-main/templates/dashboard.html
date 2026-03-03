@@ -1423,6 +1423,7 @@
                 <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('trades')">Trades</button>
                 <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('orders')">Orders</button>
                 <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('margins')">Margins</button>
+                <button class="btn btn-sm btn-outline report-tab" onclick="switchReportTab('trade-analysis')">Trade Analysis</button>
             </div>
             <div id="report-view-pnl" class="report-view">
                 <div class="grid grid-3" id="pnl-summary-cards" style="margin-bottom:16px"></div>
@@ -1474,6 +1475,35 @@
             </div>
             <div id="report-view-margins" class="report-view" style="display:none">
                 <div class="grid grid-3" id="margins-cards"></div>
+            </div>
+            <div id="report-view-trade-analysis" class="report-view" style="display:none">
+                <div class="grid grid-4" id="ta-summary-cards" style="margin-bottom:16px"></div>
+                <div class="grid grid-2" style="margin-bottom:16px">
+                    <div class="card">
+                        <div class="card-title">By Instrument</div>
+                        <div class="table-wrap" style="max-height:300px;overflow-y:auto">
+                            <table><thead><tr><th>Instrument</th><th>Trades</th><th>P&L</th><th>Win Rate</th><th>Symbols</th></tr></thead>
+                                <tbody id="ta-by-instrument-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">By Strategy</div>
+                        <div class="table-wrap" style="max-height:300px;overflow-y:auto">
+                            <table><thead><tr><th>Strategy</th><th>Trades</th><th>P&L</th><th>Win Rate</th><th>Instruments</th></tr></thead>
+                                <tbody id="ta-by-strategy-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Trades Executed Today</div>
+                    <div class="table-wrap" style="max-height:400px;overflow-y:auto">
+                        <table><thead><tr><th>Trade ID</th><th>Symbol</th><th>Strategy</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Replay</th></tr></thead>
+                            <tbody id="ta-trades-body"></tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
 
