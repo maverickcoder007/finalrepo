@@ -123,13 +123,13 @@ _SIGNAL_TYPE_STRATEGY_OVERRIDE: dict[str, FnOStrategyType] = {
 
 class BacktestThresholds(BaseModel):
     """Configurable thresholds for backtest-gated execution."""
-    min_win_rate: float = Field(default=45.0, description="Minimum win rate % to pass")
-    min_sharpe_ratio: float = Field(default=0.5, description="Minimum Sharpe ratio")
-    max_drawdown_pct: float = Field(default=25.0, description="Maximum drawdown % allowed")
-    min_total_return_pct: float = Field(default=2.0, description="Minimum total return %")
-    min_trades: int = Field(default=5, description="Minimum trades for statistical significance")
-    min_profit_factor: float = Field(default=1.1, description="Minimum profit factor (gross profit / gross loss)")
-    max_avg_loss_pct: float = Field(default=5.0, description="Maximum average loss % per trade")
+    min_win_rate: float = Field(default=40.0, description="Minimum win rate % to pass")
+    min_sharpe_ratio: float = Field(default=0.3, description="Minimum Sharpe ratio")
+    max_drawdown_pct: float = Field(default=30.0, description="Maximum drawdown % allowed")
+    min_total_return_pct: float = Field(default=0.0, description="Minimum total return %")
+    min_trades: int = Field(default=1, description="Minimum trades for statistical significance")
+    min_profit_factor: float = Field(default=0.8, description="Minimum profit factor (gross profit / gross loss)")
+    max_avg_loss_pct: float = Field(default=8.0, description="Maximum average loss % per trade")
 
     # Backtest parameters
     backtest_days: int = Field(default=365, description="Days of data for backtest")

@@ -12,10 +12,14 @@ from src.auth.authenticator import KiteAuthenticator
 from src.data.backtest import BacktestEngine, WalkForwardOptimizer
 from src.data.journal import TradeJournal
 from src.data.models import (
+    Exchange,
     Interval,
+    OrderType,
+    ProductType,
     Signal,
     Tick,
     TickMode,
+    TransactionType,
 )
 from src.data.paper_trader import PaperTradingEngine
 from src.data.synthetic import generate_synthetic_ohlcv
@@ -1417,6 +1421,15 @@ class TradingService:
             if result.signals:
                 await self._enrich_oi_signals_with_live_prices(result.signals)
 
+            # Enrich signals with mapped FNO strategy from bridge
+            if result.signals:
+                for sig in result.signals:
+                    if sig.confidence > 0:
+                        mapping = self._oi_fno_bridge.map_signal_to_strategy(sig)
+                        sig.metadata["mapped_strategy"] = mapping.fno_strategy
+                        sig.metadata["mapped_strategy_label"] = mapping.fno_strategy_label
+                        sig.metadata["strategy_rationale"] = mapping.strategy_rationale
+
             # Auto-execute if configured
             if self._oi_strategy.config.auto_execute and result.signals:
                 for sig in result.signals:
@@ -1424,10 +1437,36 @@ class TradingService:
                         pos = self._oi_strategy.create_position_from_signal(sig)
                         # Record in journal
                         self._record_oi_journal_entry(pos, "ENTRY")
-            return result.model_dump()
+
+            # Include available DB strategies for UI
+            scan_data = result.model_dump()
+            scan_data["available_strategies"] = self._get_available_fno_strategies_for_oi()
+            return scan_data
         except Exception as e:
             logger.error("oi_strategy_scan_error", underlying=underlying, error=str(e))
             return {"error": str(e)}
+
+    def _get_available_fno_strategies_for_oi(self) -> list[dict[str, Any]]:
+        """Return F&O strategies available for OI signal execution (from DB + built-in)."""
+        strategies = []
+        # Custom strategies from DB (fno_custom_strategies.json)
+        for cfg in self._fno_strategy_store.list_all():
+            strategies.append({
+                "name": cfg["name"],
+                "label": cfg["name"].replace("_", " ").title(),
+                "type": cfg.get("strategy_type", "custom"),
+                "source": "custom",
+                "underlying": cfg.get("underlying", "NIFTY"),
+            })
+        # Built-in strategies
+        for name in self.FNO_STRATEGIES:
+            strategies.append({
+                "name": name,
+                "label": name.replace("_", " ").title(),
+                "type": "built_in",
+                "source": "built_in",
+            })
+        return strategies
 
     async def _enrich_oi_signals_with_live_prices(self, signals: list) -> None:
         """Fetch live LTP for OI strategy signals and update entry_price/SL/target."""
@@ -1695,7 +1734,61 @@ class TradingService:
                 market_data_fetcher=self._fetch_underlying_data_for_backtest,
                 force_backtest=force_refresh,
             )
-            return plan.model_dump()
+
+            result = plan.model_dump()
+
+            # ── Log test signal to _signal_log so it appears in Dashboard > Signals ──
+            mapping_info = result.get("mapping") or {}
+            bt = result.get("backtest") or {}
+            approved = result.get("execution_approved", False)
+            strategy_label = mapping_info.get("fno_strategy_label") or mapping_info.get("fno_strategy", "unknown")
+            test_signal_data = {
+                "timestamp": datetime.now().isoformat(),
+                "strategy": f"OI_Bridge:{strategy_label}",
+                "tradingsymbol": sig.underlying or "NIFTY",
+                "transaction_type": sig.signal_type or "TEST",
+                "quantity": 0,
+                "price": 0,
+                "confidence": bt.get("win_rate", 0) or 0,
+                "metadata": {
+                    "type": "oi_bridge_test",
+                    "signal_id": signal_id,
+                    "approved": approved,
+                    "win_rate": bt.get("win_rate"),
+                    "sharpe": bt.get("sharpe_ratio"),
+                    "total_return_pct": bt.get("total_return_pct"),
+                    "total_trades": bt.get("total_trades"),
+                    "failure_reasons": bt.get("failure_reasons", []),
+                },
+            }
+            self._signal_log.append(test_signal_data)
+            await self._broadcast_ws({"type": "signal", "data": test_signal_data})
+            logger.info("oi_bridge_test_logged", signal_id=signal_id, approved=approved, strategy=strategy_label)
+
+            # ── If APPROVED, auto-add the mapped strategy to active strategies ──
+            if approved:
+                mapped_strategy_name = mapping_info.get("fno_strategy", "")
+                if mapped_strategy_name and mapped_strategy_name != "none":
+                    try:
+                        add_result = await self.add_strategy(
+                            name=mapped_strategy_name,
+                            params={"underlying": sig.underlying or "NIFTY", "source": "oi_bridge", "signal_id": signal_id},
+                            timeframe="5minute",
+                            require_tested=False,  # Bridge backtest already validated
+                        )
+                        if add_result.get("success"):
+                            logger.info("oi_bridge_auto_added_strategy", name=mapped_strategy_name, signal_id=signal_id)
+                            result["strategy_added"] = True
+                            result["strategy_add_result"] = add_result
+                        else:
+                            logger.warning("oi_bridge_strategy_add_failed", name=mapped_strategy_name, result=add_result)
+                            result["strategy_added"] = False
+                            result["strategy_add_result"] = add_result
+                    except Exception as strat_err:
+                        logger.warning("oi_bridge_strategy_add_error", name=mapped_strategy_name, error=str(strat_err))
+                        result["strategy_added"] = False
+
+            return result
         except Exception as e:
             logger.error("oi_fno_bridge_backtest_error", signal_id=signal_id, error=str(e))
             return {"error": str(e)}
@@ -1708,7 +1801,7 @@ class TradingService:
         Flow:
           1. Find signal → map to FNO strategy
           2. Run/check backtest (unless skip_backtest=True)
-          3. If approved → create OI position + execute via strategy
+          3. If approved → create OI position + place broker order + log signal
           4. Return execution result
 
         Args:
@@ -1749,20 +1842,79 @@ class TradingService:
                     }
                 backtest_result = plan.backtest
 
-            # Step 3: Create OI position
+            # Step 3: Create OI position (internal tracking)
             pos = self._oi_strategy.create_position_from_signal(sig)
             self._record_oi_journal_entry(pos, "ENTRY")
 
-            return {
+            # Step 4: Build a proper Signal and route through execution engine
+            # Determine exchange enum
+            exchange_str = sig.exchange or "NFO"
+            try:
+                exchange_enum = Exchange(exchange_str)
+            except ValueError:
+                exchange_enum = Exchange.NFO
+
+            # Determine transaction type
+            txn_type = TransactionType.BUY if pos.direction == "BUY" else TransactionType.SELL
+
+            strategy_label = mapping.fno_strategy_label or mapping.fno_strategy
+            broker_signal = Signal(
+                tradingsymbol=pos.tradingsymbol or f"{sig.underlying}_{sig.option_type}_{int(sig.strike)}",
+                exchange=exchange_enum,
+                transaction_type=txn_type,
+                quantity=pos.quantity,
+                price=pos.entry_price if pos.entry_price > 0 else None,
+                order_type=OrderType.LIMIT if pos.entry_price > 0 else OrderType.MARKET,
+                product=ProductType.NRML,
+                stop_loss=pos.stop_loss if pos.stop_loss > 0 else None,
+                target=pos.target if pos.target > 0 else None,
+                strategy_name=f"oi_bridge_{mapping.fno_strategy}",
+                confidence=sig.confidence,
+                metadata={
+                    "source": "oi_fno_bridge",
+                    "signal_id": signal_id,
+                    "signal_type": sig.signal_type,
+                    "mapped_strategy": mapping.fno_strategy,
+                    "mapped_strategy_label": strategy_label,
+                    "oi_position_id": pos.id,
+                    "underlying": sig.underlying,
+                    "direction": sig.direction,
+                },
+            )
+
+            # Log to signal log + place broker order via execution engine
+            order_id = None
+            broker_error = None
+            try:
+                await self._process_signal(broker_signal)
+                # Try to get the order_id from the last placed order
+                if self._signal_log:
+                    last_sig = self._signal_log[-1]
+                    order_id = last_sig.get("order_id")
+            except Exception as exec_err:
+                broker_error = str(exec_err)
+                logger.warning(
+                    "oi_bridge_broker_order_failed",
+                    signal_id=signal_id,
+                    error=broker_error,
+                )
+                # Signal is still logged even if broker order fails
+
+            result = {
                 "success": True,
                 "position": pos.model_dump(),
                 "mapping": mapping.model_dump(),
                 "backtest": backtest_result,
+                "order_id": order_id,
                 "execution_note": (
-                    f"Signal {signal_id} → {mapping.fno_strategy_label} — "
-                    f"position created"
+                    f"Signal {signal_id} → {strategy_label} — "
+                    f"position created, order {'placed' if not broker_error else 'failed: ' + broker_error}"
                 ),
             }
+            if broker_error:
+                result["broker_warning"] = broker_error
+
+            return result
         except Exception as e:
             logger.error("oi_fno_bridge_execute_error", signal_id=signal_id, error=str(e))
             return {"error": str(e)}

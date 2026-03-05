@@ -305,6 +305,31 @@ class MarketDataProvider:
             logger.error("historical_chart_failed", error=str(e))
             return {"error": str(e)}
 
+    def _is_api_available(self) -> bool:
+        """Check if the Kite API is authenticated and available for live data."""
+        try:
+            return bool(self._client._auth.is_authenticated)
+        except Exception:
+            return False
+
+    def _cache_is_fresh(self, to_date: str, interval_str: str) -> bool:
+        """Determine if the DB cache can be trusted for this request.
+
+        Cache is considered stale when the requested range includes today
+        or yesterday (intraday data may still be arriving) AND we have a
+        live API connection.  For purely historical ranges (to_date well
+        in the past) the cache is fine — prices don't change retroactively.
+        """
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            # If to_date is today or yesterday, treat cache as stale for all intervals
+            if to_date >= yesterday:
+                return False
+            return True
+        except Exception:
+            return True  # On parse error, trust cache as fallback
+
     async def _fetch_historical_chunked(
         self,
         instrument_token: int,
@@ -316,15 +341,23 @@ class MarketDataProvider:
         """
         Fetch historical candles in Kite-compliant date-range chunks.
 
-        Checks the SQLite cache first.  Any candles fetched from the API
-        are written to the cache for future use.
+        Cache strategy:
+        • If the requested range includes recent dates (today/yesterday)
+          AND the Kite API is authenticated → always fetch fresh data.
+        • If the range is entirely in the past → use DB cache.
+        • Any candles fetched from the API are written to the cache.
 
         Kite Connect enforces per-interval day limits.  When the requested
         range exceeds that limit we split into successive sub-ranges,
         fetch each one, and concatenate the results.
         """
-        # ── 1. Try DB cache first ────────────────────────────────
-        if self._store and self._store.has_candles(instrument_token, interval_str, from_date, to_date):
+        # ── 1. Try DB cache (only if range is entirely historical) ──
+        use_cache = (
+            self._store
+            and self._store.has_candles(instrument_token, interval_str, from_date, to_date)
+            and (self._cache_is_fresh(to_date, interval_str) or not self._is_api_available())
+        )
+        if use_cache:
             cached = self._store.get_candles(instrument_token, interval_str, from_date, to_date)
             if cached:
                 logger.info(
@@ -347,6 +380,15 @@ class MarketDataProvider:
                     )
                     for c in cached
                 ]
+
+        if use_cache is False and self._is_api_available():
+            logger.info(
+                "historical_cache_bypass",
+                token=instrument_token,
+                interval=interval_str,
+                to_date=to_date,
+                reason="range_includes_recent_dates_and_api_available",
+            )
 
         # ── 2. Fetch from Kite API ───────────────────────────────
         max_days = KITE_MAX_DAYS.get(interval_str, 195)
@@ -418,6 +460,30 @@ class MarketDataProvider:
                 interval=interval_str,
                 bars=stored,
             )
+
+        # ── 4. Fallback to cache if API fetch returned nothing ───
+        if not all_candles and self._store:
+            cached = self._store.get_candles(instrument_token, interval_str, from_date, to_date)
+            if cached:
+                logger.warning(
+                    "historical_api_empty_fallback_to_cache",
+                    token=instrument_token,
+                    interval=interval_str,
+                    bars=len(cached),
+                )
+                from src.data.models import HistoricalCandle
+                return [
+                    HistoricalCandle(
+                        timestamp=c["ts"],
+                        open=c["open"],
+                        high=c["high"],
+                        low=c["low"],
+                        close=c["close"],
+                        volume=c["volume"],
+                        oi=c.get("oi"),
+                    )
+                    for c in cached
+                ]
 
         return all_candles
 

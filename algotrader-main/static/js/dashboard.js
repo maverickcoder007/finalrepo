@@ -801,6 +801,54 @@ function switchLiveSegment(segment) {
 let currentFnoSpot = null;
 let currentFnoAtmStrike = null;
 
+async function loadFnoStrategyDropdown() {
+    const select = document.getElementById('fno-strategy');
+    if (!select) return;
+    try {
+        // Load custom strategies from DB
+        const custom = await API.get('/api/fno-builder/list') || [];
+        // Load built-in strategies
+        const builtInRes = await API.get('/api/fno/strategies') || {};
+        const builtIn = builtInRes.strategies || [];
+
+        let html = '';
+
+        // Custom strategies from DB first (prioritized)
+        if (custom.length > 0) {
+            html += '<optgroup label="Custom Strategies (DB)">';
+            custom.forEach(s => {
+                const underlying = s.underlying || 'NIFTY';
+                const label = `${underlying} — ${(s.name || '').replace(/_/g, ' ')}`;
+                html += `<option value="${s.name}" data-underlying="${underlying}" data-source="custom">${label}</option>`;
+            });
+            html += '</optgroup>';
+        }
+
+        // Built-in strategies grouped by underlying
+        if (builtIn.length > 0) {
+            html += '<optgroup label="Built-in NIFTY">';
+            builtIn.forEach(name => {
+                html += `<option value="${name}" data-underlying="NIFTY" data-source="built_in">NIFTY ${name.replace(/_/g, ' ')}</option>`;
+            });
+            html += '</optgroup>';
+            html += '<optgroup label="Built-in SENSEX">';
+            builtIn.forEach(name => {
+                html += `<option value="${name}" data-underlying="SENSEX" data-source="built_in">SENSEX ${name.replace(/_/g, ' ')}</option>`;
+            });
+            html += '</optgroup>';
+        }
+
+        if (!html) {
+            html = '<option value="">No strategies available — save one in F&O Builder</option>';
+        }
+
+        select.innerHTML = html;
+    } catch(e) {
+        console.error('Failed to load F&O strategy dropdown:', e);
+        select.innerHTML = '<option value="">Failed to load strategies</option>';
+    }
+}
+
 function onFnoStrategyChange() {
     const strategySelect = document.getElementById('fno-strategy');
     const underlyingSelect = document.getElementById('fno-underlying');
@@ -1188,20 +1236,8 @@ async function startLive() {
     if (fnoPanel && fnoPanel.style.display !== 'none' && fnoStrategySelect) {
         const selectedStrategy = fnoStrategySelect.value;
         if (selectedStrategy) {
-            // Map UI strategy names to backend strategy names
-            const strategyMap = {
-                'nifty_call_credit_spread': 'call_credit_spread_runner',
-                'nifty_put_credit_spread': 'put_credit_spread_runner',
-                'nifty_iron_condor': 'iron_condor',
-                'nifty_straddle': 'straddle_strangle',
-                'nifty_strangle': 'short_strangle',
-                'sensex_call_credit_spread': 'call_credit_spread_runner',
-                'sensex_put_credit_spread': 'put_credit_spread_runner',
-                'sensex_iron_condor': 'iron_condor',
-                'sensex_straddle': 'straddle_strangle',
-                'sensex_strangle': 'short_strangle',
-            };
-            fnoStrategy = strategyMap[selectedStrategy] || selectedStrategy;
+            // Strategy value is already the backend name from dynamic dropdown
+            fnoStrategy = selectedStrategy;
             
             // Get underlying from strategy selection
             const selectedOption = fnoStrategySelect.options[fnoStrategySelect.selectedIndex];
@@ -1485,6 +1521,9 @@ function renderOIStrategyScanResult(data, index) {
     document.getElementById('oi-strat-confidence').textContent = avgConf;
     document.getElementById('oi-strat-signal-count').textContent = signals.length;
 
+    // Store available strategies from DB
+    window._oiAvailableStrategies = data.available_strategies || [];
+
     // Update scan detail if single index
     if (index !== 'BOTH' && data.pcr_oi != null) {
         updateOIStratScanDetail(data, index);
@@ -1493,14 +1532,17 @@ function renderOIStrategyScanResult(data, index) {
     // Render signals table
     const tbody = document.getElementById('oi-strat-signals-body');
     if (signals.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="11" style="color:var(--text-muted);text-align:center">No signals detected</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);text-align:center">No signals detected</td></tr>';
         return;
     }
     tbody.innerHTML = signals.map(s => {
         const dirColor = s.direction === 'BULLISH' ? 'var(--success)' : s.direction === 'BEARISH' ? 'var(--danger)' : 'var(--text-muted)';
         const confPct = (s.confidence||0).toFixed(0) + '%';
         const typeLabel = (s.signal_type||'').replace(/_/g,' ');
-        return `<tr>
+        const mappedStrategy = (s.metadata && s.metadata.mapped_strategy_label) || '--';
+        const mappedStrategyName = (s.metadata && s.metadata.mapped_strategy) || '';
+        const stratColor = mappedStrategyName && mappedStrategyName !== 'none' ? 'var(--accent)' : 'var(--text-muted)';
+        return `<tr id="oi-signal-row-${s.id}">
             <td>${s.underlying||index}</td>
             <td style="font-size:11px">${typeLabel}</td>
             <td style="color:${dirColor};font-weight:600">${s.direction||'--'}</td>
@@ -1508,10 +1550,13 @@ function renderOIStrategyScanResult(data, index) {
             <td>${s.option_type||'--'}</td>
             <td>${confPct}</td>
             <td style="font-size:11px">${(s.action||'').replace(/_/g,' ')}</td>
+            <td style="font-size:11px;color:${stratColor};font-weight:500">${mappedStrategy}</td>
             <td>${s.entry_price ? s.entry_price.toFixed(1) : '--'}</td>
             <td>${s.stop_loss ? s.stop_loss.toFixed(1) : '--'}</td>
             <td>${s.target ? s.target.toFixed(1) : '--'}</td>
-            <td><button class="btn btn-sm btn-primary" onclick="executeOISignal('${s.id}')">Execute</button></td>
+            <td id="oi-signal-actions-${s.id}">
+                <button class="btn btn-sm" style="background:var(--accent);color:#fff;margin-right:4px" onclick="testOISignal('${s.id}')">Test</button>
+            </td>
         </tr>`;
     }).join('');
 }
@@ -1527,15 +1572,140 @@ function updateOIStratScanDetail(data, index) {
     document.getElementById('oi-strat-straddle').textContent = data.straddle_premium != null ? data.straddle_premium.toFixed(1) : '--';
 }
 
-async function executeOISignal(signalId) {
-    if (!confirm('Execute this OI signal as a position?')) return;
+async function testOISignal(signalId) {
+    const actionsCell = document.getElementById(`oi-signal-actions-${signalId}`);
+    if (!actionsCell) return;
+    actionsCell.innerHTML = '<span style="color:var(--text-muted);font-size:11px">Testing...</span>';
     try {
-        const r = await fetch('/api/oi/strategy/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({signal_id: signalId})});
+        const r = await fetch('/api/oi/bridge/backtest', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({signal_id: signalId})
+        });
+        const plan = await r.json();
+        if (!r.ok || plan.error) {
+            actionsCell.innerHTML = `<span style="color:var(--danger);font-size:11px">${plan.error || plan.detail || 'Test failed'}</span>
+                <button class="btn btn-sm" style="margin-left:4px;background:var(--accent);color:#fff" onclick="testOISignal('${signalId}')">Retry</button>`;
+            return;
+        }
+
+        const approved = plan.execution_approved;
+        const bt = plan.backtest || {};
+        const winRate = bt.win_rate != null ? bt.win_rate.toFixed(1) + '%' : '--';
+        const sharpe = bt.sharpe_ratio != null ? bt.sharpe_ratio.toFixed(2) : '--';
+        const returnPct = bt.total_return_pct != null ? bt.total_return_pct.toFixed(1) + '%' : '--';
+        const stratLabel = (plan.mapping && plan.mapping.fno_strategy_label) || '--';
+
+        // Show backtest results in a detail row below the signal
+        const row = document.getElementById(`oi-signal-row-${signalId}`);
+        const existingDetail = document.getElementById(`oi-signal-detail-${signalId}`);
+        if (existingDetail) existingDetail.remove();
+
+        // Build threshold checks detail
+        const checksHtml = bt.threshold_checks ? Object.entries(bt.threshold_checks).map(([name, c]) => {
+            const icon = c.passed ? '✓' : '✗';
+            const color = c.passed ? 'var(--success)' : 'var(--danger)';
+            return `<span style="color:${color};font-size:11px" title="${name}: ${c.actual} ${c.operator} ${c.threshold}">${icon} ${name.replace(/_/g,' ')}: ${c.actual}</span>`;
+        }).join(' &nbsp;|&nbsp; ') : '';
+
+        // Build failure reasons
+        const failHtml = bt.failure_reasons && bt.failure_reasons.length > 0
+            ? `<div style="margin-top:4px;color:var(--danger);font-size:11px">Backtest failed: ${bt.failure_reasons.join('; ')}</div>`
+            : '';
+
+        const detailRow = document.createElement('tr');
+        detailRow.id = `oi-signal-detail-${signalId}`;
+        detailRow.innerHTML = `<td colspan="12" style="padding:8px 12px;background:${approved ? 'rgba(0,200,100,0.05)' : 'rgba(255,80,80,0.05)'}">
+            <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-size:12px">
+                <span style="font-weight:600;color:${approved ? 'var(--success)' : 'var(--danger)'}">
+                    ${approved ? '✓ APPROVED' : '✗ REJECTED'}
+                </span>
+                <span>Strategy: <strong>${stratLabel}</strong></span>
+                <span>Win Rate: <strong>${winRate}</strong></span>
+                <span>Sharpe: <strong>${sharpe}</strong></span>
+                <span>Return: <strong>${returnPct}</strong></span>
+                <span>Trades: <strong>${bt.total_trades ?? '--'}</strong></span>
+                ${plan.risk_warnings && plan.risk_warnings.length > 0 ? `<span style="color:var(--warning);font-size:11px">⚠ ${plan.risk_warnings.length} warning(s)</span>` : ''}
+            </div>
+            ${checksHtml ? `<div style="margin-top:6px">${checksHtml}</div>` : ''}
+            ${failHtml}
+        </td>`;
+        if (row && row.parentNode) {
+            row.parentNode.insertBefore(detailRow, row.nextSibling);
+        }
+
+        // Update actions cell
+        if (approved) {
+            actionsCell.innerHTML = `<button class="btn btn-sm btn-primary" onclick="executeOISignalViaBridge('${signalId}')">Execute</button>
+                <button class="btn btn-sm" style="margin-left:4px;background:var(--accent);color:#fff" onclick="testOISignal('${signalId}')">Retest</button>`;
+            // Strategy auto-added on backend — refresh strategies panel
+            if (plan.strategy_added) {
+                showToast(`Strategy "${stratLabel}" auto-added to active strategies`, 'success');
+            }
+        } else {
+            actionsCell.innerHTML = `<span style="color:var(--danger);font-size:11px;font-weight:600">Failed</span>
+                <button class="btn btn-sm" style="margin-left:4px;background:var(--accent);color:#fff" onclick="testOISignal('${signalId}')">Retest</button>`;
+        }
+
+        // Refresh signals + strategies panels to show the test entry
+        if (typeof loadSignals === 'function') loadSignals();
+        if (typeof loadStatus === 'function') loadStatus();
+    } catch(e) {
+        actionsCell.innerHTML = `<span style="color:var(--danger);font-size:11px">${e.message}</span>
+            <button class="btn btn-sm" style="margin-left:4px" onclick="testOISignal('${signalId}')">Retry</button>`;
+    }
+}
+
+async function executeOISignalViaBridge(signalId) {
+    if (!confirm('Execute this signal via backtest-gated FNO bridge?\n\nThis will place a REAL broker order via Kite.')) return;
+    const actionsCell = document.getElementById(`oi-signal-actions-${signalId}`);
+    if (actionsCell) actionsCell.innerHTML = '<span style="color:var(--text-muted);font-size:11px">Placing order...</span>';
+    try {
+        const r = await fetch('/api/oi/bridge/execute', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({signal_id: signalId})
+        });
         const d = await r.json();
-        if (!r.ok) { alert(d.detail || 'Execute failed'); return; }
-        showToast('Position created from signal', 'success');
+        if (!r.ok || d.error) {
+            const errMsg = d.error || d.detail || 'Execute failed';
+            if (actionsCell) actionsCell.innerHTML = `<span style="color:var(--danger);font-size:11px">${errMsg}</span>
+                <button class="btn btn-sm" style="margin-left:4px" onclick="executeOISignalViaBridge('${signalId}')">Retry</button>`;
+            return;
+        }
+        const orderId = d.order_id ? ` (Order: ${d.order_id})` : '';
+        const brokerWarn = d.broker_warning ? ` ⚠ ${d.broker_warning}` : '';
+        const note = d.execution_note || 'Position created';
+        if (d.broker_warning) {
+            showToast(`Order placed with warning: ${d.broker_warning}`, 'warning');
+        } else {
+            showToast(`Order placed${orderId}`, 'success');
+        }
+        if (actionsCell) {
+            actionsCell.innerHTML = `<span style="color:var(--success);font-size:11px;font-weight:600">✓ Executed${orderId}</span>`;
+        }
+        // Update detail row if exists
+        const detailRow = document.getElementById(`oi-signal-detail-${signalId}`);
+        if (detailRow) {
+            const noteSpan = document.createElement('div');
+            noteSpan.style.cssText = 'margin-top:4px;font-size:11px;color:var(--success)';
+            noteSpan.textContent = note + brokerWarn;
+            detailRow.querySelector('td').appendChild(noteSpan);
+        }
         loadOIStrategyPositions();
-    } catch(e) { alert('Error: ' + e.message); }
+        // Refresh all dashboard panels
+        if (typeof loadSignals === 'function') loadSignals();
+        if (typeof loadOrders === 'function') loadOrders();
+        if (typeof loadStatus === 'function') loadStatus();
+    } catch(e) {
+        if (actionsCell) actionsCell.innerHTML = `<span style="color:var(--danger);font-size:11px">${e.message}</span>
+            <button class="btn btn-sm" style="margin-left:4px" onclick="executeOISignalViaBridge('${signalId}')">Retry</button>`;
+    }
+}
+
+async function executeOISignal(signalId) {
+    // Legacy direct execute — redirect to test-first flow
+    await testOISignal(signalId);
 }
 
 async function closeOIPosition(positionId) {
@@ -1646,7 +1816,12 @@ async function loadOIStrategySummary() {
 
 function toggleOIStrategyConfig() {
     const panel = document.getElementById('oi-strat-config-panel');
-    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    const showing = panel.style.display === 'none';
+    panel.style.display = showing ? 'block' : 'none';
+    if (showing) {
+        loadOIStrategyConfig();
+        loadBridgeThresholds();
+    }
 }
 
 async function loadOIStrategyConfig() {
@@ -1681,6 +1856,42 @@ async function saveOIStrategyConfig() {
         const r = await fetch('/api/oi/strategy/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(updates)});
         const d = await r.json();
         if (r.ok) showToast('Config saved', 'success');
+        else alert(d.detail || 'Save failed');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function loadBridgeThresholds() {
+    try {
+        const r = await fetch('/api/oi/bridge/thresholds');
+        const d = await r.json();
+        document.getElementById('bt-cfg-win-rate').value = d.min_win_rate ?? 40;
+        document.getElementById('bt-cfg-sharpe').value = d.min_sharpe_ratio ?? 0.3;
+        document.getElementById('bt-cfg-drawdown').value = d.max_drawdown_pct ?? 30;
+        document.getElementById('bt-cfg-return').value = d.min_total_return_pct ?? 0;
+        document.getElementById('bt-cfg-trades').value = d.min_trades ?? 1;
+        document.getElementById('bt-cfg-pf').value = d.min_profit_factor ?? 0.8;
+        document.getElementById('bt-cfg-avg-loss').value = d.max_avg_loss_pct ?? 8;
+        document.getElementById('bt-cfg-days').value = d.backtest_days ?? 365;
+        document.getElementById('bt-cfg-capital').value = d.backtest_capital ?? 500000;
+    } catch(e) { console.error('Load bridge thresholds error:', e); }
+}
+
+async function saveBridgeThresholds() {
+    const body = {
+        min_win_rate: parseFloat(document.getElementById('bt-cfg-win-rate').value),
+        min_sharpe_ratio: parseFloat(document.getElementById('bt-cfg-sharpe').value),
+        max_drawdown_pct: parseFloat(document.getElementById('bt-cfg-drawdown').value),
+        min_total_return_pct: parseFloat(document.getElementById('bt-cfg-return').value),
+        min_trades: parseInt(document.getElementById('bt-cfg-trades').value),
+        min_profit_factor: parseFloat(document.getElementById('bt-cfg-pf').value),
+        max_avg_loss_pct: parseFloat(document.getElementById('bt-cfg-avg-loss').value),
+        backtest_days: parseInt(document.getElementById('bt-cfg-days').value),
+        backtest_capital: parseFloat(document.getElementById('bt-cfg-capital').value)
+    };
+    try {
+        const r = await fetch('/api/oi/bridge/thresholds', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+        const d = await r.json();
+        if (r.ok) showToast('Backtest thresholds saved', 'success');
         else alert(d.detail || 'Save failed');
     } catch(e) { alert('Error: ' + e.message); }
 }
@@ -6478,6 +6689,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Load custom strategies into all dropdowns early
     loadCustomStrategiesDropdowns();
     loadFnOCustomStrategiesDropdowns();
+    // Load F&O strategy dropdown from DB
+    loadFnoStrategyDropdown();
     // Initialize F&O data management
     initFnODataDates();
     loadFnODataStats();

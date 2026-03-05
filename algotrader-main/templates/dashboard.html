@@ -586,10 +586,10 @@
                         <table class="data-table">
                             <thead><tr>
                                 <th>Index</th><th>Type</th><th>Direction</th><th>Strike</th><th>Option</th>
-                                <th>Confidence</th><th>Action</th><th>Price</th><th>SL</th><th>Target</th><th>Execute</th>
+                                <th>Confidence</th><th>Action</th><th>Mapped Strategy</th><th>Price</th><th>SL</th><th>Target</th><th>Actions</th>
                             </tr></thead>
                             <tbody id="oi-strat-signals-body">
-                                <tr><td colspan="11" style="color:var(--text-muted);text-align:center">Run a scan to detect signals</td></tr>
+                                <tr><td colspan="12" style="color:var(--text-muted);text-align:center">Run a scan to detect signals</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -688,6 +688,53 @@
                     <div style="margin-top:12px;display:flex;gap:8px">
                         <button class="btn btn-primary btn-sm" onclick="saveOIStrategyConfig()">Save Config</button>
                         <button class="btn btn-sm" onclick="loadOIStrategyConfig()">Reset</button>
+                    </div>
+
+                    <!-- Backtest Gate Thresholds -->
+                    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+                        <div class="card-title" style="font-size:13px;margin-bottom:8px">Backtest Gate Thresholds</div>
+                        <div class="grid grid-3" style="gap:12px">
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Min Win Rate %</label>
+                                <input type="number" id="bt-cfg-win-rate" step="1" value="40" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Min Sharpe Ratio</label>
+                                <input type="number" id="bt-cfg-sharpe" step="0.1" value="0.3" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Max Drawdown %</label>
+                                <input type="number" id="bt-cfg-drawdown" step="1" value="30" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Min Return %</label>
+                                <input type="number" id="bt-cfg-return" step="0.1" value="0" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Min Trades</label>
+                                <input type="number" id="bt-cfg-trades" step="1" value="1" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Min Profit Factor</label>
+                                <input type="number" id="bt-cfg-pf" step="0.1" value="0.8" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Max Avg Loss %</label>
+                                <input type="number" id="bt-cfg-avg-loss" step="0.5" value="8" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Backtest Days</label>
+                                <input type="number" id="bt-cfg-days" step="30" value="365" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:var(--text-muted)">Backtest Capital</label>
+                                <input type="number" id="bt-cfg-capital" step="50000" value="500000" style="width:100%;padding:4px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);border-radius:4px">
+                            </div>
+                        </div>
+                        <div style="margin-top:8px;display:flex;gap:8px">
+                            <button class="btn btn-primary btn-sm" onclick="saveBridgeThresholds()">Save Thresholds</button>
+                            <button class="btn btn-sm" onclick="loadBridgeThresholds()">Reset</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2448,21 +2495,9 @@
                     <div style="margin-bottom:12px">
                         <label style="font-size:11px;color:#8899aa;margin-bottom:4px;display:block">Strategy</label>
                         <select id="fno-strategy" onchange="onFnoStrategyChange()" style="width:100%;padding:8px 10px;background:#0d1821;color:#e0e6ed;border:1px solid #2a3a4a;border-radius:6px;font-size:13px;font-weight:500">
-                            <optgroup label="NIFTY Strategies">
-                                <option value="nifty_call_credit_spread" data-underlying="NIFTY">NIFTY Call Credit Spread</option>
-                                <option value="nifty_put_credit_spread" data-underlying="NIFTY">NIFTY Put Credit Spread</option>
-                                <option value="nifty_iron_condor" data-underlying="NIFTY">NIFTY Iron Condor</option>
-                                <option value="nifty_straddle" data-underlying="NIFTY">NIFTY Straddle</option>
-                                <option value="nifty_strangle" data-underlying="NIFTY">NIFTY Strangle</option>
-                            </optgroup>
-                            <optgroup label="SENSEX Strategies">
-                                <option value="sensex_call_credit_spread" data-underlying="SENSEX">SENSEX Call Credit Spread</option>
-                                <option value="sensex_put_credit_spread" data-underlying="SENSEX">SENSEX Put Credit Spread</option>
-                                <option value="sensex_iron_condor" data-underlying="SENSEX">SENSEX Iron Condor</option>
-                                <option value="sensex_straddle" data-underlying="SENSEX">SENSEX Straddle</option>
-                                <option value="sensex_strangle" data-underlying="SENSEX">SENSEX Strangle</option>
-                            </optgroup>
+                            <option value="">Loading strategies...</option>
                         </select>
+                        <div style="margin-top:4px;font-size:10px;color:#667788">Strategies from F&O Builder (saved) + built-in</div>
                     </div>
                     
                     <!-- Spot Price Display -->
