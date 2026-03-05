@@ -198,7 +198,7 @@ class FnOPaperTradingEngine:
         max_positions: int = 3,
         profit_target_pct: float = 50.0,
         stop_loss_pct: float = 100.0,
-        entry_dte_min: int = 15,
+        entry_dte_min: int = 3,
         entry_dte_max: int = 45,
         delta_target: float = 0.16,
         slippage_model: str = "realistic",

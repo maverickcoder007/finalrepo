@@ -104,7 +104,7 @@ class FnOBacktestEngine:
         max_positions: int = 3,
         profit_target_pct: float = 50.0,   # % of max profit to exit
         stop_loss_pct: float = 100.0,      # % of max loss to exit
-        entry_dte_min: int = 15,
+        entry_dte_min: int = 3,
         entry_dte_max: int = 45,
         delta_target: float = 0.16,        # for strike selection
         slippage_model: str = "realistic",
@@ -243,12 +243,12 @@ class FnOBacktestEngine:
                 strike=strike,
                 option_type=opt_type,
                 expiry=expiry,
-                ltp=opt.get("last_price", 0),
+                last_price=opt.get("last_price", 0),
                 oi=opt.get("oi", 0),
                 volume=opt.get("volume", 0),
                 iv=opt.get("iv", 0),
-                bid=opt.get("bid_price", 0),
-                ask=opt.get("ask_price", 0),
+                bid_price=opt.get("bid_price", 0),
+                ask_price=opt.get("ask_price", 0),
             )
             strike_map[strike][opt_type] = contract
         
@@ -256,14 +256,14 @@ class FnOBacktestEngine:
         for strike_val, data in sorted(strike_map.items()):
             entries.append(OptionChainEntry(
                 strike=strike_val,
-                CE=data.get("CE"),
-                PE=data.get("PE"),
+                ce=data.get("CE"),
+                pe=data.get("PE"),
             ))
         
         return OptionChainData(
             underlying=self.underlying,
             expiry=expiry,
-            spot=spot_price,
+            spot_price=spot_price,
             entries=entries,
         )
 
@@ -318,6 +318,12 @@ class FnOBacktestEngine:
         total_costs = 0.0
         position_counter = 0
 
+        # Data quality tracking
+        _dq_total_bars = 0
+        _dq_chain_ok = 0
+        _dq_chain_skip = 0
+        _dq_regime_blocks = 0
+
         # Pre-compute expiry dates
         start_date = self._parse_bar_date(df, 0)
         end_date = self._parse_bar_date(df, len(df) - 1)
@@ -335,6 +341,7 @@ class FnOBacktestEngine:
             spot = float(bar["close"])
             bar_date = self._parse_bar_date(df, i)
             bar_dates.append(_bar_ts(i))
+            _dq_total_bars += 1
 
             # ── 1. Regime classification ───
             price_history = closes[:i + 1]
@@ -350,6 +357,7 @@ class FnOBacktestEngine:
             if target_exp is None:
                 target_exp = self._chain_builder.nearest_expiry(bar_date, expiries)
             if target_exp is None:
+                _dq_chain_skip += 1
                 equity_curve.append(equity_curve[-1])
                 continue
             chain = self._chain_builder.build_chain(
@@ -360,8 +368,10 @@ class FnOBacktestEngine:
             )
 
             if chain is None:
+                _dq_chain_skip += 1
                 equity_curve.append(equity_curve[-1])
                 continue
+            _dq_chain_ok += 1
 
             # ── 3. Check expiry for open positions ───
             for pos in positions:
@@ -479,6 +489,8 @@ class FnOBacktestEngine:
                 should_enter = True
                 if self.use_regime_filter:
                     should_enter = self._regime_allows_entry(regime, self.structure_type)
+                    if not should_enter:
+                        _dq_regime_blocks += 1
 
                 if should_enter:
                     new_pos, entry_costs = self._open_position(
@@ -592,6 +604,21 @@ class FnOBacktestEngine:
             "greeks_history": greeks_history[-200:],
             "margin_history": margin_history[-200:],
             "regime_history": self._regime_engine.get_regime_history()[-200:],
+            "data_quality": {
+                "data_source": "synthetic",
+                "total_bars_processed": _dq_total_bars,
+                "chain_ok": _dq_chain_ok,
+                "chain_skipped": _dq_chain_skip,
+                "regime_blocked_entries": _dq_regime_blocks,
+                "chain_coverage_pct": round(_dq_chain_ok / max(_dq_total_bars, 1) * 100, 1),
+                "pricing_method": "black_scholes_synthetic",
+                "iv_source": "historical_volatility_proxy",
+                "notes": [
+                    "Option prices derived from HV-based IV model — not market IV",
+                    "Bid-ask spreads are simulated, not actual market spreads",
+                    "OI data is simulated, not real market data",
+                ],
+            },
             "settings": {
                 "max_positions": self.max_positions,
                 "profit_target_pct": self.profit_target_pct,
@@ -1189,6 +1216,12 @@ class FnOBacktestEngine:
         total_costs = 0.0
         trade_counter = 0
 
+        # Data quality tracking
+        _dq_total_bars = 0
+        _dq_stored_bars = 0
+        _dq_synthetic_bars = 0
+        _dq_chain_skip = 0
+
         # Position tracking for simulated execution
         open_positions: dict[str, dict] = {}  # tradingsymbol -> position info
 
@@ -1228,16 +1261,19 @@ class FnOBacktestEngine:
             # Get option chain (stored or synthetic)
             option_chain_data = None
             synth_chain = None
+            _dq_total_bars += 1
             
             if use_stored:
                 # Try stored data first
                 option_chain_data = self._get_stored_chain_at_time(bar_time)
                 if option_chain_data:
+                    _dq_stored_bars += 1
                     # Create a minimal synth_chain for price lookups
                     synth_chain = None
             
             if option_chain_data is None:
                 # Fall back to synthetic chain
+                _dq_synthetic_bars += 1
                 price_history = closes[:i + 1]
                 regime = self._regime_engine.classify(price_history, timestamp=datetime.now())
 
@@ -1249,6 +1285,7 @@ class FnOBacktestEngine:
                 if target_exp is None:
                     target_exp = self._chain_builder.nearest_expiry(bar_date, expiries)
                 if target_exp is None:
+                    _dq_chain_skip += 1
                     equity_curve.append(equity_curve[-1])
                     continue
 
@@ -1259,6 +1296,7 @@ class FnOBacktestEngine:
                     hv=regime.hv_20 if regime.hv_20 > 0 else 0.20,
                 )
                 if synth_chain is None:
+                    _dq_chain_skip += 1
                     equity_curve.append(equity_curve[-1])
                     continue
 
@@ -1442,6 +1480,25 @@ class FnOBacktestEngine:
             "equity_curve": [round(e, 2) for e in equity_curve],
             "bar_dates": bar_dates[:len(equity_curve)],
             "strategy_final_state": strategy.get_status(),
+            "data_quality": {
+                "data_source": "stored" if use_stored and _dq_stored_bars > 0 else "synthetic",
+                "total_bars_processed": _dq_total_bars,
+                "stored_bars_used": _dq_stored_bars,
+                "synthetic_bars_used": _dq_synthetic_bars,
+                "chain_skipped": _dq_chain_skip,
+                "stored_coverage_pct": round(_dq_stored_bars / max(_dq_total_bars, 1) * 100, 1),
+                "pricing_method": "stored_market_data" if _dq_stored_bars > _dq_synthetic_bars else "black_scholes_synthetic",
+                "iv_source": "market_iv" if _dq_stored_bars > _dq_synthetic_bars else "historical_volatility_proxy",
+                "notes": (
+                    ["Using stored market option chain data — higher accuracy"]
+                    if _dq_stored_bars > _dq_synthetic_bars
+                    else [
+                        "Option prices derived from HV-based IV model — not market IV",
+                        "Bid-ask spreads are simulated, not actual market spreads",
+                        "OI data is simulated, not real market data",
+                    ]
+                ),
+            },
             "settings": {
                 "max_positions": self.max_positions,
                 "profit_target_pct": self.profit_target_pct,

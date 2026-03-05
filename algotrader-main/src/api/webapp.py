@@ -1583,6 +1583,36 @@ async def get_backtest_results(request: Request) -> dict[str, Any]:
     return svc.get_backtest_results()
 
 
+@app.get("/api/backtest/history")
+async def get_backtest_history(request: Request) -> dict[str, Any]:
+    """Get stored backtest & paper-trade results from DB for post-analysis."""
+    svc = get_user_service(request)
+    params = request.query_params
+    strategy = params.get("strategy", "")
+    engine_type = params.get("engine_type", "")
+    run_type = params.get("run_type", "")
+    limit = int(params.get("limit", "50"))
+    include_full = params.get("include_full", "false").lower() == "true"
+    results = svc._data_store.get_backtest_results(
+        strategy_name=strategy,
+        engine_type=engine_type,
+        run_type=run_type,
+        limit=limit,
+        include_full_result=include_full,
+    )
+    return {"results": results, "count": len(results)}
+
+
+@app.get("/api/backtest/history/{result_id}")
+async def get_backtest_history_detail(result_id: int, request: Request) -> dict[str, Any]:
+    """Get a single stored backtest result by ID (includes full result)."""
+    svc = get_user_service(request)
+    result = svc._data_store.get_backtest_result_by_id(result_id)
+    if not result:
+        raise HTTPException(404, f"Backtest result #{result_id} not found")
+    return result
+
+
 # ────────────────────────────────────────────────────────
 # F&O Derivatives Backtest & Paper Trade
 # ────────────────────────────────────────────────────────
@@ -1612,7 +1642,7 @@ async def run_fno_backtest(request: Request) -> dict[str, Any]:
             max_positions=int(body.get("max_positions", 3)),
             profit_target_pct=float(body.get("profit_target_pct", 50)),
             stop_loss_pct=float(body.get("stop_loss_pct", 100)),
-            entry_dte_min=int(body.get("entry_dte_min", 15)),
+            entry_dte_min=int(body.get("entry_dte_min", 3)),
             entry_dte_max=int(body.get("entry_dte_max", 45)),
             delta_target=float(body.get("delta_target", 0.16)),
             slippage_model=body.get("slippage_model", "realistic"),
@@ -1661,7 +1691,7 @@ async def run_fno_paper_trade(request: Request) -> dict[str, Any]:
             max_positions=int(body.get("max_positions", 3)),
             profit_target_pct=float(body.get("profit_target_pct", 50)),
             stop_loss_pct=float(body.get("stop_loss_pct", 100)),
-            entry_dte_min=int(body.get("entry_dte_min", 15)),
+            entry_dte_min=int(body.get("entry_dte_min", 3)),
             entry_dte_max=int(body.get("entry_dte_max", 45)),
             delta_target=float(body.get("delta_target", 0.16)),
             slippage_model=body.get("slippage_model", "realistic"),

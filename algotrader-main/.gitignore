@@ -27,7 +27,7 @@ data/
 logs/
 data/historical/
 data/instruments.csv
-
+.kite_session_WV1243.json
 *.pyc
 *.pyo
 *.pyd

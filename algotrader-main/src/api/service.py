@@ -252,6 +252,35 @@ class TradingService:
         self._tested_strategies.add(name)
         self._data_store.add_tested_strategy(name)
 
+    def _persist_backtest_result(
+        self,
+        result: dict[str, Any],
+        *,
+        run_type: str = "backtest",
+        engine_type: str = "equity",
+        strategy_name: str = "",
+        underlying: str = "",
+        interval: str = "day",
+        data_source: str = "",
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist backtest/paper-trade result to DB for post-analysis."""
+        try:
+            ds = data_source or result.get("data_source", "")
+            self._data_store.store_backtest_result(
+                result,
+                run_type=run_type,
+                engine_type=engine_type,
+                strategy_name=strategy_name,
+                underlying=underlying,
+                interval=interval,
+                data_source=ds,
+                params=params,
+            )
+        except Exception as e:
+            logger.error("backtest_result_store_error: %s", e)
+            result.setdefault("_warnings", []).append(f"DB persistence failed: {e}")
+
     # ─── Preflight API ──────────────────────────────────────────
 
     async def run_preflight_check(self, mode: str = "live") -> dict[str, Any]:
@@ -3257,6 +3286,9 @@ class TradingService:
             logger.error("paper_trade_journal_record_error", error=str(e))
             result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result_dict, run_type="paper_trade", engine_type="equity", strategy_name=strategy_name, underlying=tradingsymbol, interval=interval)
+
         logger.info("paper_trade_complete", strategy=strategy_name, trades=result_dict.get("total_trades", len(result_dict.get("trades", []))))
         return result_dict
 
@@ -3311,6 +3343,9 @@ class TradingService:
         except Exception as e:
             logger.error("paper_trade_sample_journal_error", error=str(e))
             result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
+
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result_dict, run_type="paper_trade", engine_type="equity", strategy_name=strategy_name, underlying=symbol, data_source=data_source)
 
         return result_dict
 
@@ -3919,6 +3954,9 @@ class TradingService:
             logger.error("backtest_journal_record_error", error=str(e))
             result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result, run_type="backtest", engine_type="equity" if not is_intraday else "intraday", strategy_name=strategy_name, underlying=tradingsymbol, interval=interval)
+
         return result
 
     # Interval → pandas freq mapping for synthetic data generation
@@ -4090,6 +4128,9 @@ class TradingService:
             logger.error("backtest_sample_journal_record_error", error=str(e))
             result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result, run_type="backtest", engine_type="equity" if not is_intraday else "intraday", strategy_name=strategy_name, underlying=tradingsymbol, data_source=data_source, interval=interval)
+
         return result
 
     def get_backtest_results(self) -> dict[str, Any]:
@@ -4247,7 +4288,7 @@ class TradingService:
         max_positions: int = 3,
         profit_target_pct: float = 50.0,
         stop_loss_pct: float = 100.0,
-        entry_dte_min: int = 15,
+        entry_dte_min: int = 3,
         entry_dte_max: int = 45,
         delta_target: float = 0.16,
         slippage_model: str = "realistic",
@@ -4305,6 +4346,9 @@ class TradingService:
         except Exception as e:
             logger.error("fno_backtest_journal_record_error", error=str(e))
             result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
+
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result, run_type="backtest", engine_type="fno", strategy_name=strategy_name, underlying=underlying, interval=interval)
 
         return result
 
@@ -4368,6 +4412,9 @@ class TradingService:
             logger.error("fno_backtest_sample_journal_record_error", error=str(e))
             result.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
 
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result, run_type="backtest", engine_type="fno", strategy_name=strategy_name, underlying=underlying, data_source=data_source)
+
         return result
 
     async def run_fno_paper_trade(
@@ -4381,7 +4428,7 @@ class TradingService:
         max_positions: int = 3,
         profit_target_pct: float = 50.0,
         stop_loss_pct: float = 100.0,
-        entry_dte_min: int = 15,
+        entry_dte_min: int = 3,
         entry_dte_max: int = 45,
         delta_target: float = 0.16,
         slippage_model: str = "realistic",
@@ -4434,6 +4481,9 @@ class TradingService:
         except Exception as e:
             logger.error("fno_paper_trade_journal_record_error", error=str(e))
             result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
+
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result_dict, run_type="paper_trade", engine_type="fno", strategy_name=strategy_name, underlying=underlying, interval=interval)
 
         return result_dict
 
@@ -4495,6 +4545,9 @@ class TradingService:
         except Exception as e:
             logger.error("fno_paper_sample_journal_record_error", error=str(e))
             result_dict.setdefault("_warnings", []).append(f"Journal recording failed: {e}")
+
+        # Persist to DB for post-analysis
+        self._persist_backtest_result(result_dict, run_type="paper_trade", engine_type="fno", strategy_name=strategy_name, underlying=underlying, data_source=data_source)
 
         return result_dict
 

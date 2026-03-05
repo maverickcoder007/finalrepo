@@ -84,26 +84,29 @@ class RegimeEngine:
     REGIME_STRATEGIES: dict[MarketRegime, list[str]] = {
         MarketRegime.LOW_VOL: [
             "IRON_CONDOR", "SHORT_STRANGLE", "SHORT_STRADDLE",
-            "COVERED_CALL", "CALENDAR_SPREAD"
+            "COVERED_CALL", "CALENDAR_SPREAD",
+            "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD",
+            "IRON_BUTTERFLY",
         ],
         MarketRegime.HIGH_VOL: [
             "LONG_STRADDLE", "LONG_STRANGLE", "PROTECTIVE_PUT",
-            "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"
+            "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD",
+            "IRON_CONDOR", "IRON_BUTTERFLY",
         ],
         MarketRegime.TRENDING_UP: [
             "BULL_CALL_SPREAD", "BULL_PUT_SPREAD", "COVERED_CALL",
-            "NAKED_PUT"
+            "NAKED_PUT", "IRON_CONDOR", "SHORT_STRANGLE",
         ],
         MarketRegime.TRENDING_DOWN: [
             "BEAR_PUT_SPREAD", "BEAR_CALL_SPREAD", "PROTECTIVE_PUT",
-            "LONG_PUT"
+            "LONG_PUT", "IRON_CONDOR", "SHORT_STRANGLE",
         ],
         MarketRegime.MEAN_REVERTING: [
             "SHORT_STRADDLE", "IRON_BUTTERFLY", "SHORT_STRANGLE",
-            "IRON_CONDOR"
+            "IRON_CONDOR", "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD",
         ],
         MarketRegime.EVENT_RISK: [
-            "LONG_STRADDLE", "PROTECTIVE_PUT", "COLLAR",
+            "LONG_STRADDLE", "LONG_STRANGLE", "PROTECTIVE_PUT", "COLLAR",
         ],
     }
 
