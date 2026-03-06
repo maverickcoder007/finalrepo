@@ -24,9 +24,13 @@ existing OptionStrategyBase → ExecutionEngine → Journal pipeline.
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
+from uuid import uuid4
 
 import pandas as pd
 
@@ -44,6 +48,9 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Path for strategy state persistence
+_STATE_DIR = os.path.join("data", "strategy_state")
+
 
 # ────────────────────────────────────────────────────────────────
 # State Machine  (shared enum name with call version for symmetry)
@@ -52,6 +59,7 @@ logger = get_logger(__name__)
 class PutSpreadState(str, Enum):
     """Lifecycle states for the put credit spread."""
     IDLE = "idle"                       # No position
+    PENDING_ENTRY = "pending_entry"     # Signals sent, awaiting order confirmation
     SPREAD_OPEN = "spread_open"         # Both legs open, initial SL active
     RUNNER_LONG_ONLY = "runner_long"    # Short leg closed (SL hit), long put running
     SPREAD_BE = "spread_be"             # Spread SL moved to break-even
@@ -98,6 +106,20 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         self._long_entry_premium: float = 0.0              # premium paid for long put
         self._sl_triggered_at: Optional[str] = None        # ISO timestamp
 
+        # Fix 3: Spread linkage — unique ID per spread trade
+        self._spread_id: Optional[str] = None
+
+        # Fix 5: Re-entry throttle after rejection/failure
+        self._entry_cooldown_until: float = 0.0
+        self._ENTRY_COOLDOWN_SECS: float = 60.0
+
+        # Fix 1: Track pending order IDs to detect fill/rejection
+        self._pending_order_ids: list[str] = []
+        self._confirmed_fills: int = 0
+
+        # Fix 4: Attempt to restore persisted state on init
+        self._load_persisted_state()
+
     # ── Properties ──────────────────────────────────────────
 
     @property
@@ -108,6 +130,10 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
     def is_in_trade(self) -> bool:
         return self._state not in (PutSpreadState.IDLE, PutSpreadState.CLOSED)
 
+    @property
+    def spread_id(self) -> Optional[str]:
+        return self._spread_id
+
     # ────────────────────────────────────────────────────────
     # On-Tick / On-Bar hooks (called by the live loop)
     # ────────────────────────────────────────────────────────
@@ -116,7 +142,11 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         exit_signals = self._evaluate_exit(ticks)
         if exit_signals:
             return exit_signals
-        if self._state != PutSpreadState.IDLE or not self._option_chain:
+        if self._state not in (PutSpreadState.IDLE,):
+            return []
+        if not self._option_chain:
+            return []
+        if time.monotonic() < self._entry_cooldown_until:
             return []
         return self._evaluate_entry()
 
@@ -125,6 +155,8 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         if exit_signals:
             return exit_signals
         if self._state != PutSpreadState.IDLE or not self._option_chain:
+            return []
+        if time.monotonic() < self._entry_cooldown_until:
             return []
         return self._evaluate_entry()
 
@@ -210,9 +242,12 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         #    SL = short_put entry premium + sl_premium_points
         sl_trigger = short_put.last_price + self.params["sl_premium_points"]
 
+        # Generate spread_id for linking legs together
+        spread_id = f"pcs_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+
         short_signal = self._create_signal(
             short_put, TransactionType.SELL, confidence=65.0,
-            metadata={**meta, "leg": "short_put"},
+            metadata={**meta, "leg": "short_put", "spread_id": spread_id},
         )
         # NOTE: Do NOT set short_signal.stop_loss here.
         # The strategy manages SL internally via chain premium monitoring.
@@ -221,15 +256,18 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
 
         long_signal = self._create_signal(
             long_put, TransactionType.BUY, confidence=65.0,
-            metadata={**meta, "leg": "long_put"},
+            metadata={**meta, "leg": "long_put", "spread_id": spread_id},
         )
 
-        # 6. Update internal state
-        self._state = PutSpreadState.SPREAD_OPEN
+        # Fix 1: Transition to PENDING_ENTRY, not SPREAD_OPEN.
+        self._state = PutSpreadState.PENDING_ENTRY
+        self._spread_id = spread_id
         self._entry_credit = net_credit
         self._entry_spot = chain.spot_price
         self._short_entry_premium = short_put.last_price
         self._long_entry_premium = long_put.last_price
+        self._pending_order_ids = []
+        self._confirmed_fills = 0
         self._short_leg = {
             "tradingsymbol": short_put.tradingsymbol,
             "strike": short_put.strike,
@@ -255,6 +293,8 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
             credit=net_credit,
             sl_trigger=sl_trigger,
             spot=chain.spot_price,
+            spread_id=spread_id,
+            state="PENDING_ENTRY",
         )
 
         return [short_signal, long_signal]
@@ -265,7 +305,7 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
 
     def _evaluate_exit(self, ticks: list[Tick]) -> list[Signal]:
         """Evaluate exit / adjustment conditions based on current chain+tick data."""
-        if self._state in (PutSpreadState.IDLE, PutSpreadState.CLOSED):
+        if self._state in (PutSpreadState.IDLE, PutSpreadState.CLOSED, PutSpreadState.PENDING_ENTRY):
             return []
         if not self._option_chain:
             return []
@@ -363,6 +403,7 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
                 "leg": "short_put_exit",
                 "reason": "sl_hit",
                 "signal_type": "exit",
+                "spread_id": self._spread_id,
                 "sl_premium": self._short_leg["sl_premium"],
                 "strategy_type": "put_credit_spread_runner",
             },
@@ -468,6 +509,7 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
                     "leg": "short_put_exit",
                     "reason": reason,
                     "signal_type": "exit",
+                    "spread_id": self._spread_id,
                     "strategy_type": "put_credit_spread_runner",
                 },
             ))
@@ -486,6 +528,7 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
                     "leg": "long_put_exit",
                     "reason": reason,
                     "signal_type": "exit",
+                    "spread_id": self._spread_id,
                     "strategy_type": "put_credit_spread_runner",
                 },
             ))
@@ -511,6 +554,7 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
                 "leg": "long_put_exit",
                 "reason": reason,
                 "signal_type": "exit",
+                "spread_id": self._spread_id,
                 "strategy_type": "put_credit_spread_runner",
             },
         )
@@ -525,6 +569,7 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
             entry_credit=self._entry_credit,
             entry_spot=self._entry_spot,
             state_before=self._state.value,
+            spread_id=self._spread_id,
         )
         self._short_leg = None
         self._long_leg = None
@@ -534,8 +579,13 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         self._short_entry_premium = 0
         self._long_entry_premium = 0
         self._sl_triggered_at = None
+        self._spread_id = None
+        self._pending_order_ids = []
+        self._confirmed_fills = 0
         # Transition directly to IDLE — ready for re-entry on next cycle
         self._state = PutSpreadState.IDLE
+        # Persist clean state
+        self._persist_state()
 
     # ────────────────────────────────────────────────────────
     # Helpers
@@ -566,5 +616,133 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
             "sl_premium_points": self.params["sl_premium_points"],
             "be_trigger_points": self.params["be_trigger_points"],
             "sl_triggered_at": self._sl_triggered_at,
+            "spread_id": self._spread_id,
             "params": self.params,
         }
+
+    # ────────────────────────────────────────────────────────
+    # Fix 1: Order result notification (called by TradingService)
+    # ────────────────────────────────────────────────────────
+
+    def notify_order_placed(self, order_id: str, tradingsymbol: str) -> None:
+        """Called by TradingService after an entry order is successfully placed."""
+        if self._state == PutSpreadState.PENDING_ENTRY:
+            self._pending_order_ids.append(order_id)
+            logger.info(
+                "pcs_runner_order_placed",
+                order_id=order_id,
+                symbol=tradingsymbol,
+                pending_count=len(self._pending_order_ids),
+                spread_id=self._spread_id,
+            )
+
+    def notify_order_filled(self, order_id: str, fill_price: float) -> None:
+        """Called by TradingService when an entry order fills.
+        Transitions PENDING_ENTRY → SPREAD_OPEN when both legs are confirmed."""
+        if self._state == PutSpreadState.PENDING_ENTRY:
+            self._confirmed_fills += 1
+            logger.info(
+                "pcs_runner_fill_confirmed",
+                order_id=order_id,
+                fill_price=fill_price,
+                fills=self._confirmed_fills,
+                spread_id=self._spread_id,
+            )
+            if self._confirmed_fills >= 2:  # Both legs filled
+                self._state = PutSpreadState.SPREAD_OPEN
+                self._persist_state()
+                logger.info(
+                    "pcs_runner_spread_confirmed",
+                    state="SPREAD_OPEN",
+                    spread_id=self._spread_id,
+                )
+
+    def notify_order_failed(self, order_id: str, reason: str) -> None:
+        """Called by TradingService when an entry order is rejected/fails.
+        Reverts from PENDING_ENTRY → IDLE and activates cooldown."""
+        if self._state == PutSpreadState.PENDING_ENTRY:
+            logger.warning(
+                "pcs_runner_order_failed_reverting",
+                order_id=order_id,
+                reason=reason,
+                spread_id=self._spread_id,
+            )
+            self._reset_state(f"order_failed:{reason}")
+            self._entry_cooldown_until = time.monotonic() + self._ENTRY_COOLDOWN_SECS
+            logger.info(
+                "pcs_runner_entry_cooldown_set",
+                cooldown_secs=self._ENTRY_COOLDOWN_SECS,
+            )
+
+    # ────────────────────────────────────────────────────────
+    # Fix 4: State Persistence
+    # ────────────────────────────────────────────────────────
+
+    def _state_file_path(self) -> str:
+        return os.path.join(_STATE_DIR, f"{self.name}.json")
+
+    def _persist_state(self) -> None:
+        """Save strategy state to disk for crash recovery."""
+        try:
+            os.makedirs(_STATE_DIR, exist_ok=True)
+            state_data = {
+                "state": self._state.value,
+                "spread_id": self._spread_id,
+                "entry_credit": self._entry_credit,
+                "entry_spot": self._entry_spot,
+                "short_entry_premium": self._short_entry_premium,
+                "long_entry_premium": self._long_entry_premium,
+                "short_leg": self._short_leg,
+                "long_leg": self._long_leg,
+                "sl_triggered_at": self._sl_triggered_at,
+                "pending_order_ids": self._pending_order_ids,
+                "confirmed_fills": self._confirmed_fills,
+                "updated_at": datetime.now().isoformat(),
+            }
+            with open(self._state_file_path(), "w") as f:
+                json.dump(state_data, f, indent=2)
+        except Exception as e:
+            logger.error("pcs_runner_persist_state_error", error=str(e))
+
+    def _load_persisted_state(self) -> None:
+        """Load strategy state from disk on startup for crash recovery."""
+        try:
+            fp = self._state_file_path()
+            if not os.path.exists(fp):
+                return
+            with open(fp, "r") as f:
+                data = json.load(f)
+
+            saved_state = data.get("state", "idle")
+
+            # Only restore if there was an active position
+            if saved_state in (PutSpreadState.SPREAD_OPEN.value,
+                               PutSpreadState.RUNNER_LONG_ONLY.value,
+                               PutSpreadState.SPREAD_BE.value):
+                self._state = PutSpreadState(saved_state)
+                self._spread_id = data.get("spread_id")
+                self._entry_credit = data.get("entry_credit", 0)
+                self._entry_spot = data.get("entry_spot", 0)
+                self._short_entry_premium = data.get("short_entry_premium", 0)
+                self._long_entry_premium = data.get("long_entry_premium", 0)
+                self._short_leg = data.get("short_leg")
+                self._long_leg = data.get("long_leg")
+                self._sl_triggered_at = data.get("sl_triggered_at")
+                self._pending_order_ids = data.get("pending_order_ids", [])
+                self._confirmed_fills = data.get("confirmed_fills", 0)
+                logger.warning(
+                    "pcs_runner_state_restored",
+                    state=saved_state,
+                    spread_id=self._spread_id,
+                    short_leg=self._short_leg.get("tradingsymbol") if self._short_leg else None,
+                    long_leg=self._long_leg.get("tradingsymbol") if self._long_leg else None,
+                )
+            elif saved_state == PutSpreadState.PENDING_ENTRY.value:
+                logger.warning(
+                    "pcs_runner_pending_on_restart_reverting",
+                    spread_id=data.get("spread_id"),
+                )
+                self._state = PutSpreadState.IDLE
+                self._persist_state()
+        except Exception as e:
+            logger.error("pcs_runner_load_state_error", error=str(e))

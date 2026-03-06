@@ -128,11 +128,36 @@ def _update_chain_prices(
 
 
 # ═══════════════════════════════════════════════════════════
+# Helpers — simulate order placement & fill
+# ═══════════════════════════════════════════════════════════
+
+def _simulate_entry_fills(strat, signals):
+    """Simulate the full order placement -> fill flow for entry signals.
+    
+    After _evaluate_entry(), state is PENDING_ENTRY. This helper transitions
+    it to SPREAD_OPEN by simulating the notify_order_placed + notify_order_filled
+    callbacks that would come from TradingService/ExecutionEngine in real execution.
+    """
+    for i, sig in enumerate(signals):
+        order_id = f"test_order_{i}"
+        strat.notify_order_placed(order_id, sig.tradingsymbol)
+    for oid in list(strat._pending_order_ids):
+        strat.notify_order_filled(oid, 100.0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Test class
 # ═══════════════════════════════════════════════════════════
 
 class TestCallCreditSpreadRunner:
     """Tests for CallCreditSpreadRunnerStrategy."""
+
+    def setup_method(self):
+        """Clean up persisted state before each test to prevent leakage."""
+        import os
+        state_file = os.path.join("data", "strategy_state", "call_credit_spread_runner.json")
+        if os.path.exists(state_file):
+            os.remove(state_file)
 
     def _make_strategy(self, **overrides) -> CallCreditSpreadRunnerStrategy:
         params = {
@@ -188,9 +213,13 @@ class TestCallCreditSpreadRunner:
         assert len(short_sig) == 1, "Must have exactly 1 SELL signal"
         assert len(long_sig) == 1, "Must have exactly 1 BUY signal"
 
-        # State changed
-        assert strat.state == SpreadState.SPREAD_OPEN
+        # State goes to PENDING_ENTRY (awaiting fill confirmation)
+        assert strat.state == SpreadState.PENDING_ENTRY
         assert strat.is_in_trade
+
+        # Simulate fills to transition to SPREAD_OPEN
+        _simulate_entry_fills(strat, signals)
+        assert strat.state == SpreadState.SPREAD_OPEN
 
     def test_entry_short_call_is_near_target_delta(self):
         """The short call should be close to the 0.30 delta target."""
@@ -284,6 +313,10 @@ class TestCallCreditSpreadRunner:
 
         signals = await strat.on_tick([])
         assert len(signals) == 2
+        assert strat.state == SpreadState.PENDING_ENTRY
+
+        # Simulate fills
+        _simulate_entry_fills(strat, signals)
         assert strat.state == SpreadState.SPREAD_OPEN
 
     @pytest.mark.asyncio
@@ -304,7 +337,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == SpreadState.SPREAD_OPEN
         short_strike = strat._short_leg["strike"]
         sl_premium = strat._short_leg["sl_premium"]
@@ -336,7 +370,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
         sl_premium = strat._short_leg["sl_premium"]
@@ -373,7 +408,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == SpreadState.SPREAD_OPEN
 
         # Simulate spot drop of 70 pts (favourable for bear position)
@@ -393,7 +429,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         entry_credit = strat._entry_credit
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
@@ -432,7 +469,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == SpreadState.SPREAD_OPEN
         entry_credit = strat._entry_credit
         short_strike = strat._short_leg["strike"]
@@ -478,7 +516,8 @@ class TestCallCreditSpreadRunner:
         strat = self._make_strategy()
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
-        strat._evaluate_entry()
+        signals = strat._evaluate_entry()
+        _simulate_entry_fills(strat, signals)
 
         status = strat.get_status()
         assert status["state"] == "spread_open"
@@ -514,7 +553,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        strat._evaluate_entry()
+        signals = strat._evaluate_entry()
+        _simulate_entry_fills(strat, signals)
         short_strike = strat._short_leg["strike"]
         sl_premium = strat._short_leg["sl_premium"]
 
@@ -535,6 +575,7 @@ class TestCallCreditSpreadRunner:
 
     def test_spread_state_values(self):
         assert SpreadState.IDLE.value == "idle"
+        assert SpreadState.PENDING_ENTRY.value == "pending_entry"
         assert SpreadState.SPREAD_OPEN.value == "spread_open"
         assert SpreadState.RUNNER_LONG_ONLY.value == "runner_long"
         assert SpreadState.SPREAD_BE.value == "spread_be"
@@ -552,7 +593,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)
 
         # Enter
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == SpreadState.SPREAD_OPEN
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
@@ -574,4 +616,8 @@ class TestCallCreditSpreadRunner:
         strat.update_chain(chain)  # fresh chain
         re_entry = await strat.on_tick([])
         assert len(re_entry) == 2
+        assert strat.state == SpreadState.PENDING_ENTRY
+
+        # Simulate fills
+        _simulate_entry_fills(strat, re_entry)
         assert strat.state == SpreadState.SPREAD_OPEN

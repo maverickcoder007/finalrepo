@@ -114,10 +114,30 @@ def _update_chain_prices(
 
 
 # ═══════════════════════════════════════════════════════════
+# Helpers — simulate order placement & fill
+# ═══════════════════════════════════════════════════════════
+
+def _simulate_entry_fills(strat, signals):
+    """Simulate order placement + fill to transition PENDING_ENTRY -> SPREAD_OPEN."""
+    for i, sig in enumerate(signals):
+        order_id = f"test_order_{i}"
+        strat.notify_order_placed(order_id, sig.tradingsymbol)
+    for oid in list(strat._pending_order_ids):
+        strat.notify_order_filled(oid, 100.0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Test class
 # ═══════════════════════════════════════════════════════════
 
 class TestPutCreditSpreadRunner:
+
+    def setup_method(self):
+        """Clean up persisted state before each test."""
+        import os
+        state_file = os.path.join("data", "strategy_state", "put_credit_spread_runner.json")
+        if os.path.exists(state_file):
+            os.remove(state_file)
 
     def _make_strategy(self, **overrides) -> PutCreditSpreadRunnerStrategy:
         params = {
@@ -170,8 +190,12 @@ class TestPutCreditSpreadRunner:
         assert len(short_sig) == 1
         assert len(long_sig) == 1
 
-        assert strat.state == PutSpreadState.SPREAD_OPEN
+        assert strat.state == PutSpreadState.PENDING_ENTRY
         assert strat.is_in_trade
+
+        # Simulate fills to transition to SPREAD_OPEN
+        _simulate_entry_fills(strat, signals)
+        assert strat.state == PutSpreadState.SPREAD_OPEN
 
     def test_entry_uses_put_options(self):
         """Both legs should be PE contracts."""
@@ -262,6 +286,9 @@ class TestPutCreditSpreadRunner:
 
         signals = await strat.on_tick([])
         assert len(signals) == 2
+        assert strat.state == PutSpreadState.PENDING_ENTRY
+
+        _simulate_entry_fills(strat, signals)
         assert strat.state == PutSpreadState.SPREAD_OPEN
 
     async def test_on_tick_no_entry_without_chain(self):
@@ -279,7 +306,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == PutSpreadState.SPREAD_OPEN
         short_strike = strat._short_leg["strike"]
         sl_premium = strat._short_leg["sl_premium"]
@@ -301,7 +329,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
         sl_premium = strat._short_leg["sl_premium"]
@@ -333,7 +362,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == PutSpreadState.SPREAD_OPEN
 
         # Spot rises 70 pts (bullish = good for put credit spread)
@@ -350,7 +380,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         entry_credit = strat._entry_credit
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
@@ -381,7 +412,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         entry_credit = strat._entry_credit
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
@@ -413,7 +445,8 @@ class TestPutCreditSpreadRunner:
         strat = self._make_strategy()
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
-        strat._evaluate_entry()
+        signals = strat._evaluate_entry()
+        _simulate_entry_fills(strat, signals)
 
         status = strat.get_status()
         assert status["state"] == "spread_open"
@@ -442,7 +475,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        strat._evaluate_entry()
+        signals = strat._evaluate_entry()
+        _simulate_entry_fills(strat, signals)
         short_strike = strat._short_leg["strike"]
         sl_premium = strat._short_leg["sl_premium"]
 
@@ -462,6 +496,7 @@ class TestPutCreditSpreadRunner:
 
     def test_put_spread_state_values(self):
         assert PutSpreadState.IDLE.value == "idle"
+        assert PutSpreadState.PENDING_ENTRY.value == "pending_entry"
         assert PutSpreadState.SPREAD_OPEN.value == "spread_open"
         assert PutSpreadState.RUNNER_LONG_ONLY.value == "runner_long"
         assert PutSpreadState.SPREAD_BE.value == "spread_be"
@@ -476,7 +511,8 @@ class TestPutCreditSpreadRunner:
         chain = _build_chain(spot=25000.0)
         strat.update_chain(chain)
 
-        await strat.on_tick([])
+        signals = await strat.on_tick([])
+        _simulate_entry_fills(strat, signals)
         assert strat.state == PutSpreadState.SPREAD_OPEN
         short_strike = strat._short_leg["strike"]
         long_strike = strat._long_leg["strike"]
@@ -495,4 +531,7 @@ class TestPutCreditSpreadRunner:
         strat.update_chain(chain)
         re_entry = await strat.on_tick([])
         assert len(re_entry) == 2
+        assert strat.state == PutSpreadState.PENDING_ENTRY
+
+        _simulate_entry_fills(strat, re_entry)
         assert strat.state == PutSpreadState.SPREAD_OPEN

@@ -143,6 +143,7 @@ class ExecutionEngine:
         # Callbacks for journal integration (set by TradingService)
         self._on_fill_callback: Callable | None = None
         self._on_exit_callback: Callable | None = None
+        self._on_rejection_callback: Callable | None = None
         
         # OrderCoordinator: broker microstructure orchestration layer
         # Handles: freeze splitting, market state checks, liquidity checks,
@@ -152,25 +153,38 @@ class ExecutionEngine:
         self._market_guard = MarketStateGuard(client)
 
     async def execute_signal(self, signal: Signal) -> Optional[str]:
-        # ── PREFLIGHT: Run all pre-trade checks before any broker call ──
-        if self._preflight:
-            report = await self._preflight.check_for_live(signal=signal)
-            if not report.passed:
-                reasons = "; ".join(report.blocked_reasons[:3])
-                logger.warning(
-                    "preflight_blocked_order",
-                    symbol=signal.tradingsymbol,
-                    reasons=reasons,
-                )
-                raise RiskLimitError(f"Preflight failed: {reasons}")
+        is_exit_signal = signal.metadata.get("signal_type") == "exit"
 
-        if self._risk.is_kill_switch_active:
-            raise KillSwitchError("Kill switch is active, cannot execute orders")
+        if not is_exit_signal:
+            # ── PREFLIGHT: Run all pre-trade checks before any broker call ──
+            if self._preflight:
+                report = await self._preflight.check_for_live(signal=signal)
+                if not report.passed:
+                    reasons = "; ".join(report.blocked_reasons[:3])
+                    logger.warning(
+                        "preflight_blocked_order",
+                        symbol=signal.tradingsymbol,
+                        reasons=reasons,
+                    )
+                    raise RiskLimitError(f"Preflight failed: {reasons}")
 
-        is_valid, reason = self._risk.validate_signal(signal)
-        if not is_valid:
-            logger.warning("signal_rejected", reason=reason, signal=signal.model_dump())
-            raise RiskLimitError(reason)
+            if self._risk.is_kill_switch_active:
+                raise KillSwitchError("Kill switch is active, cannot execute orders")
+
+            is_valid, reason = self._risk.validate_signal(signal)
+            if not is_valid:
+                logger.warning("signal_rejected", reason=reason, signal=signal.model_dump())
+                raise RiskLimitError(reason)
+        else:
+            # Exit signals bypass preflight/risk — closing positions is risk-reducing
+            if self._risk.is_kill_switch_active:
+                raise KillSwitchError("Kill switch is active, cannot execute orders")
+            logger.info(
+                "exit_signal_bypassing_preflight",
+                symbol=signal.tradingsymbol,
+                strategy=signal.strategy_name,
+                spread_id=signal.metadata.get("spread_id", ""),
+            )
 
         # MARKET STATE CHECK: Block orders during pre-open/auction/circuit
         safe, guard_reason = await self._market_guard.is_safe_to_execute(
@@ -591,6 +605,32 @@ class ExecutionEngine:
         """Register callback for when a position exits. Called by TradingService."""
         self._on_exit_callback = callback
 
+    def set_on_rejection_callback(self, callback: Callable) -> None:
+        """Register callback for when an order is rejected by broker. Called by TradingService."""
+        self._on_rejection_callback = callback
+
+    def _find_tracked_position_for_exit(self, signal: Signal) -> Optional[TrackedPosition]:
+        """Find matching open TrackedPosition for an exit signal.
+
+        Matches by tradingsymbol. Prefers spread_id match if available,
+        falls back to strategy_name match.
+        """
+        spread_id = signal.metadata.get("spread_id", "")
+        for tracked in self._tracked_positions.values():
+            if tracked.is_closed:
+                continue
+            if tracked.tradingsymbol != signal.tradingsymbol:
+                continue
+            # Prefer spread_id match (most precise)
+            if spread_id and tracked.signal:
+                entry_spread_id = tracked.signal.metadata.get("spread_id", "")
+                if entry_spread_id == spread_id:
+                    return tracked
+            # Fallback: match by strategy name
+            if tracked.strategy_name == signal.strategy_name:
+                return tracked
+        return None
+
     def _signal_to_order(self, signal: Signal) -> OrderRequest:
         return OrderRequest(
             tradingsymbol=signal.tradingsymbol,
@@ -719,6 +759,15 @@ class ExecutionEngine:
                                 reason=broker_order.status_message,
                                 latency_ms=round(self._fast_recon_interval * 1000),
                             )
+                            # Notify rejection callback so strategy can revert state
+                            if self._on_rejection_callback:
+                                try:
+                                    signal = getattr(order_req, "_signal", None)
+                                    await self._on_rejection_callback(
+                                        order_id, broker_order, signal
+                                    )
+                                except Exception as e:
+                                    logger.error("rejection_callback_error", error=str(e))
                         elif broker_order.status == "COMPLETE":
                             logger.info(
                                 "fast_recon_fill_confirmed",
@@ -729,46 +778,83 @@ class ExecutionEngine:
                             # ── Post-fill actions ──
                             signal = getattr(order_req, "_signal", None)
                             fill_price = broker_order.average_price or 0.0
-                            
-                            # 1. Create tracked position for SL/trailing monitoring
-                            if signal and fill_price > 0:
-                                # Compute absolute SL price from signal
-                                sl_price = None
-                                if signal.stop_loss:
-                                    if signal.transaction_type == TransactionType.BUY:
-                                        sl_price = round(fill_price - signal.stop_loss, 2)
-                                    else:
-                                        sl_price = round(fill_price + signal.stop_loss, 2)
-                                
-                                tracked = TrackedPosition(
-                                    order_id=order_id,
-                                    tradingsymbol=signal.tradingsymbol,
-                                    exchange=signal.exchange.value if hasattr(signal.exchange, "value") else str(signal.exchange),
-                                    transaction_type=signal.transaction_type.value,
-                                    quantity=signal.quantity,
-                                    entry_price=fill_price,
-                                    stop_loss=sl_price,
-                                    strategy_name=signal.strategy_name or "",
-                                    product=signal.product.value if hasattr(signal.product, "value") else str(signal.product),
-                                    signal=signal,
-                                )
-                                self._tracked_positions[order_id] = tracked
-                                
-                                # 2. Place protective SL order
-                                if sl_price:
-                                    await self._place_protective_stop_loss(tracked)
-                                
-                                # 3. Update risk manager
-                                self._risk.update_daily_pnl(0)  # register trade count
-                            
-                            # 4. Call journal callback
-                            if self._on_fill_callback:
-                                try:
-                                    await self._on_fill_callback(
-                                        order_id, broker_order, signal
+                            is_exit = signal and signal.metadata.get("signal_type") == "exit"
+
+                            if is_exit:
+                                # ── EXIT FILL: Close matching tracked position ──
+                                matched = self._find_tracked_position_for_exit(signal)
+                                if matched:
+                                    exit_reason = signal.metadata.get("exit_reason", "strategy_exit")
+                                    self._finalize_position_exit(matched, fill_price, exit_reason)
+                                    if self._on_exit_callback:
+                                        try:
+                                            await self._on_exit_callback(matched, order_id)
+                                        except Exception as e:
+                                            logger.error("exit_fill_callback_error", error=str(e))
+                                    logger.info(
+                                        "exit_signal_fill_matched",
+                                        order_id=order_id,
+                                        entry_order=matched.order_id,
+                                        symbol=signal.tradingsymbol,
+                                        exit_price=fill_price,
+                                        pnl=matched.pnl,
+                                        spread_id=signal.metadata.get("spread_id", ""),
                                     )
-                                except Exception as e:
-                                    logger.error("fill_callback_error", error=str(e))
+                                else:
+                                    logger.warning(
+                                        "exit_signal_no_matching_position",
+                                        order_id=order_id,
+                                        symbol=signal.tradingsymbol if signal else "unknown",
+                                        strategy=signal.strategy_name if signal else "",
+                                    )
+                                    # Fallback: still call fill callback so it's journaled
+                                    if self._on_fill_callback:
+                                        try:
+                                            await self._on_fill_callback(
+                                                order_id, broker_order, signal
+                                            )
+                                        except Exception as e:
+                                            logger.error("fill_callback_error", error=str(e))
+                            else:
+                                # ── ENTRY FILL: Create tracked position (existing behavior) ──
+                                if signal and fill_price > 0:
+                                    # Compute absolute SL price from signal
+                                    sl_price = None
+                                    if signal.stop_loss:
+                                        if signal.transaction_type == TransactionType.BUY:
+                                            sl_price = round(fill_price - signal.stop_loss, 2)
+                                        else:
+                                            sl_price = round(fill_price + signal.stop_loss, 2)
+                                    
+                                    tracked = TrackedPosition(
+                                        order_id=order_id,
+                                        tradingsymbol=signal.tradingsymbol,
+                                        exchange=signal.exchange.value if hasattr(signal.exchange, "value") else str(signal.exchange),
+                                        transaction_type=signal.transaction_type.value,
+                                        quantity=signal.quantity,
+                                        entry_price=fill_price,
+                                        stop_loss=sl_price,
+                                        strategy_name=signal.strategy_name or "",
+                                        product=signal.product.value if hasattr(signal.product, "value") else str(signal.product),
+                                        signal=signal,
+                                    )
+                                    self._tracked_positions[order_id] = tracked
+                                    
+                                    # Place protective SL order
+                                    if sl_price:
+                                        await self._place_protective_stop_loss(tracked)
+                                    
+                                    # Update risk manager
+                                    self._risk.update_daily_pnl(0)  # register trade count
+                                
+                                # Call journal callback
+                                if self._on_fill_callback:
+                                    try:
+                                        await self._on_fill_callback(
+                                            order_id, broker_order, signal
+                                        )
+                                    except Exception as e:
+                                        logger.error("fill_callback_error", error=str(e))
                             
             except Exception as e:
                 logger.error("fast_reconciliation_error", error=str(e))

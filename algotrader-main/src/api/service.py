@@ -138,6 +138,7 @@ class TradingService:
         # Wire execution engine → journal callbacks
         self._execution.set_on_fill_callback(self._on_execution_fill)
         self._execution.set_on_exit_callback(self._on_execution_exit)
+        self._execution.set_on_rejection_callback(self._on_execution_rejection)
         self._chain_builder = OptionChainBuilder()
         self._preflight._chain = self._chain_builder  # Wire chain builder for F&O validation
         self._oi_tracker = OITracker()
@@ -2792,6 +2793,33 @@ class TradingService:
     # Execution → Journal Callbacks
     # ────────────────────────────────────────────────────────────
 
+    def _find_strategy_instance(self, name: str):
+        """Find a loaded strategy by name from self._strategies."""
+        for s in self._strategies:
+            if s.name == name:
+                return s
+        return None
+
+    async def _on_execution_rejection(self, order_id: str, broker_order: Any, signal: Any) -> None:
+        """Called by ExecutionEngine when broker rejects an order.
+        Notifies the originating strategy so it can revert pending state.
+        """
+        if not signal:
+            return
+        strategy = self._find_strategy_instance(signal.strategy_name)
+        if strategy and hasattr(strategy, "notify_order_failed"):
+            try:
+                reason = getattr(broker_order, "status_message", "Order rejected by broker")
+                strategy.notify_order_failed(order_id, str(reason))
+                logger.info(
+                    "strategy_notified_of_rejection",
+                    strategy=signal.strategy_name,
+                    order_id=order_id,
+                    reason=str(reason),
+                )
+            except Exception as e:
+                logger.error("strategy_rejection_notify_error", error=str(e))
+
     async def _on_execution_fill(self, order_id: str, broker_order: Any, signal: Any) -> None:
         """Called by ExecutionEngine when an entry order fills.
         Records fill in both TradeJournal and JournalStore (pro journal).
@@ -2910,6 +2938,15 @@ class TradingService:
             price=fill_price,
             strategy=strategy_name,
         )
+
+        # 6. Notify originating strategy of fill (for PENDING_ENTRY → SPREAD_OPEN transition)
+        if signal:
+            strat_inst = self._find_strategy_instance(strategy_name)
+            if strat_inst and hasattr(strat_inst, "notify_order_filled"):
+                try:
+                    strat_inst.notify_order_filled(order_id, fill_price)
+                except Exception as e:
+                    logger.error("strategy_fill_notify_error", error=str(e), strategy=strategy_name)
 
     async def _on_execution_exit(self, tracked: Any, exit_order_id: str) -> None:
         """Called by ExecutionEngine when a position exits (SL, trailing, MIS squareoff, manual).
@@ -3224,9 +3261,19 @@ class TradingService:
         self._signal_log.append(signal_data)
         await self._broadcast_ws({"type": "signal", "data": signal_data})
 
+        is_exit_signal = signal.metadata.get("signal_type") == "exit"
+        strategy_inst = self._find_strategy_instance(signal.strategy_name)
+
         try:
             order_id = await self._execution.execute_signal(signal)
             if order_id:
+                # Notify strategy of successful order placement
+                if strategy_inst and hasattr(strategy_inst, "notify_order_placed"):
+                    try:
+                        strategy_inst.notify_order_placed(order_id, signal.tradingsymbol)
+                    except Exception as e:
+                        logger.error("strategy_notify_placed_error", error=str(e))
+
                 self._journal.record_trade(
                     strategy=signal.strategy_name,
                     tradingsymbol=signal.tradingsymbol,
@@ -3235,13 +3282,19 @@ class TradingService:
                     quantity=signal.quantity,
                     price=signal.price or 0.0,
                     order_id=order_id,
-                    status="PLACED",
+                    status="EXIT_PLACED" if is_exit_signal else "PLACED",
                     metadata=signal.metadata,
                 )
         except KillSwitchError:
             logger.critical("kill_switch_triggered")
             for s in self._strategies:
                 s.deactivate()
+            # Notify strategy of failure
+            if strategy_inst and hasattr(strategy_inst, "notify_order_failed"):
+                try:
+                    strategy_inst.notify_order_failed(None, "Kill switch active")
+                except Exception:
+                    pass
             # Record critical system event
             try:
                 from src.journal.journal_models import SystemEvent
@@ -3256,6 +3309,12 @@ class TradingService:
                 pass
         except RiskLimitError as e:
             logger.warning("risk_limit_hit", error=str(e))
+            # Notify strategy of failure
+            if strategy_inst and hasattr(strategy_inst, "notify_order_failed"):
+                try:
+                    strategy_inst.notify_order_failed(None, str(e))
+                except Exception:
+                    pass
             # Record warning system event
             try:
                 from src.journal.journal_models import SystemEvent
@@ -3270,6 +3329,12 @@ class TradingService:
                 pass
         except Exception as e:
             logger.error("signal_processing_error", error=str(e))
+            # Notify strategy of failure
+            if strategy_inst and hasattr(strategy_inst, "notify_order_failed"):
+                try:
+                    strategy_inst.notify_order_failed(None, str(e))
+                except Exception:
+                    pass
 
     # ────────────────────────────────────────────────────────────
     # Paper Trading
