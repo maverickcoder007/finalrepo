@@ -36,7 +36,7 @@ from src.journal.journal_models import (
     PortfolioSnapshot, CapitalMetrics, RiskMetrics, SystemEvent,
     SignalQuality, LiquiditySnapshot,
 )
-from src.options.chain import OptionChainBuilder
+from src.options.chain import OptionChainBuilder, OptionChainData
 from src.options.oi_analysis import FuturesOIAnalyzer, OptionsOIAnalyzer
 from src.options.oi_intraday_analyzer import IntradayOIFlowAnalyzer, get_intraday_oi_analyzer
 from src.options.oi_snapshot_scheduler import OISnapshotScheduler, get_oi_snapshot_scheduler
@@ -1459,13 +1459,14 @@ class TradingService:
                         sig.metadata["mapped_strategy_label"] = mapping.fno_strategy_label
                         sig.metadata["strategy_rationale"] = mapping.strategy_rationale
 
-            # Auto-execute if configured
+            # Auto-execute if configured — use bridge for proper multi-leg execution
             if self._oi_strategy.config.auto_execute and result.signals:
                 for sig in result.signals:
                     if sig.confidence >= 65:
-                        pos = self._oi_strategy.create_position_from_signal(sig)
-                        # Record in journal
-                        self._record_oi_journal_entry(pos, "ENTRY")
+                        try:
+                            await self.oi_fno_bridge_execute_signal(sig.id, skip_backtest=False)
+                        except Exception as auto_err:
+                            logger.warning("oi_auto_execute_failed", signal_id=sig.id, error=str(auto_err))
 
             # Include available DB strategies for UI
             scan_data = result.model_dump()
@@ -1586,16 +1587,17 @@ class TradingService:
         sensex = await self.oi_strategy_scan("SENSEX")
         return {"nifty": nifty, "sensex": sensex}
 
-    def oi_strategy_execute_signal(self, signal_id: str) -> dict[str, Any]:
-        """Execute a specific OI signal by creating a position."""
-        sig = next((s for s in self._oi_strategy._signals_history if s.id == signal_id), None)
-        if not sig:
-            return {"error": f"Signal {signal_id} not found"}
-        if len(self._oi_strategy.get_open_positions()) >= self._oi_strategy.config.max_open_positions:
-            return {"error": "Max open positions reached"}
-        pos = self._oi_strategy.create_position_from_signal(sig)
-        self._record_oi_journal_entry(pos, "ENTRY")
-        return {"success": True, "position": pos.model_dump()}
+    async def oi_strategy_execute_signal(self, signal_id: str) -> dict[str, Any]:
+        """Execute a specific OI signal via the bridge for proper multi-leg execution.
+
+        Delegates to oi_fno_bridge_execute_signal which:
+          1. Maps signal to FNO strategy (CCS/PCS runner etc.)
+          2. Runs backtest gate (unless skip_backtest)
+          3. Fetches option chain and feeds to strategy
+          4. Triggers multi-leg signal generation
+          5. Routes each leg through _process_signal → broker + dashboard
+        """
+        return await self.oi_fno_bridge_execute_signal(signal_id, skip_backtest=False)
 
     def oi_strategy_close_position(self, position_id: str, exit_price: float = 0.0) -> dict[str, Any]:
         """Close an OI strategy position."""
@@ -1657,26 +1659,26 @@ class TradingService:
                 notes=f"OI Strategy: {position.signal_type} | {action}",
                 metadata=meta,
             )
-            # Also record in JournalStore (pro journal)
-            if action == "EXIT":
-                entry = JournalEntry(
-                    entry_id=f"oi-{position.id}",
-                    trade_type="fno",
-                    instrument=position.tradingsymbol or f"{position.underlying}_{position.option_type}_{position.strike}",
-                    tradingsymbol=position.tradingsymbol or "",
-                    exchange=position.exchange,
-                    strategy_name=f"oi_strategy_{position.signal_type}",
-                    direction=position.direction,
-                    is_closed=True,
-                    gross_pnl=position.pnl,
-                    net_pnl=position.pnl,
-                    entry_time=position.entry_time,
-                    exit_time=position.exit_time or "",
-                    tags=["oi_strategy", position.signal_type, position.underlying],
-                    notes=f"OI Signal: {position.signal_type}",
-                    metadata=meta,
-                )
-                self._journal_store.record_entry(entry)
+            # Record in pro journal for both ENTRY and EXIT
+            is_closed = action == "EXIT"
+            entry = JournalEntry(
+                entry_id=f"oi-{position.id}-{action.lower()}",
+                trade_type="fno",
+                instrument=position.tradingsymbol or f"{position.underlying}_{position.option_type}_{position.strike}",
+                tradingsymbol=position.tradingsymbol or "",
+                exchange=position.exchange,
+                strategy_name=f"oi_strategy_{position.signal_type}",
+                direction=position.direction,
+                is_closed=is_closed,
+                gross_pnl=position.pnl if is_closed else 0.0,
+                net_pnl=position.pnl if is_closed else 0.0,
+                entry_time=position.entry_time,
+                exit_time=position.exit_time or "",
+                tags=["oi_strategy", position.signal_type, position.underlying, action.lower()],
+                notes=f"OI Signal: {position.signal_type} | {action}",
+                metadata=meta,
+            )
+            self._journal_store.record_entry(entry)
         except Exception as e:
             logger.error("oi_journal_record_error", error=str(e))
 
@@ -1830,8 +1832,11 @@ class TradingService:
         Flow:
           1. Find signal → map to FNO strategy
           2. Run/check backtest (unless skip_backtest=True)
-          3. If approved → create OI position + place broker order + log signal
-          4. Return execution result
+          3. If approved → create OI position for tracking
+          4. Ensure the mapped strategy (CCS/PCS runner etc.) is in active strategies
+          5. Fetch fresh option chain and feed it to the strategy
+          6. Trigger strategy's on_tick() to generate proper multi-leg entry signals
+          7. Route all leg signals through _process_signal() for dashboard + broker
 
         Args:
             signal_id: OI signal to execute.
@@ -1875,73 +1880,127 @@ class TradingService:
             pos = self._oi_strategy.create_position_from_signal(sig)
             self._record_oi_journal_entry(pos, "ENTRY")
 
-            # Step 4: Build a proper Signal and route through execution engine
-            # Determine exchange enum
-            exchange_str = sig.exchange or "NFO"
-            try:
-                exchange_enum = Exchange(exchange_str)
-            except ValueError:
-                exchange_enum = Exchange.NFO
-
-            # Determine transaction type
-            txn_type = TransactionType.BUY if pos.direction == "BUY" else TransactionType.SELL
-
             strategy_label = mapping.fno_strategy_label or mapping.fno_strategy
-            broker_signal = Signal(
-                tradingsymbol=pos.tradingsymbol or f"{sig.underlying}_{sig.option_type}_{int(sig.strike)}",
-                exchange=exchange_enum,
-                transaction_type=txn_type,
-                quantity=pos.quantity,
-                price=pos.entry_price if pos.entry_price > 0 else None,
-                order_type=OrderType.LIMIT if pos.entry_price > 0 else OrderType.MARKET,
-                product=ProductType.NRML,
-                stop_loss=pos.stop_loss if pos.stop_loss > 0 else None,
-                target=pos.target if pos.target > 0 else None,
-                strategy_name=f"oi_bridge_{mapping.fno_strategy}",
-                confidence=sig.confidence,
-                metadata={
-                    "source": "oi_fno_bridge",
-                    "signal_id": signal_id,
-                    "signal_type": sig.signal_type,
-                    "mapped_strategy": mapping.fno_strategy,
-                    "mapped_strategy_label": strategy_label,
-                    "oi_position_id": pos.id,
-                    "underlying": sig.underlying,
-                    "direction": sig.direction,
-                },
-            )
+            mapped_name = mapping.fno_strategy  # e.g. "call_credit_spread_runner"
 
-            # Log to signal log + place broker order via execution engine
-            order_id = None
-            broker_error = None
-            try:
-                await self._process_signal(broker_signal)
-                # Try to get the order_id from the last placed order
-                if self._signal_log:
-                    last_sig = self._signal_log[-1]
-                    order_id = last_sig.get("order_id")
-            except Exception as exec_err:
-                broker_error = str(exec_err)
-                logger.warning(
-                    "oi_bridge_broker_order_failed",
-                    signal_id=signal_id,
-                    error=broker_error,
+            # Step 4: Ensure mapped strategy is in self._strategies
+            target_strat = None
+            for s in self._strategies:
+                if s.name == mapped_name:
+                    target_strat = s
+                    break
+
+            if target_strat is None:
+                add_result = await self.add_strategy(
+                    name=mapped_name,
+                    params={
+                        "underlying": sig.underlying or "NIFTY",
+                        "source": "oi_bridge",
+                        "signal_id": signal_id,
+                    },
+                    timeframe="5minute",
+                    require_tested=False,
                 )
-                # Signal is still logged even if broker order fails
+                if not add_result.get("success"):
+                    return {
+                        "error": f"Failed to add strategy {mapped_name}: {add_result.get('error', 'unknown')}",
+                    }
+                # Find the newly added strategy
+                for s in self._strategies:
+                    if s.name == mapped_name:
+                        target_strat = s
+                        break
 
-            result = {
+            if target_strat is None:
+                return {"error": f"Strategy {mapped_name} not found after add"}
+
+            # Step 5: Fetch fresh option chain and feed it to the strategy
+            underlying = sig.underlying or "NIFTY"
+            chain_error = None
+            try:
+                chain = await self._build_chain_for_underlying(underlying)
+                if chain and chain.entries:
+                    target_strat.update_chain(chain)
+                    logger.info(
+                        "oi_bridge_chain_fed_to_strategy",
+                        strategy=mapped_name,
+                        underlying=underlying,
+                        entries=len(chain.entries),
+                        spot=round(chain.spot_price, 2),
+                    )
+                else:
+                    chain_error = "Chain build returned no entries"
+                    logger.warning("oi_bridge_chain_empty", underlying=underlying)
+            except Exception as ce:
+                chain_error = str(ce)
+                logger.warning("oi_bridge_chain_build_failed", underlying=underlying, error=chain_error)
+
+            # Step 6: Trigger strategy's on_tick to generate proper multi-leg signals
+            signals_generated: list[dict[str, Any]] = []
+            broker_errors: list[str] = []
+            if chain_error is None and target_strat.is_active:
+                try:
+                    entry_signals = await target_strat.on_tick([])
+                    if entry_signals:
+                        logger.info(
+                            "oi_bridge_strategy_signals",
+                            strategy=mapped_name,
+                            count=len(entry_signals),
+                            legs=[getattr(s, "tradingsymbol", "") for s in entry_signals],
+                        )
+                        for leg_sig in entry_signals:
+                            # Enrich metadata with bridge context
+                            leg_meta = dict(leg_sig.metadata) if leg_sig.metadata else {}
+                            leg_meta.update({
+                                "source": "oi_fno_bridge",
+                                "signal_id": signal_id,
+                                "oi_position_id": pos.id,
+                            })
+                            leg_sig.metadata = leg_meta
+
+                            try:
+                                await self._process_signal(leg_sig)
+                                signals_generated.append({
+                                    "tradingsymbol": leg_sig.tradingsymbol,
+                                    "transaction_type": leg_sig.transaction_type.value,
+                                    "quantity": leg_sig.quantity,
+                                    "leg": leg_meta.get("leg", "unknown"),
+                                })
+                            except Exception as exec_err:
+                                broker_errors.append(f"{leg_sig.tradingsymbol}: {exec_err}")
+                    else:
+                        logger.warning(
+                            "oi_bridge_no_entry_signals",
+                            strategy=mapped_name,
+                            underlying=underlying,
+                            hint="Strategy on_tick returned empty — entry conditions may not be met",
+                        )
+                except Exception as sig_err:
+                    broker_errors.append(f"Signal generation failed: {sig_err}")
+                    logger.error("oi_bridge_signal_gen_error", strategy=mapped_name, error=str(sig_err))
+            elif not target_strat.is_active:
+                chain_error = (chain_error or "") + "; strategy is not active"
+
+            result: dict[str, Any] = {
                 "success": True,
                 "position": pos.model_dump(),
                 "mapping": mapping.model_dump(),
                 "backtest": backtest_result,
-                "order_id": order_id,
+                "signals_placed": signals_generated,
+                "legs_count": len(signals_generated),
                 "execution_note": (
                     f"Signal {signal_id} → {strategy_label} — "
-                    f"position created, order {'placed' if not broker_error else 'failed: ' + broker_error}"
+                    f"position created, {len(signals_generated)} leg(s) placed"
                 ),
             }
-            if broker_error:
-                result["broker_warning"] = broker_error
+            if broker_errors:
+                result["broker_warnings"] = broker_errors
+            if chain_error:
+                result["chain_warning"] = chain_error
+            if not signals_generated:
+                result["execution_note"] += (
+                    " (no entry signals generated — check strategy conditions / chain data)"
+                )
 
             return result
         except Exception as e:
@@ -4563,6 +4622,140 @@ class TradingService:
         265:    "BSE:SENSEX",         # SENSEX
     }
 
+    # ── On-demand chain build (used by OI bridge execute) ──
+
+    async def _build_chain_for_underlying(self, underlying: str) -> Optional[OptionChainData]:
+        """Build a fresh option chain for a single underlying via REST.
+
+        Reusable helper that mirrors the chain-refresh loop logic but runs
+        on-demand for a single underlying.  Returns ``None`` on failure.
+        """
+        from datetime import date as _date
+
+        # 1. Spot price
+        spot = 0.0
+        spot_token = {"NIFTY": 256265, "SENSEX": 265, "BANKNIFTY": 260105}.get(underlying, 0)
+        if spot_token and spot_token in self._live_ticks:
+            spot = self._live_ticks[spot_token].get("ltp", 0.0)
+        if spot <= 0:
+            try:
+                ltp_key = {
+                    "NIFTY": "NSE:NIFTY 50",
+                    "SENSEX": "BSE:SENSEX",
+                    "BANKNIFTY": "NSE:NIFTY BANK",
+                }.get(underlying)
+                if ltp_key:
+                    ltp_data = await self._client.get_ltp([ltp_key])
+                    for v in ltp_data.values():
+                        p = v.last_price if hasattr(v, "last_price") else 0
+                        if p > 0:
+                            spot = p
+            except Exception:
+                pass
+        if spot <= 0:
+            logger.warning("build_chain_no_spot", underlying=underlying)
+            return None
+
+        # 2. Load instruments
+        exchange = "BFO" if underlying == "SENSEX" else "NFO"
+        try:
+            raw_instruments = await self._market_data.get_instruments(exchange)
+            all_instruments = [
+                i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
+                for i in raw_instruments
+            ]
+        except Exception as e:
+            logger.warning("build_chain_instruments_failed", underlying=underlying, error=str(e))
+            return None
+
+        filtered = [
+            i for i in all_instruments
+            if i.get("instrument_type") in ("CE", "PE")
+            and i.get("name", "").upper() == underlying.upper()
+        ]
+        if not filtered:
+            return None
+
+        # 3. Nearest expiry (skip same-day)
+        today = _date.today()
+        expiries: set[str] = set()
+        for inst in filtered:
+            exp = inst.get("expiry", "")
+            if exp:
+                try:
+                    exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
+                    if exp_dt > today:
+                        expiries.add(exp)
+                except (ValueError, TypeError):
+                    pass
+        if not expiries:
+            # Fallback: include today if no future expiries
+            for inst in filtered:
+                exp = inst.get("expiry", "")
+                if exp:
+                    try:
+                        exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
+                        if exp_dt >= today:
+                            expiries.add(exp)
+                    except (ValueError, TypeError):
+                        pass
+        if not expiries:
+            return None
+        nearest_expiry = min(expiries)
+
+        expiry_instruments = [i for i in filtered if i.get("expiry") == nearest_expiry]
+
+        # 4. Narrow to ±10 strikes around ATM
+        strikes = sorted(set(i.get("strike", 0) for i in expiry_instruments if i.get("strike", 0) > 0))
+        if not strikes:
+            return None
+        atm_strike = min(strikes, key=lambda s: abs(s - spot))
+        atm_idx = strikes.index(atm_strike)
+        lo = max(0, atm_idx - 10)
+        hi = min(len(strikes), atm_idx + 11)
+        near_strikes = set(strikes[lo:hi])
+        near_instruments = [i for i in expiry_instruments if i.get("strike", 0) in near_strikes]
+
+        # 5. Fetch quotes
+        quote_keys = []
+        for inst in near_instruments:
+            exch = inst.get("exchange", exchange)
+            tsym = inst.get("tradingsymbol", "")
+            if tsym:
+                quote_keys.append(f"{exch}:{tsym}")
+
+        quotes: dict[str, dict[str, Any]] = {}
+        for batch_start in range(0, len(quote_keys), 400):
+            batch = quote_keys[batch_start:batch_start + 400]
+            try:
+                raw = await self._client.get_quote(batch)
+                for k, q in raw.items():
+                    ltp = q.last_price if hasattr(q, "last_price") else 0
+                    quotes[k] = {
+                        "last_price": ltp,
+                        "volume": q.volume if hasattr(q, "volume") else 0,
+                        "oi": q.oi if hasattr(q, "oi") else 0,
+                    }
+            except Exception as e:
+                logger.warning("build_chain_quote_error", underlying=underlying, error=str(e))
+
+        # 6. Build chain
+        chain = self._chain_builder.build_chain(
+            underlying=underlying,
+            spot_price=spot,
+            instruments=near_instruments,
+            quotes=quotes,
+            expiry_filter=nearest_expiry,
+        )
+        logger.info(
+            "build_chain_success",
+            underlying=underlying,
+            entries=len(chain.entries),
+            spot=round(spot, 2),
+            expiry=nearest_expiry,
+        )
+        return chain
+
     # ── Option Chain Refresh (feeds live chain data to option strategies) ──
 
     async def _option_chain_refresh_loop(self) -> None:
@@ -4571,66 +4764,86 @@ class TradingService:
         Without this, option strategies (credit spreads etc.) never receive
         chain data in the live loop and can neither enter nor manage positions.
         Runs every 10 seconds; uses REST quotes (≤500 instruments per call batch).
+
+        Strategies may be added dynamically (e.g. via OI→FNO bridge) after
+        start_live(), so we re-scan self._strategies each cycle instead of
+        capturing once at startup.
         """
         await asyncio.sleep(5)  # Let ticks start flowing first
 
-        # Determine which underlyings our option strategies care about
-        underlyings: set[str] = set()
-        option_strategies: list[OptionStrategyBase] = []
-        for s in self._strategies:
-            if isinstance(s, OptionStrategyBase):
-                option_strategies.append(s)
-                underlyings.add(s.params.get("underlying", "NIFTY"))
-
-        if not option_strategies:
-            logger.debug("option_chain_refresh_loop_skipped", reason="no option strategies")
-            return
-
-        logger.info(
-            "option_chain_refresh_loop_started",
-            underlyings=list(underlyings),
-            strategies=[s.name for s in option_strategies],
-        )
-
-        # Pre-fetch NFO/BFO instruments once (they don't change intra-day)
+        # Instrument cache — loaded once per underlying, reused across cycles
+        _nfo_list: list[dict[str, Any]] | None = None
+        _bfo_list: list[dict[str, Any]] | None = None
         instruments_by_underlying: dict[str, list[dict[str, Any]]] = {}
-        try:
-            nfo_instruments = await self._market_data.get_instruments("NFO")
-            nfo_list = [
-                i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
-                for i in nfo_instruments
-            ]
-            for underlying in underlyings:
-                instruments_by_underlying[underlying] = [
-                    i for i in nfo_list
-                    if i.get("instrument_type") in ("CE", "PE")
-                    and i.get("name", "").upper() == underlying.upper()
-                ]
-            # Also try BFO for SENSEX
-            if "SENSEX" in underlyings:
-                try:
-                    bfo_instruments = await self._market_data.get_instruments("BFO")
-                    bfo_list = [
-                        i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
-                        for i in bfo_instruments
-                    ]
-                    sensex_opts = [
-                        i for i in bfo_list
-                        if i.get("instrument_type") in ("CE", "PE")
-                        and i.get("name", "").upper() == "SENSEX"
-                    ]
-                    instruments_by_underlying["SENSEX"] = sensex_opts or instruments_by_underlying.get("SENSEX", [])
-                except Exception:
-                    pass
-            logger.info("option_chain_instruments_loaded", counts={u: len(v) for u, v in instruments_by_underlying.items()})
-        except Exception as e:
-            logger.error("option_chain_instruments_load_failed", error=str(e))
-            return
+        _known_underlyings: set[str] = set()  # track which underlyings we've loaded
+
+        logger.info("option_chain_refresh_loop_alive", msg="Loop started, will scan for option strategies each cycle")
 
         while self._running:
+            # ── 1. Re-discover option strategies each cycle ──────────
+            option_strategies: list[OptionStrategyBase] = []
+            underlyings: set[str] = set()
+            for s in self._strategies:
+                if isinstance(s, OptionStrategyBase):
+                    option_strategies.append(s)
+                    underlyings.add(s.params.get("underlying", "NIFTY"))
+
+            if not option_strategies:
+                await asyncio.sleep(10)
+                continue
+
+            # ── 2. Load instruments if we have new underlyings ───────
+            new_underlyings = underlyings - _known_underlyings
+            if new_underlyings:
+                logger.info(
+                    "option_chain_refresh_loading_instruments",
+                    new_underlyings=list(new_underlyings),
+                    all_strategies=[s.name for s in option_strategies],
+                )
+                try:
+                    if _nfo_list is None:
+                        nfo_instruments = await self._market_data.get_instruments("NFO")
+                        _nfo_list = [
+                            i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
+                            for i in nfo_instruments
+                        ]
+                    for underlying in new_underlyings:
+                        instruments_by_underlying[underlying] = [
+                            i for i in _nfo_list
+                            if i.get("instrument_type") in ("CE", "PE")
+                            and i.get("name", "").upper() == underlying.upper()
+                        ]
+                    # Also try BFO for SENSEX
+                    if "SENSEX" in new_underlyings:
+                        try:
+                            if _bfo_list is None:
+                                bfo_instruments = await self._market_data.get_instruments("BFO")
+                                _bfo_list = [
+                                    i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else vars(i))
+                                    for i in bfo_instruments
+                                ]
+                            sensex_opts = [
+                                i for i in _bfo_list
+                                if i.get("instrument_type") in ("CE", "PE")
+                                and i.get("name", "").upper() == "SENSEX"
+                            ]
+                            instruments_by_underlying["SENSEX"] = sensex_opts or instruments_by_underlying.get("SENSEX", [])
+                        except Exception as e:
+                            logger.warning("option_chain_bfo_load_failed", error=str(e))
+                    _known_underlyings |= new_underlyings
+                    logger.info("option_chain_instruments_loaded", counts={u: len(v) for u, v in instruments_by_underlying.items()})
+                except Exception as e:
+                    logger.error("option_chain_instruments_load_failed", error=str(e))
+                    await asyncio.sleep(10)
+                    continue
+
+            # ── 3. Refresh chain for each underlying ─────────────────
+            from datetime import date as _date
+            today = _date.today()
+
             for underlying in underlyings:
                 try:
-                    # 1. Get spot price from cached live ticks
+                    # 3a. Get spot price from cached live ticks
                     spot = 0.0
                     spot_token = {"NIFTY": 256265, "SENSEX": 265, "BANKNIFTY": 260105}.get(underlying, 0)
                     if spot_token and spot_token in self._live_ticks:
@@ -4648,24 +4861,22 @@ class TradingService:
                         except Exception:
                             pass
                     if spot <= 0:
-                        logger.debug("option_chain_skip_no_spot", underlying=underlying)
+                        logger.info("option_chain_skip_no_spot", underlying=underlying)
                         continue
 
-                    # 2. Filter instruments to near-ATM strikes (±10 strikes) to limit quote calls
+                    # 3b. Filter instruments to near-ATM strikes (±10 strikes)
                     all_instruments = instruments_by_underlying.get(underlying, [])
                     if not all_instruments:
+                        logger.info("option_chain_skip_no_instruments", underlying=underlying)
                         continue
 
                     # Find suitable expiry (skip same-day expiry as premiums are too low)
-                    from datetime import date as _date
-                    today = _date.today()
                     expiries: set[str] = set()
                     for inst in all_instruments:
                         exp = inst.get("expiry", "")
                         if exp:
                             try:
                                 exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
-                                # Skip today's expiry - premiums are near-zero
                                 if exp_dt > today:
                                     expiries.add(exp)
                             except (ValueError, TypeError):
@@ -4682,6 +4893,7 @@ class TradingService:
                                 except (ValueError, TypeError):
                                     pass
                     if not expiries:
+                        logger.info("option_chain_skip_no_expiries", underlying=underlying)
                         continue
                     nearest_expiry = min(expiries)
                     logger.info(
@@ -4709,7 +4921,7 @@ class TradingService:
                         i for i in expiry_instruments if i.get("strike", 0) in near_strikes
                     ]
 
-                    # 3. Fetch quotes for these instruments
+                    # 3c. Fetch quotes for these instruments
                     quote_keys = []
                     for inst in near_instruments:
                         exch = inst.get("exchange", "NFO")
@@ -4748,7 +4960,7 @@ class TradingService:
                         except Exception as e:
                             logger.warning("option_chain_quote_batch_error", underlying=underlying, error=str(e))
 
-                    # 4. Build chain
+                    # 3d. Build chain
                     chain = self._chain_builder.build_chain(
                         underlying=underlying,
                         spot_price=spot,
@@ -4757,8 +4969,7 @@ class TradingService:
                         expiry_filter=nearest_expiry,
                     )
 
-                    # 5. Feed chain to all option strategies that trade this underlying
-                    #    and evaluate entry signals (in case WebSocket ticks aren't flowing)
+                    # 3e. Feed chain to all option strategies that trade this underlying
                     for strat in option_strategies:
                         if strat.params.get("underlying", "NIFTY") == underlying:
                             strat.update_chain(chain)

@@ -268,7 +268,7 @@ class PreflightChecker:
         results.append(await self._check_margin_utilization())
 
         # 5. WebSocket stable
-        results.append(self._check_websocket_health())
+        results.append(self._check_websocket_health(signal))
 
         # 6. Exposure within limits
         results.append(self._check_exposure_limit(signal))
@@ -498,10 +498,42 @@ class PreflightChecker:
                 message=f"Margin utilization check failed: {str(e)[:100]}",
             )
 
-    def _check_websocket_health(self) -> CheckResult:
-        """Verify WebSocket is connected and last tick is fresh."""
+    def _check_websocket_health(self, signal: Any = None) -> CheckResult:
+        """Verify WebSocket is connected and last tick is fresh.
+
+        For LIMIT orders that already have a valid price (e.g. OI bridge
+        orders) or option-strategy MARKET orders whose prices come from a
+        fresh REST-based chain snapshot, a disconnected WebSocket is
+        downgraded to WARNING so the order is not blocked.
+        """
+        # Determine if signal already carries a usable price (LIMIT order)
+        # or is from a chain-based option strategy (prices sourced via REST)
+        from src.data.models import OrderType as _OT
+        can_bypass_ws = False
+        if signal is not None:
+            sig_price = getattr(signal, "price", None)
+            sig_otype = getattr(signal, "order_type", None)
+            if sig_price and sig_price > 0 and sig_otype in (_OT.LIMIT, "LIMIT"):
+                can_bypass_ws = True
+
+            # Option strategies get prices from the REST-based chain refresh,
+            # not from the WebSocket.  Their MARKET orders are safe to execute.
+            if not can_bypass_ws:
+                meta = getattr(signal, "metadata", None) or {}
+                strategy_name = getattr(signal, "strategy_name", "") or ""
+                is_chain_based = (
+                    "leg" in meta  # all option strategy signals carry leg metadata
+                    or meta.get("source") == "oi_fno_bridge"
+                    or any(kw in strategy_name for kw in (
+                        "spread", "condor", "butterfly", "straddle", "strangle",
+                        "covered_call", "protective_put", "calendar",
+                    ))
+                )
+                if is_chain_based:
+                    can_bypass_ws = True
+
         if not self._ticker:
-            if self.config.require_websocket_for_live:
+            if self.config.require_websocket_for_live and not can_bypass_ws:
                 return CheckResult(
                     name="websocket_stable",
                     passed=False,
@@ -510,9 +542,9 @@ class PreflightChecker:
                 )
             return CheckResult(
                 name="websocket_stable",
-                passed=True,
-                severity=CheckSeverity.INFO,
-                message="WebSocket not required",
+                passed=True if can_bypass_ws else False,
+                severity=CheckSeverity.WARNING if can_bypass_ws else CheckSeverity.CRITICAL,
+                message="WebSocket not configured — order has REST-sourced data, proceeding" if can_bypass_ws else "No WebSocket ticker configured",
             )
 
         # Check connection
@@ -521,6 +553,14 @@ class PreflightChecker:
             is_connected = is_connected()
 
         if not is_connected:
+            # LIMIT / chain-based orders can proceed without live WS ticks
+            if can_bypass_ws:
+                return CheckResult(
+                    name="websocket_stable",
+                    passed=True,
+                    severity=CheckSeverity.WARNING,
+                    message="WebSocket disconnected — order has REST-sourced data, proceeding with warning",
+                )
             return CheckResult(
                 name="websocket_stable",
                 passed=False,
@@ -540,6 +580,14 @@ class PreflightChecker:
             if latest_tick_time:
                 age = (datetime.now() - latest_tick_time).total_seconds()
                 if age > self.config.max_tick_age_seconds:
+                    if can_bypass_ws:
+                        return CheckResult(
+                            name="websocket_stable",
+                            passed=True,
+                            severity=CheckSeverity.WARNING,
+                            message=f"Last tick is {age:.0f}s old — order has REST-sourced data, proceeding with warning",
+                            details={"tick_age_seconds": round(age, 1)},
+                        )
                     return CheckResult(
                         name="websocket_stable",
                         passed=False,

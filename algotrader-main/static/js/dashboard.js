@@ -126,6 +126,9 @@ async function loadFullStatus() {
         updateJournalPanel(data.journal);
         updateExecutionPanel(data.execution);
         updateTicksTable(data.ticks);
+        if (data.signals && data.signals.length > 0) {
+            renderSignalsList(data.signals);
+        }
         if (data.authenticated) {
             updatePortfolioSection(data);
             portfolioLoaded = true;
@@ -1301,12 +1304,13 @@ async function toggleKillSwitch() {
 async function loadSignals() {
     try {
         const signals = await API.get('/api/signals');
-        const el = document.getElementById('signals-log');
-        if (signals.length === 0) {
-            el.innerHTML = '<div class="empty-state"><p>No signals generated yet</p></div>';
+        const elFull = document.getElementById('signals-log-full');
+        const elOverview = document.getElementById('signals-log');
+        if (!signals || signals.length === 0) {
+            if (elFull) elFull.innerHTML = '<div class="empty-state"><p>No signals generated yet</p></div>';
             return;
         }
-        el.innerHTML = signals.reverse().map(s => {
+        const html = signals.slice().reverse().map(s => {
             const cls = s.transaction_type === 'BUY' ? 'buy' : 'sell';
             return `
                 <div class="signal-entry ${cls}">
@@ -1321,6 +1325,9 @@ async function loadSignals() {
                 </div>
             `;
         }).join('');
+        // Populate both: the Signals tab (full history) and the Overview panel
+        if (elFull) elFull.innerHTML = html;
+        if (elOverview) elOverview.innerHTML = html;
     } catch (e) { console.error(e); }
 }
 

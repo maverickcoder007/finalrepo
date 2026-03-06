@@ -78,12 +78,14 @@ class OptionStrategyBase(BaseStrategy):
         # Use MARKET orders for live-trading safety.  LIMIT orders with stale
         # last_price from the chain snapshot are rejected by the exchange when
         # the market moves even slightly between chain-build and order-place.
+        # Store last_price for dashboard display / tracking (ignored by exchange
+        # for MARKET orders).
         return Signal(
             tradingsymbol=contract.tradingsymbol,
             exchange=Exchange(self.params["exchange"]),
             transaction_type=transaction_type,
             quantity=quantity,
-            price=0,
+            price=contract.last_price if contract.last_price > 0 else 0,
             order_type=OrderType.MARKET,
             product=ProductType(self.params["product"]),
             strategy_name=self.name,

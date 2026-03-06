@@ -24,6 +24,7 @@ existing OptionStrategyBase → ExecutionEngine → Journal pipeline.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
@@ -97,6 +98,7 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
         self._short_entry_premium: float = 0.0             # premium at which short call was sold
         self._long_entry_premium: float = 0.0              # premium paid for long call
         self._sl_triggered_at: Optional[str] = None        # ISO timestamp
+        self._last_skip_log_time: float = 0.0              # throttle skip logs
 
     # ── Properties ──────────────────────────────────────────
 
@@ -117,10 +119,12 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
         if exit_signals:
             return exit_signals
         if self._state != SpreadState.IDLE:
-            logger.info("ccs_runner_tick_skip_not_idle", state=self._state.value)
             return []
         if not self._option_chain:
-            logger.info("ccs_runner_tick_skip_no_chain")
+            now = time.monotonic()
+            if now - self._last_skip_log_time > 30:
+                logger.debug("ccs_runner_tick_skip_no_chain", hint="waiting for option chain refresh")
+                self._last_skip_log_time = now
             return []
         return self._evaluate_entry()
 
@@ -142,12 +146,12 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
 
     def _evaluate_entry(self) -> list[Signal]:
         if self._state != SpreadState.IDLE:
-            logger.info("ccs_runner_skip_not_idle", state=self._state.value)
+            logger.debug("ccs_runner_skip_not_idle", state=self._state.value)
             return []
 
         chain = self._option_chain
         if not chain or not chain.entries:
-            logger.info("ccs_runner_skip_no_chain", has_chain=bool(chain), entries=len(chain.entries) if chain else 0)
+            logger.debug("ccs_runner_skip_no_chain", has_chain=bool(chain), entries=len(chain.entries) if chain else 0)
             return []
 
         logger.info(

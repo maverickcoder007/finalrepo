@@ -677,7 +677,7 @@ async def oi_strategy_execute(request: Request) -> dict[str, Any]:
     signal_id = body.get("signal_id", "")
     if not signal_id:
         return {"error": "signal_id required"}
-    return get_user_service(request).oi_strategy_execute_signal(signal_id)
+    return await get_user_service(request).oi_strategy_execute_signal(signal_id)
 
 
 @app.post("/api/oi/strategy/close")

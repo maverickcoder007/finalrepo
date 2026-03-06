@@ -10,6 +10,7 @@ All strategy × mode tests share these fixtures.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from datetime import date, datetime, timedelta
@@ -18,6 +19,25 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+
+# ─────────────────────────────────────────────────────────
+# Suppress structlog noise during tests
+# Must be done BEFORE any src module imports so
+# get_logger() picks up the suppressed configuration.
+# ─────────────────────────────────────────────────────────
+import structlog
+
+structlog.reset_defaults()
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.CRITICAL),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=False,
+)
 
 
 # ─────────────────────────────────────────────────────────

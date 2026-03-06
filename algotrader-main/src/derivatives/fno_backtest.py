@@ -1432,8 +1432,10 @@ class FnOBacktestEngine:
             final_spot = float(df.iloc[-1]["close"])
             final_time = _bar_ts(len(df) - 1)
             for sym, pos in list(open_positions.items()):
-                # Estimate final price (ATM-ish)
-                final_price = max(pos["entry_price"] * 0.5, 1.0)  # rough estimate
+                # Try to get actual price from last chain; fall back to rough estimate
+                final_price = self._find_option_price_unified(synth_chain, option_chain_data, sym)
+                if final_price is None:
+                    final_price = max(pos["entry_price"] * 0.5, 1.0)
                 pnl = 0.0
                 if pos["side"] == "SELL":
                     pnl = (pos["entry_price"] - final_price) * pos["quantity"]
@@ -1511,23 +1513,34 @@ class FnOBacktestEngine:
             },
         })
 
+    @staticmethod
+    def _parse_option_symbol(tradingsymbol: str) -> tuple[str, float] | None:
+        """Parse tradingsymbol to extract option type and strike.
+
+        Uses regex to find the last C or P followed by digits at the end,
+        which is robust even when the underlying name contains C or P
+        (e.g., HDFC, TCS, ICICIBANK).
+
+        Returns (opt_type, strike) or None if parsing fails.
+        """
+        import re
+        # Match last occurrence of C or P followed by digits at end of string
+        m = re.search(r'([CP])(\d+(?:\.\d+)?)$', tradingsymbol)
+        if not m:
+            return None
+        opt_type = "CE" if m.group(1) == "C" else "PE"
+        strike = float(m.group(2))
+        return opt_type, strike
+
     def _find_option_price_from_chain(
         self, chain: SyntheticChain, tradingsymbol: str
     ) -> float | None:
         """Find option price from synthetic chain by tradingsymbol."""
-        # Parse tradingsymbol to get strike and option type
-        # Format: NIFTY2024-06-27C25000 or similar
         try:
-            if "C" in tradingsymbol:
-                opt_type = "CE"
-                strike_str = tradingsymbol.split("C")[-1]
-            elif "P" in tradingsymbol:
-                opt_type = "PE"
-                strike_str = tradingsymbol.split("P")[-1]
-            else:
+            parsed = self._parse_option_symbol(tradingsymbol)
+            if not parsed:
                 return None
-
-            strike = float(strike_str)
+            opt_type, strike = parsed
 
             if strike in chain.strikes:
                 quote = chain.strikes[strike].get(opt_type)
@@ -1542,22 +1555,16 @@ class FnOBacktestEngine:
     ) -> float | None:
         """Find option price from OptionChainData by tradingsymbol."""
         try:
-            if "C" in tradingsymbol:
-                opt_type = "CE"
-                strike_str = tradingsymbol.split("C")[-1]
-            elif "P" in tradingsymbol:
-                opt_type = "PE"
-                strike_str = tradingsymbol.split("P")[-1]
-            else:
+            parsed = self._parse_option_symbol(tradingsymbol)
+            if not parsed:
                 return None
-            
-            strike = float(strike_str)
+            opt_type, strike = parsed
             
             for entry in chain_data.entries:
                 if abs(entry.strike - strike) < 0.01:
-                    contract = entry.CE if opt_type == "CE" else entry.PE
+                    contract = entry.ce if opt_type == "CE" else entry.pe
                     if contract:
-                        return contract.ltp
+                        return contract.last_price
             
         except (ValueError, IndexError):
             pass
@@ -1586,14 +1593,8 @@ class FnOBacktestEngine:
 
     def _extract_strike_from_symbol(self, tradingsymbol: str) -> float:
         """Extract strike price from tradingsymbol."""
-        try:
-            if "C" in tradingsymbol:
-                return float(tradingsymbol.split("C")[-1])
-            elif "P" in tradingsymbol:
-                return float(tradingsymbol.split("P")[-1])
-        except (ValueError, IndexError):
-            pass
-        return 0.0
+        parsed = self._parse_option_symbol(tradingsymbol)
+        return parsed[1] if parsed else 0.0
 
     @staticmethod
     def _sanitize(obj: Any) -> Any:

@@ -1,0 +1,21 @@
+============================= test session starts =============================
+collecting ... collected 12 items
+
+tests/test_all_strategies.py::TestPutCreditSpreadRunnerStateMachine::test_initial_state PASSED [  8%]
+tests/test_all_strategies.py::TestPutCreditSpreadRunnerStateMachine::test_entry_generates_two_signals PASSED [ 16%]
+tests/test_all_strategies.py::TestPutCreditSpreadRunnerStateMachine::test_no_entry_when_not_idle PASSED [ 25%]
+tests/test_all_strategies.py::TestPutCreditSpreadRunnerStateMachine::test_insufficient_credit_blocks_entry PASSED [ 33%]
+tests/test_all_strategies.py::TestPutCreditSpreadRunnerStateMachine::test_risk_exceeded_blocks_entry PASSED [ 41%]
+tests/test_all_strategies.py::TestPutCreditSpreadRunnerStateMachine::test_no_chain_blocks_entry PASSED [ 50%]
+tests/test_all_strategies.py::TestCallCreditSpreadRunnerStateMachine::test_initial_state PASSED [ 58%]
+tests/test_all_strategies.py::TestCallCreditSpreadRunnerStateMachine::test_entry_generates_two_signals PASSED [ 66%]
+tests/test_all_strategies.py::TestCallCreditSpreadRunnerStateMachine::test_no_entry_when_not_idle PASSED [ 75%]
+tests/test_all_strategies.py::TestCallCreditSpreadRunnerStateMachine::test_insufficient_credit_blocks_entry PASSED [ 83%]
+tests/test_all_strategies.py::TestCallCreditSpreadRunnerStateMachine::test_risk_exceeded_blocks_entry PASSED [ 91%]
+tests/test_all_strategies.py::TestCallCreditSpreadRunnerStateMachine::test_no_chain_blocks_entry PASSED [100%]
+
+============================= 12 passed in 0.80s ==============================
+
+---
+
+RC:0
