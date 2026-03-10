@@ -1459,6 +1459,8 @@ class TradingService:
                         sig.metadata["mapped_strategy"] = mapping.fno_strategy
                         sig.metadata["mapped_strategy_label"] = mapping.fno_strategy_label
                         sig.metadata["strategy_rationale"] = mapping.strategy_rationale
+                        # Recalculate SL/target to match credit spread parameters
+                        self._oi_fno_bridge.adjust_signal_for_mapped_strategy(sig, mapping)
 
             # Auto-execute if configured — use bridge for proper multi-leg execution
             if self._oi_strategy.config.auto_execute and result.signals:
@@ -1892,13 +1894,17 @@ class TradingService:
                     break
 
             if target_strat is None:
+                # Merge bridge-derived strategy params so underlying-specific
+                # defaults (spread width, strike offsets, lot size) are applied
+                strat_params = dict(mapping.strategy_params) if mapping.strategy_params else {}
+                strat_params.update({
+                    "underlying": sig.underlying or "NIFTY",
+                    "source": "oi_bridge",
+                    "signal_id": signal_id,
+                })
                 add_result = await self.add_strategy(
                     name=mapped_name,
-                    params={
-                        "underlying": sig.underlying or "NIFTY",
-                        "source": "oi_bridge",
-                        "signal_id": signal_id,
-                    },
+                    params=strat_params,
                     timeframe="5minute",
                     require_tested=False,
                 )
@@ -2787,6 +2793,14 @@ class TradingService:
             ))
         except Exception as e:
             logger.error("order_update_system_event_error", error=str(e))
+
+        # Forward fill/rejection to execution engine for instant state transition
+        # (don't wait for the 2-second reconciliation poll)
+        try:
+            await self._execution.process_order_update(data)
+        except Exception as e:
+            logger.error("ws_order_forward_error", error=str(e))
+
         await self._broadcast_ws({"type": "order_update", "data": data})
 
     # ────────────────────────────────────────────────────────────

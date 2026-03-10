@@ -871,6 +871,118 @@ class ExecutionEngine:
             await asyncio.sleep(self._slow_recon_interval)
             await self.reconcile_orders()
 
+    async def process_order_update(self, data: dict[str, Any]) -> None:
+        """Process a real-time order update from the Kite WebSocket.
+
+        This gives instant fill/rejection detection without waiting for the
+        reconciliation loop poll cycle.  The recon loop is still the
+        authoritative fallback — this method simply accelerates the
+        PENDING_ENTRY → SPREAD_OPEN transition for multi-leg strategies.
+        """
+        order_id = data.get("order_id", "")
+        status = data.get("status", "")
+        if not order_id or status not in ("COMPLETE", "REJECTED", "CANCELLED"):
+            return
+
+        order_req = self._pending_orders.pop(order_id, None)
+        if order_req is None:
+            return  # Not one of our pending orders (or already handled)
+
+        signal = getattr(order_req, "_signal", None)
+
+        if status == "COMPLETE":
+            fill_price = float(data.get("average_price", 0) or 0)
+            logger.info(
+                "ws_fill_detected",
+                order_id=order_id,
+                average_price=fill_price,
+                symbol=data.get("tradingsymbol", ""),
+            )
+
+            # Build a lightweight broker-order-like object for callbacks
+            class _BrokerSnap:
+                pass
+            bo = _BrokerSnap()
+            bo.order_id = order_id
+            bo.status = status
+            bo.average_price = fill_price
+            bo.tradingsymbol = data.get("tradingsymbol", "")
+            bo.exchange = data.get("exchange", "")
+            bo.transaction_type = data.get("transaction_type", "")
+            bo.filled_quantity = int(data.get("filled_quantity", 0) or data.get("quantity", 0) or 0)
+            bo.status_message = data.get("status_message", "")
+
+            self._filled_orders[order_id] = bo  # type: ignore[assignment]
+
+            is_exit = signal and signal.metadata.get("signal_type") == "exit"
+            if is_exit:
+                matched = self._find_tracked_position_for_exit(signal)
+                if matched:
+                    exit_reason = signal.metadata.get("exit_reason", "strategy_exit")
+                    self._finalize_position_exit(matched, fill_price, exit_reason)
+                    if self._on_exit_callback:
+                        try:
+                            await self._on_exit_callback(matched, order_id)
+                        except Exception as e:
+                            logger.error("ws_exit_callback_error", error=str(e))
+                elif self._on_fill_callback:
+                    try:
+                        await self._on_fill_callback(order_id, bo, signal)
+                    except Exception as e:
+                        logger.error("ws_fill_callback_error", error=str(e))
+            else:
+                # Entry fill — create tracked position + notify strategy
+                if signal and fill_price > 0:
+                    sl_price = None
+                    if signal.stop_loss:
+                        if signal.transaction_type == TransactionType.BUY:
+                            sl_price = round(fill_price - signal.stop_loss, 2)
+                        else:
+                            sl_price = round(fill_price + signal.stop_loss, 2)
+
+                    tracked = TrackedPosition(
+                        order_id=order_id,
+                        tradingsymbol=signal.tradingsymbol,
+                        exchange=signal.exchange.value if hasattr(signal.exchange, "value") else str(signal.exchange),
+                        transaction_type=signal.transaction_type.value,
+                        quantity=signal.quantity,
+                        entry_price=fill_price,
+                        stop_loss=sl_price,
+                        strategy_name=signal.strategy_name or "",
+                        product=signal.product.value if hasattr(signal.product, "value") else str(signal.product),
+                        signal=signal,
+                    )
+                    self._tracked_positions[order_id] = tracked
+
+                    if sl_price:
+                        await self._place_protective_stop_loss(tracked)
+                    self._risk.update_daily_pnl(0)
+
+                if self._on_fill_callback:
+                    try:
+                        await self._on_fill_callback(order_id, bo, signal)
+                    except Exception as e:
+                        logger.error("ws_fill_callback_error", error=str(e))
+
+        elif status in ("REJECTED", "CANCELLED"):
+            logger.warning(
+                "ws_rejection_detected",
+                order_id=order_id,
+                status=status,
+                reason=data.get("status_message", ""),
+            )
+            if self._on_rejection_callback and signal:
+                class _BrokerSnap:
+                    pass
+                bo = _BrokerSnap()
+                bo.order_id = order_id
+                bo.status = status
+                bo.status_message = data.get("status_message", "")
+                try:
+                    await self._on_rejection_callback(order_id, bo, signal)
+                except Exception as e:
+                    logger.error("ws_rejection_callback_error", error=str(e))
+
     async def stop_reconciliation_loop(self) -> None:
         self._running = False
         logger.info("reconciliation_loop_stopped")

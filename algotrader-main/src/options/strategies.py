@@ -453,10 +453,13 @@ class StraddleStrangleStrategy(OptionStrategyBase):
 
 class BullCallSpreadStrategy(OptionStrategyBase):
     def __init__(self, params: Optional[dict[str, Any]] = None) -> None:
+        # Dynamic defaults: SENSEX (~80k) needs wider spreads than NIFTY (~24k)
+        underlying = (params or {}).get("underlying", "NIFTY")
+        is_sensex = underlying.upper() == "SENSEX"
         defaults = {
             "buy_strike_offset": 0,
-            "sell_strike_offset": 200,
-            "min_risk_reward": 1.5,
+            "sell_strike_offset": 600 if is_sensex else 200,
+            "min_risk_reward": 1.2 if is_sensex else 1.5,
             "trend_ema_period": 20,
             "profit_target_pct": 50.0,  # Close at 50% of max profit
         }
@@ -531,6 +534,15 @@ class BullCallSpreadStrategy(OptionStrategyBase):
 
         risk_reward = max_profit / net_debit
         if risk_reward < self.params["min_risk_reward"]:
+            logger.debug(
+                "bull_call_rr_rejected",
+                risk_reward=round(risk_reward, 2),
+                min_required=self.params["min_risk_reward"],
+                buy_strike=buy_ce.strike,
+                sell_strike=sell_ce.strike,
+                net_debit=round(net_debit, 2),
+                spot=round(chain.spot_price, 2),
+            )
             return []
 
         stop_loss = round(0.3 * max_profit, 2)
@@ -592,10 +604,13 @@ class BullCallSpreadStrategy(OptionStrategyBase):
 
 class BearPutSpreadStrategy(OptionStrategyBase):
     def __init__(self, params: Optional[dict[str, Any]] = None) -> None:
+        # Dynamic defaults: SENSEX (~80k) needs wider spreads than NIFTY (~24k)
+        underlying = (params or {}).get("underlying", "NIFTY")
+        is_sensex = underlying.upper() == "SENSEX"
         defaults = {
             "buy_strike_offset": 0,
-            "sell_strike_offset": -200,
-            "min_risk_reward": 1.5,
+            "sell_strike_offset": -600 if is_sensex else -200,
+            "min_risk_reward": 1.2 if is_sensex else 1.5,
             "trend_ema_period": 20,
             "profit_target_pct": 50.0,  # Close at 50% of max profit
         }
@@ -669,6 +684,15 @@ class BearPutSpreadStrategy(OptionStrategyBase):
 
         risk_reward = max_profit / net_debit
         if risk_reward < self.params["min_risk_reward"]:
+            logger.debug(
+                "bear_put_rr_rejected",
+                risk_reward=round(risk_reward, 2),
+                min_required=self.params["min_risk_reward"],
+                buy_strike=buy_pe.strike,
+                sell_strike=sell_pe.strike,
+                net_debit=round(net_debit, 2),
+                spot=round(chain.spot_price, 2),
+            )
             return []
 
         meta = {

@@ -46,6 +46,20 @@ logger = get_logger(__name__)
 # Signal-to-Strategy Mapping
 # ─────────────────────────────────────────────────────────────
 
+# Credit spread strategies — used for SL/target adjustment
+_CREDIT_SPREAD_STRATEGIES = frozenset({
+    "call_credit_spread_runner",
+    "put_credit_spread_runner",
+})
+
+# Default risk parameters matching the credit spread runner classes
+_CREDIT_SPREAD_DEFAULTS = {
+    "sl_premium_points": 40,       # SL distance on the sold premium (absolute points)
+    "profit_target_pct": 80.0,     # Close at this % of max profit
+    "be_trigger_points": 60,       # Move SL to breakeven after this spot move
+}
+
+
 class FnOStrategyType(str, Enum):
     """Supported FNO strategies that OI signals can map to."""
     CALL_CREDIT_SPREAD = "call_credit_spread_runner"
@@ -346,12 +360,65 @@ class OIFnOBridge:
         else:
             params["lots"] = 1
 
+        # Credit spread runner defaults — include risk params for SL/target sync
+        if strategy in (FnOStrategyType.CALL_CREDIT_SPREAD, FnOStrategyType.PUT_CREDIT_SPREAD):
+            params["sl_premium_points"] = _CREDIT_SPREAD_DEFAULTS["sl_premium_points"]
+            params["profit_target_pct"] = _CREDIT_SPREAD_DEFAULTS["profit_target_pct"]
+            params["be_trigger_points"] = _CREDIT_SPREAD_DEFAULTS["be_trigger_points"]
+
+        # Debit spread strategies — scale strike offsets for SENSEX
+        if strategy == FnOStrategyType.BULL_CALL_SPREAD:
+            params["sell_strike_offset"] = params["spread_width"] * 2  # 600 for SENSEX, 200 for NIFTY
+        elif strategy == FnOStrategyType.BEAR_PUT_SPREAD:
+            params["sell_strike_offset"] = -(params["spread_width"] * 2)
+
         # Add context for the strategy
         params["oi_signal_type"] = signal.signal_type
         params["oi_direction"] = signal.direction
         params["oi_confidence"] = signal.confidence
 
         return params
+
+    def adjust_signal_for_mapped_strategy(
+        self, signal: OISignal, mapping: StrategyMapping
+    ) -> None:
+        """Recalculate signal SL/target to match the mapped credit spread strategy.
+
+        Credit spread runners use:
+          - sl_premium_points (absolute point rise on the sold premium = loss)
+          - profit_target_pct (% of max profit → premium decays to remainder)
+
+        Instead of the generic percentage-based stop_loss_pct / target_pct
+        that the OI signal engine applies for directional trades.
+        """
+        if mapping.fno_strategy not in _CREDIT_SPREAD_STRATEGIES:
+            return
+        if signal.entry_price <= 0:
+            return
+
+        sl_points = mapping.strategy_params.get(
+            "sl_premium_points", _CREDIT_SPREAD_DEFAULTS["sl_premium_points"]
+        )
+        profit_target_pct = mapping.strategy_params.get(
+            "profit_target_pct", _CREDIT_SPREAD_DEFAULTS["profit_target_pct"]
+        )
+
+        # Credit spread: sold premium rising = loss, decaying = profit
+        signal.stop_loss = round(signal.entry_price + sl_points, 2)
+        signal.target = round(
+            signal.entry_price * (1 - profit_target_pct / 100), 2
+        )
+
+        # Store credit spread context in metadata for transparency
+        signal.metadata["spread_sl_premium_points"] = sl_points
+        signal.metadata["spread_profit_target_pct"] = profit_target_pct
+        signal.metadata["spread_sl_note"] = (
+            f"SL when premium rises {sl_points}pts above entry"
+        )
+        signal.metadata["spread_target_note"] = (
+            f"Target: {profit_target_pct:.0f}% of max profit "
+            f"(premium decays to {100 - profit_target_pct:.0f}% of entry)"
+        )
 
     # ─── 2. Backtest Validation ──────────────────────────────
 
