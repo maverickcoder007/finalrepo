@@ -43,7 +43,7 @@ templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 SESSION_COOKIE = "kta_session"
 
-PUBLIC_PATHS = {"/login", "/auth/send-otp", "/auth/verify-otp", "/api/auth/callback", "/api/auth/postback"}
+PUBLIC_PATHS = {"/login", "/auth/send-otp", "/auth/verify-otp", "/auth/callback", "/api/auth/callback", "/api/auth/postback"}
 
 
 def get_user_service(request: Request) -> TradingService:
@@ -216,8 +216,8 @@ async def login_url(request: Request) -> dict[str, str]:
     return {"url": svc.get_login_url()}
 
 
-@app.get("/api/auth/callback")
-async def auth_callback(request: Request):
+async def _handle_auth_callback(request: Request):
+    """Shared handler for both /auth/callback and /api/auth/callback."""
     request_token = request.query_params.get("request_token", "")
     status = request.query_params.get("status", "")
     if status != "success" or not request_token:
@@ -231,6 +231,17 @@ async def auth_callback(request: Request):
     except Exception as e:
         logger.error("auth_callback_failed", error=str(e))
         return RedirectResponse(f"/?auth_error={str(e)[:100]}")
+
+
+# Zerodha redirect URL may be configured as either path — both are handled.
+@app.get("/auth/callback")
+async def auth_callback_short(request: Request):
+    return await _handle_auth_callback(request)
+
+
+@app.get("/api/auth/callback")
+async def auth_callback(request: Request):
+    return await _handle_auth_callback(request)
 
 
 @app.get("/api/auth/postback")

@@ -137,12 +137,12 @@ _SIGNAL_TYPE_STRATEGY_OVERRIDE: dict[str, FnOStrategyType] = {
 
 class BacktestThresholds(BaseModel):
     """Configurable thresholds for backtest-gated execution."""
-    min_win_rate: float = Field(default=40.0, description="Minimum win rate % to pass")
-    min_sharpe_ratio: float = Field(default=0.3, description="Minimum Sharpe ratio")
-    max_drawdown_pct: float = Field(default=30.0, description="Maximum drawdown % allowed")
+    min_win_rate: float = Field(default=45.0, description="Minimum win rate % to pass")
+    min_sharpe_ratio: float = Field(default=1.0, description="Minimum Sharpe ratio")
+    max_drawdown_pct: float = Field(default=15.0, description="Maximum drawdown % allowed")
     min_total_return_pct: float = Field(default=0.0, description="Minimum total return %")
-    min_trades: int = Field(default=1, description="Minimum trades for statistical significance")
-    min_profit_factor: float = Field(default=0.8, description="Minimum profit factor (gross profit / gross loss)")
+    min_trades: int = Field(default=30, description="Minimum trades for statistical significance")
+    min_profit_factor: float = Field(default=1.2, description="Minimum profit factor (gross profit / gross loss)")
     max_avg_loss_pct: float = Field(default=8.0, description="Maximum average loss % per trade")
 
     # Backtest parameters
@@ -365,6 +365,8 @@ class OIFnOBridge:
             params["sl_premium_points"] = _CREDIT_SPREAD_DEFAULTS["sl_premium_points"]
             params["profit_target_pct"] = _CREDIT_SPREAD_DEFAULTS["profit_target_pct"]
             params["be_trigger_points"] = _CREDIT_SPREAD_DEFAULTS["be_trigger_points"]
+            params["min_credit"] = 0.1  # Very low for synthetic data in backtests
+            params["disable_persistence"] = True  # Disable persistence for backtest
 
         # Debit spread strategies — scale strike offsets for SENSEX
         if strategy == FnOStrategyType.BULL_CALL_SPREAD:
@@ -491,6 +493,7 @@ class OIFnOBridge:
                 initial_capital=self.thresholds.backtest_capital,
                 max_positions=self.thresholds.backtest_max_positions,
                 use_regime_filter=True,
+                strategy_params=mapping.strategy_params,
             )
 
             backtest_raw = engine.run(df, tradingsymbol=mapping.underlying)

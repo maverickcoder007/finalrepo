@@ -87,7 +87,8 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
             "short_call_delta": 0.30,       # ~30 delta short call
             "max_risk_pct": 0.02,           # 2% of capital per spread
             "capital": 500000.0,            # default capital for risk calc
-            "min_credit": 15.0,             # minimum net credit per lot
+            "min_credit": 30.0,             # minimum net credit per lot (covers round-trip costs)
+            "disable_persistence": False,   # disable state persistence for backtest
         }
         merged = {**defaults, **(params or {})}
         # Calculate max_risk_per_spread from capital * max_risk_pct
@@ -117,6 +118,14 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
         # Fix 1: Track pending order IDs to detect fill/rejection
         self._pending_order_ids: list[str] = []
         self._confirmed_fills: int = 0
+
+        # IV regime filter: rolling ATM IV buffer used to avoid selling options
+        # when IV is cyclically depressed (low-IV entry compresses credit and
+        # widens breakeven, making the spread structurally unattractive).
+        self._iv_history: list[float] = []
+        self._IV_HISTORY_MAX: int = 30    # keep at most 30 observations
+        self._IV_MIN_SAMPLES: int = 10    # need ≥10 samples before gating
+        self._IV_PERCENTILE_GATE: float = 0.30  # block if IV < 30th percentile
 
         # Fix 4: Attempt to restore persisted state on init
         self._load_persisted_state()
@@ -162,10 +171,19 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
             return exit_signals
         if self._state != SpreadState.IDLE or not self._option_chain:
             return []
+        self._record_iv()
         # Fix 5: Respect entry cooldown
         if time.monotonic() < self._entry_cooldown_until:
             return []
         return self._evaluate_entry()
+
+    def _record_iv(self) -> None:
+        """Append current ATM IV to the rolling regime buffer."""
+        chain = self._option_chain
+        if chain and chain.atm_iv > 0:
+            self._iv_history.append(chain.atm_iv)
+            if len(self._iv_history) > self._IV_HISTORY_MAX:
+                self._iv_history = self._iv_history[-self._IV_HISTORY_MAX:]
 
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
         """Backtesting entry point — returns a single entry signal when conditions met."""
@@ -192,6 +210,22 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
             atm_iv=chain.atm_iv,
         )
 
+        # IV regime check: skip entry if current ATM IV is below the 30th percentile
+        # of recent observations. Selling options in a depressed-IV regime reduces
+        # credit received, widens breakeven, and increases adverse-move risk.
+        if chain.atm_iv > 0 and len(self._iv_history) >= self._IV_MIN_SAMPLES:
+            sorted_ivs = sorted(self._iv_history)
+            p30_idx = max(0, int(len(sorted_ivs) * self._IV_PERCENTILE_GATE) - 1)
+            p30_iv = sorted_ivs[p30_idx]
+            if chain.atm_iv < p30_iv:
+                logger.info(
+                    "ccs_runner_skip_low_iv_regime",
+                    current_iv=round(chain.atm_iv, 4),
+                    iv_p30=round(p30_iv, 4),
+                    samples=len(self._iv_history),
+                )
+                return []
+
         # Dynamic spread width: 300 for SENSEX (~80k), 100 for NIFTY (~24k)
         if "spread_width" in (self._user_params or {}):
             spread_width = self.params["spread_width"]  # User override
@@ -204,9 +238,12 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
         short_call = self._find_strike_by_delta(
             self.params["short_call_delta"], "CE", chain
         )
-        if not short_call or short_call.last_price <= 0:
+        spot = chain.spot_price
+        # Validate: short call must be OTM (strike > spot).  When all deltas are 0
+        # (market closed, quote failure, or near-zero DTE), the selector can return
+        # a deep-ITM call as the "closest" match — we must reject that and fall back.
+        if not short_call or short_call.last_price <= 0 or short_call.strike <= spot:
             # Fallback: find OTM strike ~1-2 strikes above ATM with meaningful premium
-            spot = chain.spot_price
             candidates = []
             for entry in chain.entries:
                 if entry.ce and entry.ce.strike > spot and entry.ce.last_price > 1.0:
@@ -777,6 +814,8 @@ class CallCreditSpreadRunnerStrategy(OptionStrategyBase):
 
     def _load_persisted_state(self) -> None:
         """Load strategy state from disk on startup for crash recovery."""
+        if self.params.get("disable_persistence", False):
+            return  # Skip loading for backtest
         try:
             fp = self._state_file_path()
             if not os.path.exists(fp):

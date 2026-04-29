@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Optional
 from enum import Enum
 
@@ -31,6 +31,14 @@ from src.options.oi_analysis import OptionsOIReport, OptionsOIStrike
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse an ISO-format timestamp string, returning datetime.min on failure."""
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return datetime.min
 
 
 # ─────────────────────────────────────────────────────────────
@@ -95,10 +103,15 @@ class OIStrategyAction(str, Enum):
 # Models
 # ─────────────────────────────────────────────────────────────
 
+# Default signal TTL in minutes — signals older than this are considered expired
+SIGNAL_TTL_MINUTES = 30
+
+
 class OISignal(BaseModel):
     """A single OI-based trading signal."""
     id: str = ""
     timestamp: str = ""
+    expires_at: str = ""  # ISO timestamp; signal is stale after this
     underlying: str = ""
     signal_type: str = ""
     action: str = ""
@@ -312,7 +325,27 @@ class OIStrategyEngine:
             combined_dir = "NEUTRAL"
             combined_conf = 50.0
 
-        # Store signals
+        # ─── DEDUP & STORE ─────────────────────────────────
+        # Supersede existing signals with the same fingerprint
+        # (underlying + signal_type + action + strike) so repeated
+        # scans don't pile up identical signals.
+        new_keys: set[tuple[str, str, str, float]] = set()
+        for sig in signals:
+            new_keys.add((sig.underlying, sig.signal_type, sig.action, sig.strike))
+
+        if new_keys:
+            self._signals_history = [
+                s for s in self._signals_history
+                if (s.underlying, s.signal_type, s.action, s.strike) not in new_keys
+            ]
+
+        # Prune expired signals
+        now = datetime.now()
+        self._signals_history = [
+            s for s in self._signals_history
+            if not s.expires_at or _parse_iso(s.expires_at) > now
+        ]
+
         self._signals_history.extend(signals)
         if len(self._signals_history) > 500:
             self._signals_history = self._signals_history[-500:]
@@ -477,8 +510,12 @@ class OIStrategyEngine:
         return sorted(closed, key=lambda x: x.exit_time or "", reverse=True)[:limit]
 
     def get_signal_history(self, underlying: Optional[str] = None, limit: int = 50) -> list[OISignal]:
-        """Get recent signal history."""
-        signals = self._signals_history
+        """Get recent signal history (expired signals excluded)."""
+        now = datetime.now()
+        signals = [
+            s for s in self._signals_history
+            if not s.expires_at or _parse_iso(s.expires_at) > now
+        ]
         if underlying:
             signals = [s for s in signals if s.underlying == underlying.upper()]
         return sorted(signals, key=lambda x: x.timestamp, reverse=True)[:limit]
@@ -577,6 +614,10 @@ class OIStrategyEngine:
         self._signal_counter += 1
         return f"OIS-{self._signal_counter:05d}"
 
+    def _signal_expiry(self) -> str:
+        """Return ISO-format expiry timestamp for a new signal."""
+        return (datetime.now() + timedelta(minutes=SIGNAL_TTL_MINUTES)).isoformat()
+
     def _make_signal(
         self,
         ctx: dict[str, Any],
@@ -668,9 +709,7 @@ class OIStrategyEngine:
         return OISignal(
             id=self._next_signal_id(),
             timestamp=datetime.now().isoformat(),
-            underlying=ctx["underlying"],
-            signal_type=signal_type.value,
-            action=action.value,
+        expires_at=self._signal_expiry(),
             direction=direction,
             confidence=round(min(confidence, 100.0), 1),
             strike=strike,
@@ -843,12 +882,37 @@ class OIStrategyEngine:
     # ── 4. Max Pain Magnet ────────────────────────────────────
 
     def _detect_max_pain_magnet(self, report: OptionsOIReport, ctx: dict) -> list[OISignal]:
-        """Fade moves away from max pain — price tends to gravitate towards max pain."""
+        """Fade moves away from max pain — price tends to gravitate towards max pain.
+
+        Only active within 2 DTE: max pain magnetism is a near-expiry phenomenon
+        driven by dealer hedging and ITM/OTM roll-offs. Earlier in the week the
+        effect is too weak to trade reliably and adds noise.
+        """
         signals = []
         spot = report.spot_price
         mp = report.max_pain
 
         if mp <= 0 or spot <= 0:
+            return signals
+
+        # Gate on DTE — skip if more than 2 calendar days to expiry.
+        expiry_str = ctx.get("expiry", "")
+        dte = 30  # Conservative default: assume far from expiry
+        if expiry_str:
+            for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y"):
+                try:
+                    expiry_date = datetime.strptime(expiry_str, fmt).date()
+                    dte = max(0, (expiry_date - date.today()).days)
+                    break
+                except ValueError:
+                    continue
+        if dte > 2:
+            logger.debug(
+                "max_pain_skipped_dte",
+                underlying=ctx.get("underlying"),
+                dte=dte,
+                hint="max pain magnet only reliable within 2 DTE",
+            )
             return signals
 
         dist_pct = (spot - mp) / spot * 100

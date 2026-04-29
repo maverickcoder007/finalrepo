@@ -22,6 +22,11 @@ logger = get_logger(__name__)
 
 
 class RiskManager:
+    # Maximum absolute net portfolio delta (NIFTY-equivalent units).
+    # Prevents simultaneous directional exposure across correlated instruments
+    # (e.g. NIFTY + SENSEX both long), which creates hidden concentration risk.
+    PORTFOLIO_DELTA_LIMIT: float = 150.0
+
     def __init__(self, client: Optional[KiteClient] = None) -> None:
         self._settings = get_settings()
         self._client = client
@@ -32,6 +37,7 @@ class RiskManager:
         self._trade_count: int = 0
         self._session_start: datetime = datetime.now()
         self._position_validator: Optional[PositionValidator] = None
+        self._portfolio_delta: float = 0.0  # updated by PortfolioGreeksMonitor
 
     @property
     def is_kill_switch_active(self) -> bool:
@@ -64,6 +70,20 @@ class RiskManager:
     def set_position_validator(self, validator: PositionValidator) -> None:
         """Set the position validator for multi-leg monitoring."""
         self._position_validator = validator
+
+    def update_portfolio_delta(self, net_delta: float) -> None:
+        """Update tracked portfolio delta from PortfolioGreeksMonitor.
+
+        Called after each Greeks recompute so validate_signal can block new
+        directional orders when the portfolio is already delta-saturated.
+        """
+        self._portfolio_delta = net_delta
+        if abs(net_delta) > self.PORTFOLIO_DELTA_LIMIT:
+            logger.warning(
+                "portfolio_delta_limit_warning",
+                net_delta=round(net_delta, 2),
+                limit=self.PORTFOLIO_DELTA_LIMIT,
+            )
 
     async def validate_margin_for_multi_leg(self, signals: list[Signal], margins_data: Optional[dict[str, Any]] = None) -> bool:
         """
@@ -187,6 +207,15 @@ class RiskManager:
                 f"would exceed max {self._settings.max_exposure}"
             )
 
+        # Portfolio delta limit: block new signals when net delta is already extreme.
+        # NIFTY and SENSEX are >95% correlated, so opening both long simultaneously
+        # doubles directional exposure without diversification benefit.
+        if abs(self._portfolio_delta) > self.PORTFOLIO_DELTA_LIMIT:
+            return False, (
+                f"Portfolio delta limit exceeded: |{self._portfolio_delta:.1f}| > "
+                f"{self.PORTFOLIO_DELTA_LIMIT:.0f} — concentrated directional risk"
+            )
+
         return True, "Signal validated"
 
     def calculate_position_size(
@@ -235,6 +264,11 @@ class RiskManager:
                 (self._total_exposure / self._settings.max_exposure * 100)
                 if self._settings.max_exposure > 0
                 else 0
+            ),
+            "portfolio_delta": round(self._portfolio_delta, 2),
+            "delta_limit": self.PORTFOLIO_DELTA_LIMIT,
+            "delta_headroom": round(
+                self.PORTFOLIO_DELTA_LIMIT - abs(self._portfolio_delta), 2
             ),
         }
 

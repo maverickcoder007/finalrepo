@@ -87,7 +87,8 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
             "short_put_delta": 0.30,        # ~30 delta short put (absolute)
             "max_risk_pct": 0.02,           # 2% of capital per spread
             "capital": 500000.0,            # default capital for risk calc
-            "min_credit": 15.0,             # minimum net credit per lot
+            "min_credit": 30.0,             # minimum net credit per lot (covers round-trip costs)
+            "disable_persistence": False,   # disable state persistence for backtest
         }
         merged = {**defaults, **(params or {})}
         # Calculate max_risk_per_spread from capital * max_risk_pct
@@ -116,6 +117,14 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         # Fix 1: Track pending order IDs to detect fill/rejection
         self._pending_order_ids: list[str] = []
         self._confirmed_fills: int = 0
+
+        # IV regime filter: rolling ATM IV buffer used to avoid selling options
+        # when IV is cyclically depressed (low-IV entry compresses credit and
+        # widens breakeven, making the spread structurally unattractive).
+        self._iv_history: list[float] = []
+        self._IV_HISTORY_MAX: int = 30    # keep at most 30 observations
+        self._IV_MIN_SAMPLES: int = 10    # need ≥10 samples before gating
+        self._IV_PERCENTILE_GATE: float = 0.30  # block if IV < 30th percentile
 
         # Fix 4: Attempt to restore persisted state on init
         self._load_persisted_state()
@@ -156,9 +165,18 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
             return exit_signals
         if self._state != PutSpreadState.IDLE or not self._option_chain:
             return []
+        self._record_iv()
         if time.monotonic() < self._entry_cooldown_until:
             return []
         return self._evaluate_entry()
+
+    def _record_iv(self) -> None:
+        """Append current ATM IV to the rolling regime buffer."""
+        chain = self._option_chain
+        if chain and chain.atm_iv > 0:
+            self._iv_history.append(chain.atm_iv)
+            if len(self._iv_history) > self._IV_HISTORY_MAX:
+                self._iv_history = self._iv_history[-self._IV_HISTORY_MAX:]
 
     def generate_signal(self, data: pd.DataFrame, instrument_token: int) -> Optional[Signal]:
         """Backtesting entry point — returns a single entry signal when conditions met."""
@@ -184,29 +202,101 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
         else:
             spread_width = 100  # NIFTY
 
+        logger.info(
+            "pcs_runner_evaluating_entry",
+            spot=chain.spot_price,
+            entries=len(chain.entries),
+            atm_iv=chain.atm_iv,
+        )
+
+        # IV regime check: skip entry if current ATM IV is below the 30th percentile
+        # of recent observations. Selling options in a depressed-IV regime reduces
+        # credit received, widens breakeven, and increases adverse-move risk.
+        if chain.atm_iv > 0 and len(self._iv_history) >= self._IV_MIN_SAMPLES:
+            sorted_ivs = sorted(self._iv_history)
+            p30_idx = max(0, int(len(sorted_ivs) * self._IV_PERCENTILE_GATE) - 1)
+            p30_iv = sorted_ivs[p30_idx]
+            if chain.atm_iv < p30_iv:
+                logger.info(
+                    "pcs_runner_skip_low_iv_regime",
+                    current_iv=round(chain.atm_iv, 4),
+                    iv_p30=round(p30_iv, 4),
+                    samples=len(self._iv_history),
+                )
+                return []
+
         # 1. Find the short put — use delta-based selection
         #    PE deltas are negative; we match by absolute value
         short_put = self._find_strike_by_delta(
             self.params["short_put_delta"], "PE", chain
         )
-        if not short_put or short_put.last_price <= 0:
+        spot = chain.spot_price
+        # Validate: short put must be OTM (strike < spot).  When all deltas are 0
+        # (market closed, quote failure, or near-zero DTE), the selector can return
+        # the lowest-strike (most-OTM) PE, which sits so far below ATM that
+        # target_long_strike falls outside the chain.  Fall back to ATM-adjacent OTM
+        # put (highest-premium put with strike < spot) to stay in-range.
+        if not short_put or short_put.last_price <= 0 or short_put.strike >= spot:
+            candidates = []
+            for entry in chain.entries:
+                if entry.pe and entry.pe.strike < spot and entry.pe.last_price > 1.0:
+                    candidates.append(entry.pe)
+            # Pick the one with highest premium (closest to ATM with liquidity)
+            if candidates:
+                short_put = max(candidates, key=lambda c: c.last_price)
+
+        if not short_put or short_put.last_price <= 1.0:
+            logger.info(
+                "pcs_runner_no_short_put",
+                target_delta=self.params["short_put_delta"],
+                found=bool(short_put),
+                price=short_put.last_price if short_put else 0,
+                spot=spot,
+            )
             return []
+
+        logger.info(
+            "pcs_runner_short_selected",
+            strike=short_put.strike,
+            premium=round(short_put.last_price, 2),
+            delta=round(short_put.delta, 4) if short_put.delta else 0,
+        )
 
         # 2. Find long put — short_strike MINUS spread_width (lower strike)
         target_long_strike = short_put.strike - spread_width
         long_put = self._find_strike_nearest(target_long_strike, "PE", chain)
         if not long_put or long_put.last_price <= 0:
+            logger.info(
+                "pcs_runner_no_long_put",
+                target_strike=target_long_strike,
+                found=bool(long_put),
+                price=long_put.last_price if long_put else 0,
+            )
             return []
+
+        logger.info(
+            "pcs_runner_long_selected",
+            strike=long_put.strike,
+            premium=round(long_put.last_price, 2),
+        )
 
         # Ensure correct ordering: long put must be BELOW short put
         if long_put.strike >= short_put.strike:
-            logger.debug("pcs_runner_strikes_invalid", short=short_put.strike, long=long_put.strike)
+            logger.info("pcs_runner_strikes_invalid", short=short_put.strike, long=long_put.strike)
             return []
 
         # 3. Credit / risk validation
         net_credit = short_put.last_price - long_put.last_price
         if net_credit < self.params["min_credit"]:
-            logger.debug("pcs_runner_credit_insufficient", credit=net_credit)
+            logger.info(
+                "pcs_runner_credit_insufficient",
+                short_strike=short_put.strike,
+                long_strike=long_put.strike,
+                credit=round(net_credit, 2),
+                min_required=self.params["min_credit"],
+                short_premium=round(short_put.last_price, 2),
+                long_premium=round(long_put.last_price, 2),
+            )
             return []
 
         actual_width = short_put.strike - long_put.strike
@@ -706,6 +796,8 @@ class PutCreditSpreadRunnerStrategy(OptionStrategyBase):
 
     def _load_persisted_state(self) -> None:
         """Load strategy state from disk on startup for crash recovery."""
+        if self.params.get("disable_persistence", False):
+            return  # Skip loading for backtest
         try:
             fp = self._state_file_path()
             if not os.path.exists(fp):

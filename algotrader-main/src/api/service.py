@@ -1252,17 +1252,19 @@ class TradingService:
     ) -> dict[str, Any]:
         # Auto-discover instruments if not provided
         if not instruments and not self._oi_tracker.get_tracked_tokens():
-            try:
-                nfo_instruments = await self._market_data.get_instruments("NFO")
-                inst_dicts = [
-                    i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else i)
-                    for i in nfo_instruments
-                    if (i.get("instrument_type", "") if isinstance(i, dict) else getattr(i, "instrument_type", "")) in ("CE", "PE")
-                ]
-                self._oi_tracker.register_instruments(inst_dicts)
-                logger.info("oi_instruments_auto_loaded", count=len(inst_dicts))
-            except Exception as e:
-                logger.error("oi_instruments_auto_load_error", error=str(e))
+            # Load NFO (NIFTY options) and BFO (SENSEX options)
+            for exchange in ("NFO", "BFO"):
+                try:
+                    raw_instruments = await self._market_data.get_instruments(exchange)
+                    inst_dicts = [
+                        i if isinstance(i, dict) else (i.model_dump() if hasattr(i, "model_dump") else i)
+                        for i in raw_instruments
+                        if (i.get("instrument_type", "") if isinstance(i, dict) else getattr(i, "instrument_type", "")) in ("CE", "PE")
+                    ]
+                    self._oi_tracker.register_instruments(inst_dicts)
+                    logger.info("oi_instruments_auto_loaded", exchange=exchange, count=len(inst_dicts))
+                except Exception as e:
+                    logger.error("oi_instruments_auto_load_error", exchange=exchange, error=str(e))
 
         if instruments:
             self._oi_tracker.register_instruments(instruments)
@@ -1552,10 +1554,26 @@ class TradingService:
                 key = f"{exchange}:{sig.tradingsymbol}"
                 q = quotes.get(key)
                 if not q:
+                    # Quote didn't resolve — keep the OI report price as-is
+                    logger.warning(
+                        "oi_signal_quote_not_resolved",
+                        symbol=sig.tradingsymbol,
+                        exchange=exchange,
+                        key=key,
+                    )
+                    sig.metadata["live_price_updated"] = False
+                    sig.metadata["live_price_error"] = "quote_not_resolved"
                     continue
 
                 live_price = q.last_price if hasattr(q, "last_price") else 0.0
                 if live_price <= 0:
+                    logger.warning(
+                        "oi_signal_live_price_zero",
+                        symbol=sig.tradingsymbol,
+                        exchange=exchange,
+                    )
+                    sig.metadata["live_price_updated"] = False
+                    sig.metadata["live_price_error"] = "zero_price"
                     continue
 
                 # Update entry price with live LTP
@@ -1570,9 +1588,8 @@ class TradingService:
                     sig.stop_loss = round(live_price * (1 + sl_pct), 2)
                     sig.target = round(live_price * (1 - tgt_pct), 2)
 
-                if old_price != sig.entry_price:
-                    sig.metadata["oi_report_price"] = old_price
-                    sig.metadata["live_price_updated"] = True
+                sig.metadata["oi_report_price"] = old_price
+                sig.metadata["live_price_updated"] = True
 
                 logger.info(
                     "oi_signal_price_enriched",
@@ -1744,7 +1761,7 @@ class TradingService:
             return {"error": str(e)}
 
     async def oi_fno_bridge_backtest_signal(
-        self, signal_id: str, force_refresh: bool = False
+        self, signal_id: str, force_refresh: bool = True
     ) -> dict[str, Any]:
         """Run backtest for a specific OI signal's mapped FNO strategy.
 

@@ -202,6 +202,7 @@ class FnOPaperTradingEngine:
         entry_dte_max: int = 45,
         delta_target: float = 0.16,
         slippage_model: str = "realistic",
+        strategy_params: Optional[dict[str, Any]] = None,  # Params for strategy-driven mode
     ) -> None:
         self.strategy_name = strategy_name
         self.underlying = underlying.upper()
@@ -212,6 +213,8 @@ class FnOPaperTradingEngine:
         self.entry_dte_min = entry_dte_min
         self.entry_dte_max = entry_dte_max
         self.delta_target = delta_target
+        self.slippage_model = slippage_model
+        self.strategy_params = strategy_params or {}
 
         self.structure_type = self.STRATEGY_MAP.get(
             strategy_name.lower(), StructureType.IRON_CONDOR
@@ -836,6 +839,7 @@ class FnOPaperTradingEngine:
             "lot_size": self._chain_builder.lot_size,
             "lots": 1,
             "exchange": self._chain_builder.exchange,
+            **self.strategy_params,  # Merge in user params
         })
 
         # Position tracking for simulated execution

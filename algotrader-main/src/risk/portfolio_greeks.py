@@ -293,10 +293,10 @@ class PortfolioGreeksMonitor:
         report.warnings = warnings
 
         # ── Risk warnings ────────────────────────────────────
-        if abs(report.net_delta) > 500:
+        if abs(report.net_delta) > 150:
             report.warnings.append(
                 f"High net delta exposure: {report.net_delta:.2f} "
-                f"(directional risk)"
+                f"(directional risk — approaches RiskManager.PORTFOLIO_DELTA_LIMIT=150)"
             )
         if abs(report.net_gamma) > 100:
             report.warnings.append(

@@ -110,6 +110,7 @@ class FnOBacktestEngine:
         slippage_model: str = "realistic",
         use_regime_filter: bool = True,
         use_stored_data: bool = True,      # Prefer stored data over synthetic
+        strategy_params: Optional[dict[str, Any]] = None,  # Params for strategy-driven mode
     ) -> None:
         self.strategy_name = strategy_name
         self.underlying = underlying.upper()
@@ -123,6 +124,7 @@ class FnOBacktestEngine:
         self.slippage_model = slippage_model
         self.use_regime_filter = use_regime_filter
         self.use_stored_data = use_stored_data
+        self.strategy_params = strategy_params or {}
 
         self.structure_type = self.STRATEGY_MAP.get(
             strategy_name.lower(), StructureType.IRON_CONDOR
@@ -1206,6 +1208,7 @@ class FnOBacktestEngine:
             "lot_size": self._chain_builder.lot_size,
             "lots": 1,
             "exchange": self._chain_builder.exchange,
+            **self.strategy_params,  # Merge in user params
         })
 
         # State tracking

@@ -224,8 +224,12 @@ class StockScanner:
                 except Exception as e:
                     err_str = str(e)
                     logger.warning("scan_failed", symbol=symbol, error=err_str)
-                    is_permission_error = "insufficient permission" in err_str.lower()
-                    is_auth_error = "403" in err_str or "expired" in err_str.lower() or "invalid" in err_str.lower()
+                    # PermissionError = API plan restriction (session still valid)
+                    # AuthenticationError / "403"/"expired" = token problem
+                    is_permission_error = isinstance(e, PermissionError) or "insufficient permission" in err_str.lower()
+                    is_auth_error = (not is_permission_error) and (
+                        "403" in err_str or "expired" in err_str.lower() or "invalid" in err_str.lower()
+                    )
                     if is_permission_error or is_auth_error:
                         auth_failures += 1
                         if auth_failures >= 3:

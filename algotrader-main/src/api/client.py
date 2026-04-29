@@ -124,12 +124,25 @@ class KiteClient:
                             except Exception:
                                 error_msg = "Token expired or invalid"
                                 error_type = ""
-                            logger.error("auth_failed", endpoint=endpoint, status=403, error_msg=error_msg, error_type=error_type)
-                            self._auth.invalidate_session()
-                            await self._recreate_session()
-                            raise AuthenticationError(
-                                f"{error_msg} (HTTP 403)", response.status
-                            )
+                            # Zerodha returns 403 for two distinct reasons:
+                            #   TokenException    — token expired/invalid → invalidate session
+                            #   PermissionException — API plan lacks access to this endpoint
+                            #                        → session is fine, do NOT wipe the token
+                            is_token_error = error_type in ("TokenException", "InvalidInputException") or \
+                                not error_type  # unknown 403 → treat conservatively as token error
+                            if is_token_error:
+                                logger.error("auth_failed", endpoint=endpoint, status=403, error_msg=error_msg, error_type=error_type)
+                                self._auth.invalidate_session()
+                                await self._recreate_session()
+                                raise AuthenticationError(
+                                    f"{error_msg} (HTTP 403)", response.status
+                                )
+                            else:
+                                # Plan/permission error — session remains valid, caller handles gracefully
+                                logger.warning("permission_denied", endpoint=endpoint, status=403, error_msg=error_msg, error_type=error_type)
+                                raise PermissionError(
+                                    f"[{error_type}] {error_msg} (HTTP 403)"
+                                )
 
                         if not parse_json:
                             return await response.text()
